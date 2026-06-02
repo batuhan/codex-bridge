@@ -2,6 +2,7 @@ package appserver
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -103,7 +104,9 @@ func (c *Client) Close() {
 	if c == nil {
 		return
 	}
-	_ = c.stdin.Close()
+	if c.stdin != nil {
+		_ = c.stdin.Close()
+	}
 	if c.cmd != nil && c.cmd.Process != nil {
 		_ = c.cmd.Process.Kill()
 		_, _ = c.cmd.Process.Wait()
@@ -204,28 +207,37 @@ func (c *Client) writeRaw(ctx context.Context, msg Message) error {
 func (c *Client) readLoop() {
 	defer close(c.done)
 	defer close(c.incoming)
-	scanner := bufio.NewScanner(c.stdout)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-	for scanner.Scan() {
+	reader := bufio.NewReaderSize(c.stdout, 64*1024)
+	for {
+		raw, err := reader.ReadBytes('\n')
+		if len(raw) == 0 && err != nil {
+			return
+		}
 		var msg Message
-		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil {
-			continue
+		if json.Unmarshal(bytes.TrimSpace(raw), &msg) == nil {
+			c.handleIncoming(msg)
 		}
-		if msg.ID != nil && msg.Method == "" {
-			id := fmt.Sprint(msg.ID)
-			c.waitMu.Lock()
-			ch := c.waiting[id]
-			c.waitMu.Unlock()
-			if ch != nil {
-				ch <- msg
-			}
-			continue
-		}
-		select {
-		case c.incoming <- msg:
-		default:
+		if err != nil {
+			return
 		}
 	}
+}
+
+func (c *Client) handleIncoming(msg Message) {
+	if msg.ID == nil && msg.Method == "" {
+		return
+	}
+	if msg.ID != nil && msg.Method == "" {
+		id := fmt.Sprint(msg.ID)
+		c.waitMu.Lock()
+		ch := c.waiting[id]
+		c.waitMu.Unlock()
+		if ch != nil {
+			ch <- msg
+		}
+		return
+	}
+	c.incoming <- msg
 }
 
 func Initialize(ctx context.Context, c *Client) error {

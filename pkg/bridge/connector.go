@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/rs/zerolog"
+	"go.mau.fi/util/dbutil"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	matrixconnector "maunium.net/go/mautrix/bridgev2/matrix"
@@ -20,22 +21,31 @@ import (
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
+	"github.com/beeper/ai-bridge/pkg/aidb"
 	"github.com/beeper/codex-bridge/pkg/appserver"
 )
 
 const appServerStartupTimeout = 15 * time.Second
-const bridgeInfoVersion = 1
-const roomCapabilitiesVersion = 3
+const contactGhostSyncLimit = 20
+const messageMetadataSyncLimit = 500
+const bridgeInfoVersion = 2
+const roomCapabilitiesVersion = 5
+const roomFeaturesID = "com.beeper.codex.capabilities.2026_06_02.no_typing+state"
+const defaultCodexAvatarMXC = "mxc://beeper.com/51a668657dd9e0132cc823ad9402c6c2d0fc3321"
 
 type Connector struct {
 	Bridge *bridgev2.Bridge
 	Config Config
+	Store  *aidb.Store
 
 	appMu sync.Mutex
 	app   *appserver.Client
 
 	activeMu sync.Mutex
 	active   map[string]*activeRun
+
+	pendingStartMu sync.Mutex
+	pendingStarts  map[string]pendingTurnStart
 
 	threadMu    sync.Mutex
 	threadRooms map[string]threadRoom
@@ -48,19 +58,28 @@ type Connector struct {
 }
 
 type threadRoom struct {
-	portalKey     networkid.PortalKey
-	login         *bridgev2.UserLogin
-	cwd           string
-	modelProvider string
+	portalKey       networkid.PortalKey
+	login           *bridgev2.UserLogin
+	cwd             string
+	modelProvider   string
+	model           string
+	reasoningEffort string
+}
+
+type pendingTurnStart struct {
+	client    *Client
+	portalKey networkid.PortalKey
 }
 
 var _ bridgev2.NetworkConnector = (*Connector)(nil)
 var _ bridgev2.ConfigValidatingNetwork = (*Connector)(nil)
+var _ bridgev2.PortalBridgeInfoFillingNetwork = (*Connector)(nil)
 
 func (c *Connector) GetName() bridgev2.BridgeName {
 	return bridgev2.BridgeName{
 		DisplayName:          "Codex",
 		NetworkURL:           "https://github.com/openai/codex",
+		NetworkIcon:          id.ContentURIString(defaultCodexAvatarMXC),
 		NetworkID:            networkID,
 		BeeperBridgeType:     beeperBridgeType,
 		DefaultPort:          29345,
@@ -77,6 +96,8 @@ func (c *Connector) GetDBMetaTypes() database.MetaTypes {
 
 func (c *Connector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
 	return &bridgev2.NetworkGeneralCapabilities{
+		DisappearingMessages: true,
+		AggressiveUpdateInfo: true,
 		Provisioning: bridgev2.ProvisioningCapabilities{
 			ResolveIdentifier: bridgev2.ResolveIdentifierCapabilities{
 				CreateDM:       true,
@@ -91,7 +112,11 @@ func (c *Connector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
 func (c *Connector) Init(bridge *bridgev2.Bridge) {
 	c.Config.ApplyDefaults()
 	c.Bridge = bridge
+	if bridge != nil && bridge.DB != nil {
+		c.Store = aidb.NewStore(bridge.DB.Database, bridge.ID, dbutil.ZeroLogger(bridge.Log.With().Str("db_section", "ai").Logger()))
+	}
 	c.active = map[string]*activeRun{}
+	c.pendingStarts = map[string]pendingTurnStart{}
 	c.threadRooms = map[string]threadRoom{}
 	c.processes = map[string]*activeRun{}
 	c.globalState = map[string]any{}
@@ -107,6 +132,17 @@ func (c *Connector) Start(ctx context.Context) error {
 	c.Config.ApplyDefaults()
 	if c.Bridge.GetBeeperStreamPublisher() == nil {
 		return fmt.Errorf("Codex bridge requires a Matrix connector with Beeper stream support")
+	}
+	if _, ok := c.Bridge.Matrix.(bridgev2.MatrixConnectorWithArbitraryRoomState); !ok {
+		return fmt.Errorf("Codex bridge requires a Matrix connector with arbitrary room state support")
+	}
+	if c.Bridge.Config == nil || !c.Bridge.Config.EnableSendStateRequests {
+		return fmt.Errorf("Codex bridge requires bridge.enable_send_state_requests for Beeper room state support")
+	}
+	if c.Store != nil {
+		if err := c.Store.Upgrade(ctx); err != nil {
+			return bridgev2.DBUpgradeError{Err: err, Section: "ai"}
+		}
 	}
 	path, err := appserver.CheckBinary(ctx, c.Config.CodexCommand, c.Config.MinVersion)
 	if err != nil {
@@ -129,6 +165,9 @@ func (c *Connector) Start(ctx context.Context) error {
 	c.appMu.Unlock()
 	c.seedConfiguredLogins(startupCtx)
 	c.hydrateThreadRooms(startupCtx)
+	c.normalizeStoredMessageMetadata(startupCtx)
+	c.syncBaseContactGhosts(startupCtx)
+	go c.syncRecentContactGhosts(ctx)
 	go c.dispatchAppServer()
 	return nil
 }
@@ -143,8 +182,51 @@ func (c *Connector) Stop() {
 	}
 }
 
+func (c *Connector) normalizeStoredMessageMetadata(ctx context.Context) {
+	if c == nil || c.Bridge == nil || c.Bridge.DB == nil {
+		return
+	}
+	portals, err := c.Bridge.GetAllPortals(ctx)
+	if err != nil {
+		logFromContext(ctx).Warn().Err(err).Msg("Failed to load portals for Codex message metadata normalization")
+		return
+	}
+	updated := 0
+	for _, portal := range portals {
+		if portal == nil {
+			continue
+		}
+		messages, err := c.Bridge.DB.Message.GetLastNInPortal(ctx, portal.PortalKey, messageMetadataSyncLimit)
+		if err != nil {
+			logFromContext(ctx).Warn().Err(err).Stringer("portal_key", portal.PortalKey).Msg("Failed to load messages for Codex metadata normalization")
+			continue
+		}
+		for _, msg := range messages {
+			if !normalizeStoredMessageMetadata(msg) {
+				continue
+			}
+			if err := c.Bridge.DB.Message.Update(ctx, msg); err != nil {
+				logFromContext(ctx).Warn().Err(err).Str("message_id", string(msg.ID)).Msg("Failed to normalize Codex message metadata")
+				continue
+			}
+			updated++
+		}
+	}
+	if updated > 0 {
+		logFromContext(ctx).Info().Int("updated", updated).Msg("Normalized Codex message metadata")
+	}
+}
+
 func (c *Connector) GetBridgeInfoVersion() (info, capabilities int) {
 	return bridgeInfoVersion, roomCapabilitiesVersion
+}
+
+func (c *Connector) FillPortalBridgeInfo(portal *bridgev2.Portal, content *event.BridgeEventContent) {
+	if portal == nil || content == nil {
+		return
+	}
+	content.BeeperBridgeName = string(portal.Receiver)
+	content.BeeperSelfHosted = true
 }
 
 func (c *Connector) LoadUserLogin(ctx context.Context, login *bridgev2.UserLogin) error {
@@ -166,7 +248,35 @@ func (c *Connector) request(ctx context.Context, method string, params any, out 
 	if err != nil {
 		return err
 	}
-	return app.Request(ctx, method, params, out)
+	logCodexRequest(ctx, method, params).Msg("Sending Codex app-server request")
+	err = app.Request(ctx, method, params, out)
+	if err != nil {
+		logCodexRequest(ctx, method, params).Err(err).Msg("Codex app-server request failed")
+	}
+	return err
+}
+
+func logCodexRequest(ctx context.Context, method string, params any) *zerolog.Event {
+	logger := logFromContext(ctx).With().Str("method", method).Logger()
+	ev := logger.Debug()
+	fields, _ := params.(map[string]any)
+	for _, key := range []string{"threadId", "turnId", "expectedTurnId", "cwd", "model", "approvalPolicy", "clientUserMessageId"} {
+		if value, _ := fields[key].(string); value != "" {
+			ev = ev.Str(fieldNameForLog(key), value)
+		}
+	}
+	return ev
+}
+
+func fieldNameForLog(key string) string {
+	var out strings.Builder
+	for i, ch := range key {
+		if i > 0 && ch >= 'A' && ch <= 'Z' {
+			out.WriteByte('_')
+		}
+		out.WriteRune(ch)
+	}
+	return strings.ToLower(out.String())
 }
 
 func (c *Connector) dispatchAppServer() {
@@ -192,8 +302,8 @@ func (c *Connector) handleServerRequest(msg appserver.Message) {
 		return
 	}
 	ctx := context.Background()
-	if msg.Method == "attestation/generate" {
-		_ = app.RespondError(ctx, msg.ID, -32002, "Codex bridge does not provide attestation tokens")
+	if code, message, ok := directServerRequestError(msg.Method); ok {
+		_ = app.RespondError(ctx, msg.ID, code, message)
 		return
 	}
 	active := c.activeRunForRequest(msg.Params)
@@ -399,14 +509,43 @@ func notificationProcessID(params json.RawMessage) string {
 }
 
 func canStartActiveRunFromNotification(method string) bool {
-	if method == "turn/started" || method == "model/rerouted" || method == "model/verification" {
-		return true
-	}
-	if strings.HasPrefix(method, "item/") || strings.HasPrefix(method, "hook/") {
+	return isActiveRunNotification(method)
+}
+
+func isActiveRunNotification(method string) bool {
+	if strings.HasPrefix(method, "item/") ||
+		strings.HasPrefix(method, "hook/") ||
+		strings.HasPrefix(method, "thread/realtime/") {
 		return true
 	}
 	switch method {
-	case "turn/diff/updated", "turn/plan/updated", "rawResponseItem/completed":
+	case "thread/started",
+		"thread/status/changed",
+		"thread/archived",
+		"thread/unarchived",
+		"thread/closed",
+		"thread/name/updated",
+		"thread/goal/updated",
+		"thread/goal/cleared",
+		"thread/settings/updated",
+		"thread/tokenUsage/updated",
+		"thread/compacted",
+		"turn/started",
+		"turn/completed",
+		"turn/diff/updated",
+		"turn/plan/updated",
+		"command/exec/outputDelta",
+		"process/outputDelta",
+		"process/exited",
+		"rawResponseItem/completed",
+		"serverRequest/resolved",
+		"model/rerouted",
+		"model/verification",
+		"warning",
+		"guardianWarning",
+		"deprecationNotice",
+		"configWarning",
+		"error":
 		return true
 	default:
 		return false
@@ -469,12 +608,21 @@ func (c *Connector) startActiveRunFromNotification(threadID string, params json.
 	if active := c.activeRun(threadID); active != nil {
 		return active
 	}
-	room, ok := c.lookupThreadRoom(context.Background(), threadID)
-	if !ok {
+	pending, hasPending := c.pendingTurnStart(threadID)
+	client := pending.client
+	portalKey := pending.portalKey
+	if !hasPending {
+		room, ok := c.lookupThreadRoom(context.Background(), threadID)
+		if !ok {
+			return nil
+		}
+		client = &Client{Main: c, UserLogin: room.login, loggedIn: true}
+		portalKey = room.portalKey
+	}
+	if client == nil || portalKey.ID == "" {
 		return nil
 	}
-	client := &Client{Main: c, UserLogin: room.login, loggedIn: true}
-	run := newActiveRun(client, room.portalKey, threadID, turnID)
+	run := newActiveRun(client, portalKey, threadID, turnID)
 	c.activeMu.Lock()
 	if c.active == nil {
 		c.active = map[string]*activeRun{}
@@ -484,14 +632,56 @@ func (c *Connector) startActiveRunFromNotification(threadID string, params json.
 		return active
 	}
 	c.active[threadID] = run
-	c.rememberThreadRoom(threadID, run.client, run.portalKey, "")
 	c.activeMu.Unlock()
-	if err := run.start(context.Background()); err != nil {
-		c.setActive(threadID, nil)
-		logFromContext(context.Background()).Err(err).Str("thread_id", threadID).Str("turn_id", turnID).Msg("Failed to start Codex stream from notification")
-		return nil
+	c.rememberThreadRoom(threadID, run.client, run.portalKey, "")
+	if hasPending {
+		if err := run.start(context.Background()); err != nil {
+			c.setActive(threadID, nil)
+			if client.Main != nil {
+				client.Main.queueThreadNotice(threadID, "Failed to start Codex stream:\n\n"+err.Error())
+			}
+			logFromContext(context.Background()).Err(err).
+				Str("thread_id", threadID).
+				Str("turn_id", turnID).
+				Str("source", "notification").
+				Msg("Failed to start Codex stream")
+			return nil
+		}
+	} else {
+		run.startAsync(context.Background(), "notification")
 	}
 	return run
+}
+
+func (c *Connector) setPendingTurnStart(threadID string, client *Client, portalKey networkid.PortalKey) {
+	if c == nil || threadID == "" || client == nil || portalKey.ID == "" {
+		return
+	}
+	c.pendingStartMu.Lock()
+	if c.pendingStarts == nil {
+		c.pendingStarts = map[string]pendingTurnStart{}
+	}
+	c.pendingStarts[threadID] = pendingTurnStart{client: client, portalKey: portalKey}
+	c.pendingStartMu.Unlock()
+}
+
+func (c *Connector) clearPendingTurnStart(threadID string) {
+	if c == nil || threadID == "" {
+		return
+	}
+	c.pendingStartMu.Lock()
+	delete(c.pendingStarts, threadID)
+	c.pendingStartMu.Unlock()
+}
+
+func (c *Connector) pendingTurnStart(threadID string) (pendingTurnStart, bool) {
+	if c == nil || threadID == "" {
+		return pendingTurnStart{}, false
+	}
+	c.pendingStartMu.Lock()
+	defer c.pendingStartMu.Unlock()
+	pending, ok := c.pendingStarts[threadID]
+	return pending, ok
 }
 
 func (c *Connector) setActive(threadID string, run *activeRun) {
@@ -500,13 +690,15 @@ func (c *Connector) setActive(threadID string, run *activeRun) {
 	}
 	c.activeMu.Lock()
 	if run == nil {
-		c.forgetProcessesLocked(c.active[threadID])
+		c.forgetProcessesForThread(threadID, c.active[threadID])
 		delete(c.active, threadID)
 	} else {
 		c.active[threadID] = run
-		c.rememberThreadRoom(threadID, run.client, run.portalKey, "")
 	}
 	c.activeMu.Unlock()
+	if run != nil {
+		c.rememberThreadRoom(threadID, run.client, run.portalKey, "")
+	}
 }
 
 func (c *Connector) activeRun(threadID string) *activeRun {
@@ -516,6 +708,20 @@ func (c *Connector) activeRun(threadID string) *activeRun {
 	c.activeMu.Lock()
 	defer c.activeMu.Unlock()
 	return c.active[threadID]
+}
+
+func (c *Connector) forgetThread(threadID string) {
+	if c == nil || threadID == "" {
+		return
+	}
+	c.activeMu.Lock()
+	run := c.active[threadID]
+	delete(c.active, threadID)
+	c.activeMu.Unlock()
+	c.forgetProcessesForThread(threadID, run)
+	c.threadMu.Lock()
+	delete(c.threadRooms, threadID)
+	c.threadMu.Unlock()
 }
 
 func (c *Connector) rememberProcess(processID string, run *activeRun) {
@@ -540,29 +746,43 @@ func (c *Connector) activeRunForProcess(params json.RawMessage) *activeRun {
 	return c.processes[processID]
 }
 
-func (c *Connector) forgetProcessesLocked(run *activeRun) {
-	if c == nil || run == nil {
+func (c *Connector) forgetProcessesForThread(threadID string, run *activeRun) {
+	if c == nil || (threadID == "" && run == nil) {
 		return
 	}
 	c.processMu.Lock()
 	for processID, active := range c.processes {
-		if active == run {
+		if active == run || (active != nil && active.threadID == threadID) {
 			delete(c.processes, processID)
 		}
 	}
 	c.processMu.Unlock()
 }
 
-func (c *Connector) rememberThreadRoom(threadID string, cl *Client, portalKey networkid.PortalKey, cwd string) {
+func (c *Connector) rememberThreadRoom(threadID string, cl *Client, portalKey networkid.PortalKey, cwd string, modelInfo ...string) {
 	if threadID == "" || cl == nil || cl.UserLogin == nil {
 		return
 	}
 	c.threadMu.Lock()
+	for existingThreadID, existing := range c.threadRooms {
+		if existingThreadID != threadID && existing.portalKey == portalKey && portalKey.ID != "" {
+			delete(c.threadRooms, existingThreadID)
+		}
+	}
 	room := c.threadRooms[threadID]
 	room.portalKey = portalKey
 	room.login = cl.UserLogin
 	if cwd != "" {
 		room.cwd = cwd
+	}
+	if len(modelInfo) > 0 && strings.TrimSpace(modelInfo[0]) != "" {
+		room.modelProvider = strings.TrimSpace(modelInfo[0])
+	}
+	if len(modelInfo) > 1 && strings.TrimSpace(modelInfo[1]) != "" {
+		room.model = codexModelRef(room.modelProvider, modelInfo[1])
+	}
+	if len(modelInfo) > 2 && strings.TrimSpace(modelInfo[2]) != "" {
+		room.reasoningEffort = strings.TrimSpace(modelInfo[2])
 	}
 	c.threadRooms[threadID] = room
 	c.threadMu.Unlock()
@@ -573,6 +793,56 @@ func (c *Connector) threadRoom(threadID string) (threadRoom, bool) {
 	defer c.threadMu.Unlock()
 	room, ok := c.threadRooms[threadID]
 	return room, ok && room.login != nil && room.portalKey.ID != ""
+}
+
+func (c *Connector) modelStateForPortalKey(portalKey networkid.PortalKey) map[string]any {
+	if c == nil || portalKey.ID == "" {
+		return nil
+	}
+	c.threadMu.Lock()
+	defer c.threadMu.Unlock()
+	for _, room := range c.threadRooms {
+		if room.portalKey != portalKey {
+			continue
+		}
+		state := map[string]any{}
+		if room.model != "" {
+			state["model"] = room.model
+		}
+		if room.modelProvider != "" {
+			state["provider"] = room.modelProvider
+			state["modelProvider"] = room.modelProvider
+		}
+		if room.reasoningEffort != "" {
+			state["effort"] = room.reasoningEffort
+			state["reasoning"] = room.reasoningEffort
+			state["reasoningEffort"] = room.reasoningEffort
+		}
+		if len(state) > 0 {
+			return state
+		}
+	}
+	return nil
+}
+
+func (c *Connector) setModelStateForPortalKey(portalKey networkid.PortalKey, state map[string]any) {
+	if c == nil || portalKey.ID == "" {
+		return
+	}
+	model := codexModelStateRef(state, firstStateString(state, "provider", "modelProvider"))
+	provider := firstStateString(state, "provider", "modelProvider")
+	effort := firstStateString(state, "effort", "reasoning", "reasoningEffort", "reasoning_effort")
+	c.threadMu.Lock()
+	for threadID, room := range c.threadRooms {
+		if room.portalKey != portalKey {
+			continue
+		}
+		room.model = model
+		room.modelProvider = provider
+		room.reasoningEffort = effort
+		c.threadRooms[threadID] = room
+	}
+	c.threadMu.Unlock()
 }
 
 func (c *Connector) lookupThreadRoom(ctx context.Context, threadID string) (threadRoom, bool) {
@@ -593,12 +863,169 @@ func (c *Connector) hydrateThreadRooms(ctx context.Context) {
 		return
 	}
 	for _, portal := range portals {
+		if c.deleteUnmaterializedProjectPortal(ctx, portal) {
+			continue
+		}
+		portal = c.hydratePortalThreadRoomState(ctx, portal)
 		c.rememberPortalThreadRoom(portal)
 	}
 }
 
+func (c *Connector) syncBaseContactGhosts(ctx context.Context) {
+	if c == nil || c.Bridge == nil {
+		return
+	}
+	c.syncContactGhostsForThreads(ctx, nil)
+}
+
+func (c *Connector) syncRecentContactGhosts(ctx context.Context) {
+	if c == nil || c.Bridge == nil {
+		return
+	}
+	threads, _, err := (&Client{Main: c}).listThreadPage(ctx, "", contactGhostSyncLimit)
+	if err != nil {
+		logFromContext(ctx).Warn().Err(err).Msg("Failed to list Codex threads for contact ghost sync")
+		return
+	}
+	c.syncContactGhostsForThreads(ctx, threads)
+}
+
+func (c *Connector) syncContactGhostsForThreads(ctx context.Context, threads []appserver.Thread) {
+	if c == nil || c.Bridge == nil {
+		return
+	}
+	contacts := []struct {
+		id   networkid.UserID
+		info *bridgev2.UserInfo
+	}{
+		{codexUserID, codexUserInfo("Codex", false)},
+		{newProjectUserID, codexUserInfo("New Project", false)},
+	}
+	for _, thread := range sortedRecentDirectories(threads) {
+		name := directoryName(thread.Cwd)
+		contacts = append(contacts, struct {
+			id   networkid.UserID
+			info *bridgev2.UserInfo
+		}{projectUserID(thread.Cwd), projectUserInfo(thread, thread.Cwd, name)})
+	}
+	for _, contact := range contacts {
+		ghost, err := c.Bridge.GetGhostByID(ctx, contact.id)
+		if err != nil {
+			logFromContext(ctx).Warn().Err(err).Str("user_id", string(contact.id)).Msg("Failed to load Codex contact ghost")
+			continue
+		}
+		ghost.UpdateInfo(ctx, contact.info)
+	}
+}
+
+func (c *Connector) deleteUnmaterializedProjectPortal(ctx context.Context, portal *bridgev2.Portal) bool {
+	if portal == nil || portal.MXID != "" {
+		return false
+	}
+	if _, ok := parseProjectPortalID(portal.PortalKey.ID); !ok {
+		return false
+	}
+	if err := portal.Delete(ctx); err != nil {
+		logFromContext(ctx).Warn().Err(err).Stringer("portal_key", portal.PortalKey).Msg("Failed to delete unmaterialized Codex project portal")
+		return false
+	}
+	logFromContext(ctx).Info().Stringer("portal_key", portal.PortalKey).Msg("Deleted unmaterialized Codex project portal")
+	return true
+}
+
+func (c *Connector) hydratePortalThreadRoomState(ctx context.Context, portal *bridgev2.Portal) *bridgev2.Portal {
+	if c == nil || c.Bridge == nil || portal == nil || portal.MXID == "" {
+		return portal
+	}
+	meta := portalMetadata(portal.Metadata)
+	hadThreadID := meta.ThreadID != ""
+	login := c.Bridge.GetCachedUserLoginByID(portal.PortalKey.Receiver)
+	if login == nil {
+		return portal
+	}
+	cl, ok := login.Client.(*Client)
+	if !ok || cl == nil {
+		cl = &Client{Main: c, UserLogin: login, loggedIn: true}
+	}
+	state := cl.roomCodexThreadState(ctx, portal)
+	threadID := meta.ThreadID
+	if threadID == "" {
+		threadID = firstStateString(state, "threadId", "sessionId")
+	}
+	if threadID == "" {
+		return portal
+	}
+	cwd := meta.Cwd
+	if cwd == "" {
+		cwd = firstStateString(state, "cwd")
+	}
+	if meta.ThreadID == "" {
+		meta = cl.hydratePortalThreadMetadata(ctx, portal, meta)
+	} else if cwd != "" && cwd != meta.Cwd {
+		cl.setPortalThreadMetadata(ctx, portal, threadID, cwd)
+		meta = portalMetadata(portal.Metadata)
+	}
+	if meta.ThreadID != "" {
+		threadID = meta.ThreadID
+	}
+	if meta.Cwd != "" {
+		cwd = meta.Cwd
+	}
+	if actual, err := cl.readThread(ctx, threadID, false); err == nil {
+		if actual.Cwd == "" {
+			actual.Cwd = cwd
+		}
+		return cl.syncThreadPortal(ctx, portal, actual)
+	} else if isThreadNotFoundError(err) {
+		c.clearMissingPortalThread(ctx, cl, portal, meta)
+		return portal
+	} else {
+		logFromContext(ctx).Warn().Err(err).Str("thread_id", meta.ThreadID).Msg("Failed to validate Codex thread during startup")
+	}
+	thread := appserver.Thread{
+		ID:            threadID,
+		SessionID:     firstStateString(state, "sessionId"),
+		Cwd:           cwd,
+		ModelProvider: firstStateString(state, "modelProvider"),
+		Raw:           state,
+	}
+	if thread.SessionID == "" {
+		thread.SessionID = thread.ID
+	}
+	if !hadThreadID || (cwd != "" && portal.PortalKey != projectPortalKey(cwd, login.ID)) {
+		synced := cl.syncThreadPortal(ctx, portal, thread)
+		if synced != nil {
+			return synced
+		}
+	} else if c != nil {
+		c.rememberThreadRoom(threadID, cl, portal.PortalKey, cwd, thread.ModelProvider, threadModelRef(thread), threadReasoningEffort(thread))
+	}
+	return portal
+}
+
+func (c *Connector) clearMissingPortalThread(ctx context.Context, cl *Client, portal *bridgev2.Portal, meta *PortalMetadata) {
+	if c == nil || cl == nil || portal == nil || meta == nil || meta.ThreadID == "" {
+		return
+	}
+	oldThreadID := meta.ThreadID
+	cwd := meta.Cwd
+	cl.clearMissingThread(ctx, portal, meta)
+	if cwd == "" {
+		if parsed, ok := parseProjectPortalID(portal.PortalKey.ID); ok {
+			cwd = parsed
+		}
+	}
+	state := map[string]any{
+		"cwd":              cwd,
+		"lastNotification": "thread/not_found",
+		"missingThreadId":  oldThreadID,
+	}
+	portal.UpdateInfo(ctx, portalInfo(directoryName(cwd), cl.codexMembers(), cwd, "", state), cl.UserLogin, nil, time.Now())
+	logFromContext(ctx).Warn().Str("thread_id", oldThreadID).Str("cwd", cwd).Msg("Cleared missing Codex thread during startup")
+}
+
 func (c *Connector) rememberPortalThreadRoom(portal *bridgev2.Portal) {
-	if portal == nil {
+	if portal == nil || portal.MXID == "" {
 		return
 	}
 	meta := portalMetadata(portal.Metadata)
@@ -610,11 +1037,13 @@ func (c *Connector) rememberPortalThreadRoom(portal *bridgev2.Portal) {
 		return
 	}
 	c.threadMu.Lock()
-	c.threadRooms[meta.ThreadID] = threadRoom{
-		portalKey: portal.PortalKey,
-		login:     login,
-		cwd:       meta.Cwd,
+	room := c.threadRooms[meta.ThreadID]
+	room.portalKey = portal.PortalKey
+	room.login = login
+	if meta.Cwd != "" {
+		room.cwd = meta.Cwd
 	}
+	c.threadRooms[meta.ThreadID] = room
 	c.threadMu.Unlock()
 }
 
@@ -630,15 +1059,35 @@ func (c *Connector) handleThreadMetadataNotification(method, threadID string, pa
 	if cwd, _ := state["cwd"].(string); cwd != "" && cwd != room.cwd {
 		room.cwd = cwd
 	}
+	room = c.canonicalizeThreadRoom(context.Background(), threadID, room)
 	if provider, _ := state["modelProvider"].(string); strings.TrimSpace(provider) != "" {
 		room.modelProvider = strings.TrimSpace(provider)
 	}
 	if method == "model/rerouted" && room.modelProvider != "" {
 		state["modelProvider"] = room.modelProvider
 	}
+	if model := codexModelStateRef(state, room.modelProvider); model != "" {
+		room.model = model
+	}
+	if effort := firstStateString(state, "effort", "reasoning", "reasoningEffort", "reasoning_effort"); effort != "" {
+		room.reasoningEffort = effort
+	}
+	if codexModelStateRef(state, room.modelProvider) == "" && room.model != "" {
+		state["model"] = room.model
+	}
+	if firstStateString(state, "modelProvider", "provider") == "" && room.modelProvider != "" {
+		state["modelProvider"] = room.modelProvider
+	}
+	if firstStateString(state, "effort", "reasoning", "reasoningEffort", "reasoning_effort") == "" && room.reasoningEffort != "" {
+		state["reasoningEffort"] = room.reasoningEffort
+	}
 	c.threadMu.Lock()
 	c.threadRooms[threadID] = room
 	c.threadMu.Unlock()
+	c.updateActiveRunRoom(threadID, room)
+	if room.login == nil || room.login.Bridge == nil {
+		return
+	}
 	info := codexThreadChatInfo(room.cwd, threadID, state)
 	res := room.login.QueueRemoteEvent(&simplevent.ChatInfoChange{
 		EventMeta: remoteEventMeta(bridgev2.RemoteEventChatInfoChange, room.portalKey, codexUserID, time.Now()),
@@ -654,9 +1103,73 @@ func (c *Connector) handleThreadMetadataNotification(method, threadID string, pa
 	}
 }
 
+func (c *Connector) canonicalizeThreadRoom(ctx context.Context, threadID string, room threadRoom) threadRoom {
+	if c == nil || c.Bridge == nil || room.login == nil || room.cwd == "" {
+		return room
+	}
+	target := projectPortalKey(room.cwd, room.login.ID)
+	if room.portalKey == target {
+		return room
+	}
+	result, portal, err := c.Bridge.ReIDPortal(ctx, room.portalKey, target)
+	if err != nil {
+		logFromContext(ctx).Warn().Err(err).
+			Str("thread_id", threadID).
+			Stringer("source_portal_key", room.portalKey).
+			Stringer("target_portal_key", target).
+			Msg("Failed to canonicalize Codex thread room")
+		return room
+	}
+	logFromContext(ctx).Info().
+		Int("result", int(result)).
+		Str("thread_id", threadID).
+		Stringer("source_portal_key", room.portalKey).
+		Stringer("target_portal_key", target).
+		Msg("Canonicalized Codex thread room")
+	room.portalKey = target
+	if portal != nil {
+		room.portalKey = portal.PortalKey
+	}
+	return room
+}
+
+func (c *Connector) updateActiveRunRoom(threadID string, room threadRoom) {
+	if c == nil || threadID == "" || room.portalKey.ID == "" {
+		return
+	}
+	c.activeMu.Lock()
+	active := c.active[threadID]
+	c.activeMu.Unlock()
+	if active == nil {
+		return
+	}
+	active.mu.Lock()
+	active.portalKey = room.portalKey
+	if room.login != nil {
+		if active.client == nil {
+			active.client = &Client{Main: c, UserLogin: room.login, loggedIn: true}
+		} else {
+			active.client.Main = c
+			active.client.UserLogin = room.login
+			active.client.loggedIn = true
+		}
+	}
+	if room.model != "" {
+		active.setModelLocked(room.model)
+	}
+	active.mu.Unlock()
+}
+
 func (c *Connector) handleThreadNoticeNotification(method, threadID string, params json.RawMessage) {
 	text := threadNoticeText(method, params)
 	if text == "" {
+		return
+	}
+	c.queueThreadNotice(threadID, text)
+}
+
+func (c *Connector) queueThreadNotice(threadID, text string) {
+	if c == nil || strings.TrimSpace(text) == "" {
 		return
 	}
 	ctx := context.Background()
@@ -700,8 +1213,8 @@ func codexThreadStateUpdater(state map[string]any) bridgev2.ExtraUpdater[*bridge
 
 func codexAIModelStateUpdater(state map[string]any) bridgev2.ExtraUpdater[*bridgev2.Portal] {
 	content := codexAIModelStateContent(state)
-	if len(content) == 0 {
-		return nil
+	if content == nil {
+		content = map[string]any{}
 	}
 	return func(ctx context.Context, portal *bridgev2.Portal) bool {
 		if portal == nil || portal.MXID == "" {
@@ -732,6 +1245,7 @@ func codexThreadChatInfo(cwd, threadID string, state map[string]any) *bridgev2.C
 	info := &bridgev2.ChatInfo{
 		ExcludeChangesFromTimeline: true,
 		CanBackfill:                threadID != "",
+		Avatar:                     codexAvatar(),
 		ExtraUpdates:               codexThreadMetadataUpdater(cwd, threadID, state),
 	}
 	if name := chatNameFromThreadState(state, cwd); name != "" {
@@ -809,7 +1323,7 @@ func codexThreadInitialState(thread appserver.Thread) map[string]any {
 
 func copyThreadStateFields(dst, thread map[string]any) {
 	delete(thread, "turns")
-	for _, key := range []string{"sessionId", "forkedFromId", "parentThreadId", "cwd", "path", "name", "preview", "status", "modelProvider", "createdAt", "updatedAt", "ephemeral", "cliVersion", "source", "threadSource", "agentNickname", "agentRole", "gitInfo"} {
+	for _, key := range []string{"sessionId", "forkedFromId", "parentThreadId", "cwd", "path", "name", "preview", "status", "model", "modelProvider", "serviceTier", "effort", "reasoningEffort", "summary", "createdAt", "updatedAt", "ephemeral", "cliVersion", "source", "threadSource", "agentNickname", "agentRole", "gitInfo"} {
 		if value, ok := thread[key]; ok {
 			dst[key] = value
 		}
@@ -886,18 +1400,30 @@ func copyThreadSettingsFields(dst, settings map[string]any) {
 }
 
 func codexAIModelStateContent(state map[string]any) map[string]any {
-	model := firstStateString(state, "model", "toModel")
+	model := codexModelStateRef(state, "")
 	if model == "" {
 		return nil
 	}
-	content := map[string]any{"model": codexModelRef(firstStateString(state, "modelProvider", "provider"), model)}
-	if effort := firstStateString(state, "effort", "reasoning"); effort != "" {
+	content := map[string]any{"model": model}
+	if effort := firstStateString(state, "effort", "reasoning", "reasoningEffort", "reasoning_effort"); effort != "" {
 		content["reasoning"] = effort
 	}
-	if name := firstStateString(state, "modelName"); name != "" && name != model {
+	if name := firstStateString(state, "modelName"); name != "" && name != firstStateString(state, "model", "toModel") {
 		content["name"] = name
 	}
 	return content
+}
+
+func codexModelStateRef(state map[string]any, fallbackProvider string) string {
+	model := firstStateString(state, "model", "toModel")
+	if model == "" {
+		return ""
+	}
+	provider := firstStateString(state, "modelProvider", "provider")
+	if provider == "" {
+		provider = fallbackProvider
+	}
+	return codexModelRef(provider, model)
 }
 
 func codexModelRef(provider, model string) string {
@@ -907,6 +1433,25 @@ func codexModelRef(provider, model string) string {
 		return model
 	}
 	return provider + "/" + model
+}
+
+func threadModelRef(thread appserver.Thread) string {
+	if thread.Raw != nil {
+		if model := codexModelStateRef(thread.Raw, thread.ModelProvider); model != "" {
+			return model
+		}
+	}
+	if provider := strings.TrimSpace(thread.ModelProvider); strings.Contains(provider, "/") {
+		return provider
+	}
+	return ""
+}
+
+func threadReasoningEffort(thread appserver.Thread) string {
+	if thread.Raw == nil {
+		return ""
+	}
+	return firstStateString(thread.Raw, "effort", "reasoning", "reasoningEffort", "reasoning_effort")
 }
 
 func firstStateString(state map[string]any, keys ...string) string {
@@ -931,7 +1476,30 @@ func isThreadMetadataNotification(method string) bool {
 		"thread/settings/updated",
 		"thread/tokenUsage/updated",
 		"thread/compacted",
-		"model/rerouted":
+		"model/rerouted",
+		"model/verification":
+		return true
+	default:
+		return false
+	}
+}
+
+func isThreadNoticeNotification(method string) bool {
+	switch method {
+	case "thread/compacted",
+		"thread/status/changed",
+		"thread/archived",
+		"thread/unarchived",
+		"thread/closed",
+		"model/rerouted",
+		"model/verification",
+		"thread/realtime/error",
+		"thread/realtime/closed",
+		"warning",
+		"guardianWarning",
+		"configWarning",
+		"deprecationNotice",
+		"error":
 		return true
 	default:
 		return false
@@ -939,10 +1507,15 @@ func isThreadMetadataNotification(method string) bool {
 }
 
 func threadNoticeText(method string, params json.RawMessage) string {
+	if !isThreadNoticeNotification(method) {
+		return ""
+	}
 	payload := rawPayload(params)
 	switch method {
 	case "thread/compacted":
 		return codexCompactionNotice
+	case "thread/status/changed":
+		return threadStatusErrorNotice(payload)
 	case "thread/archived":
 		return "Codex archived this thread."
 	case "thread/unarchived":
@@ -1007,6 +1580,47 @@ func errorNoticeText(payload map[string]any) string {
 	return "Codex error."
 }
 
+func threadStatusErrorNotice(payload map[string]any) string {
+	status, _ := payload["status"].(map[string]any)
+	statusType, _ := status["type"].(string)
+	if statusType == "" {
+		statusType, _ = payload["statusType"].(string)
+	}
+	switch strings.ToLower(strings.TrimSpace(statusType)) {
+	case "systemerror", "error", "failed":
+	default:
+		return ""
+	}
+	if message := statusErrorMessage(status); message != "" {
+		return "Codex error:\n\n" + message
+	}
+	if message := statusErrorMessage(payload); message != "" {
+		return "Codex error:\n\n" + message
+	}
+	if model, _ := payload["model"].(string); strings.TrimSpace(model) != "" {
+		return "Codex entered system error state while using " + strings.TrimSpace(model) + "."
+	}
+	return "Codex entered system error state."
+}
+
+func statusErrorMessage(payload map[string]any) string {
+	if payload == nil {
+		return ""
+	}
+	if message, _ := payload["message"].(string); strings.TrimSpace(message) != "" {
+		return strings.TrimSpace(message)
+	}
+	if errPayload, _ := payload["error"].(map[string]any); errPayload != nil {
+		if message, _ := errPayload["message"].(string); strings.TrimSpace(message) != "" {
+			return strings.TrimSpace(message)
+		}
+	}
+	if errText, _ := payload["error"].(string); strings.TrimSpace(errText) != "" {
+		return strings.TrimSpace(errText)
+	}
+	return ""
+}
+
 func accountName(account *appserver.Account) string {
 	if account == nil {
 		return "Codex"
@@ -1062,6 +1676,25 @@ func userInfo(name string, isBot bool, identifiers ...string) *bridgev2.UserInfo
 	return &bridgev2.UserInfo{Name: stringPtr(name), IsBot: boolPtr(isBot), Identifiers: uniqueIdentifiers(append([]string{name}, identifiers...)...)}
 }
 
+func loginUserInfo() *bridgev2.UserInfo {
+	info := userInfo("You", false)
+	info.Avatar = &bridgev2.Avatar{ID: networkid.AvatarID("login-user"), Remove: true}
+	return info
+}
+
+func codexAvatar() *bridgev2.Avatar {
+	return &bridgev2.Avatar{
+		ID:  networkid.AvatarID(defaultCodexAvatarMXC),
+		MXC: id.ContentURIString(defaultCodexAvatarMXC),
+	}
+}
+
+func codexUserInfo(name string, isBot bool, identifiers ...string) *bridgev2.UserInfo {
+	info := userInfo(name, isBot, identifiers...)
+	info.Avatar = codexAvatar()
+	return info
+}
+
 func uniqueIdentifiers(values ...string) []string {
 	seen := map[string]bool{}
 	var out []string
@@ -1087,6 +1720,7 @@ func portalInfo(name string, members *bridgev2.ChatMemberList, cwd, threadID str
 	}
 	return &bridgev2.ChatInfo{
 		Name:                       stringPtr(name),
+		Avatar:                     codexAvatar(),
 		Type:                       &roomType,
 		Members:                    members,
 		ExcludeChangesFromTimeline: true,
@@ -1095,9 +1729,25 @@ func portalInfo(name string, members *bridgev2.ChatMemberList, cwd, threadID str
 	}
 }
 
+func applyStoredPortalInfo(info *bridgev2.ChatInfo, portal *bridgev2.Portal) {
+	if info == nil || portal == nil {
+		return
+	}
+	if portal.NameSet {
+		info.Name = &portal.Name
+	}
+	if portal.TopicSet {
+		info.Topic = &portal.Topic
+	}
+	if portal.Disappear.Type != "" {
+		disappear := portal.Disappear
+		info.Disappear = &disappear
+	}
+}
+
 func (c *Connector) ResolveLogin(ctx context.Context, user *bridgev2.User, requested networkid.UserLoginID) (*bridgev2.UserLogin, error) {
 	if requested == "" {
-		requested = defaultLoginID
+		requested = c.defaultLoginIDForUser(user)
 	}
 	if cached := c.Bridge.GetCachedUserLoginByID(requested); cached != nil && cached.UserMXID == user.MXID {
 		return cached, nil
@@ -1116,45 +1766,27 @@ func (c *Connector) ResolveLogin(ctx context.Context, user *bridgev2.User, reque
 }
 
 func (c *Connector) loginIDForUser(_ id.UserID) networkid.UserLoginID {
+	if c == nil || c.Bridge == nil {
+		return defaultLoginID
+	}
+	if mx, ok := c.Bridge.Matrix.(*matrixconnector.Connector); ok && mx.Config != nil {
+		botUsername := strings.TrimSpace(mx.Config.AppService.Bot.Username)
+		if alias, ok := strings.CutSuffix(botUsername, "bot"); ok {
+			return networkid.UserLoginID(alias)
+		}
+		template := strings.TrimSpace(mx.Config.AppService.UsernameTemplate)
+		if prefix, _, ok := strings.Cut(template, "_{{"); ok {
+			return networkid.UserLoginID(prefix)
+		}
+	}
+	if c.Bridge.ID != "" {
+		return networkid.UserLoginID(c.Bridge.ID)
+	}
 	return defaultLoginID
 }
 
 func (c *Connector) loginIDsForUser(userID id.UserID) []networkid.UserLoginID {
-	ids := []networkid.UserLoginID{c.loginIDForUser(userID)}
-	for _, alias := range c.loginAliases() {
-		if alias == "" {
-			continue
-		}
-		seen := false
-		for _, id := range ids {
-			if alias == id {
-				seen = true
-				break
-			}
-		}
-		if !seen {
-			ids = append(ids, alias)
-		}
-	}
-	return ids
-}
-
-func (c *Connector) loginAliases() []networkid.UserLoginID {
-	if c == nil || c.Bridge == nil {
-		return nil
-	}
-	aliases := []networkid.UserLoginID{networkid.UserLoginID(c.Bridge.ID)}
-	if mx, ok := c.Bridge.Matrix.(*matrixconnector.Connector); ok && mx.Config != nil {
-		botUsername := strings.TrimSpace(mx.Config.AppService.Bot.Username)
-		if alias, ok := strings.CutSuffix(botUsername, "bot"); ok {
-			aliases = append(aliases, networkid.UserLoginID(alias))
-		}
-		template := strings.TrimSpace(mx.Config.AppService.UsernameTemplate)
-		if prefix, _, ok := strings.Cut(template, "_{{"); ok {
-			aliases = append(aliases, networkid.UserLoginID(prefix))
-		}
-	}
-	return aliases
+	return []networkid.UserLoginID{c.loginIDForUser(userID)}
 }
 
 func (c *Connector) isLoginIDForUser(userID id.UserID, loginID networkid.UserLoginID) bool {

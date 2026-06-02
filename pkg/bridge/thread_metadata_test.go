@@ -2,11 +2,18 @@ package bridge
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"time"
 
+	aistream "github.com/beeper/ai-bridge/pkg/ai-stream"
+	"github.com/beeper/codex-bridge/pkg/appserver"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/bridgev2/status"
+	"maunium.net/go/mautrix/event"
+	"maunium.net/go/mautrix/id"
 )
 
 func TestIsThreadMetadataNotification(t *testing.T) {
@@ -18,6 +25,7 @@ func TestIsThreadMetadataNotification(t *testing.T) {
 		"thread/closed",
 		"thread/compacted",
 		"model/rerouted",
+		"model/verification",
 	} {
 		if !isThreadMetadataNotification(method) {
 			t.Fatalf("expected %s to be metadata", method)
@@ -45,8 +53,8 @@ func TestCodexThreadState(t *testing.T) {
 		t.Fatalf("unexpected closed state: %#v", state)
 	}
 
-	state = codexThreadState("thread/started", "thread-2", "", []byte(`{"thread":{"id":"thread-2","sessionId":"session-1","cwd":"/tmp/project","name":"Bridge","status":"running","modelProvider":"openai"}}`))
-	if state["threadId"] != "thread-2" || state["sessionId"] != "session-1" || state["cwd"] != "/tmp/project" || state["name"] != "Bridge" || state["status"] != "running" || state["modelProvider"] != "openai" {
+	state = codexThreadState("thread/started", "thread-2", "", []byte(`{"thread":{"id":"thread-2","sessionId":"session-1","cwd":"/tmp/project","name":"Bridge","status":"running","model":"gpt-5","modelProvider":"openai","serviceTier":"priority","effort":"high"}}`))
+	if state["threadId"] != "thread-2" || state["sessionId"] != "session-1" || state["cwd"] != "/tmp/project" || state["name"] != "Bridge" || state["status"] != "running" || state["model"] != "gpt-5" || state["modelProvider"] != "openai" || state["serviceTier"] != "priority" || state["effort"] != "high" {
 		t.Fatalf("thread fields were not normalized: %#v", state)
 	}
 
@@ -107,8 +115,30 @@ func TestCodexAIModelStateContent(t *testing.T) {
 		t.Fatalf("reroute should use known provider: %#v", content)
 	}
 
+	content = codexAIModelStateContent(map[string]any{"model": "gpt-b", "modelProvider": "openai", "reasoningEffort": "medium"})
+	if content["model"] != "openai/gpt-b" || content["reasoning"] != "medium" {
+		t.Fatalf("reasoning effort alias should write AI model state: %#v", content)
+	}
+
 	if content = codexAIModelStateContent(map[string]any{"modelProvider": "openai"}); len(content) != 0 {
 		t.Fatalf("blank model should not write AI model state: %#v", content)
+	}
+}
+
+func TestInitialThreadStateIncludesHydratedModelSettings(t *testing.T) {
+	thread := appserver.ThreadOpenResponse{
+		Thread:          appserver.Thread{ID: "thread-1", SessionID: "session-1"},
+		Model:           "gpt-5",
+		ModelProvider:   "openai",
+		ServiceTier:     "priority",
+		Cwd:             "/tmp/project",
+		ReasoningEffort: "high",
+	}.HydratedThread()
+
+	state := codexThreadInitialState(thread)
+	content := codexAIModelStateContent(state)
+	if content["model"] != "openai/gpt-5" || content["reasoning"] != "high" || state["serviceTier"] != "priority" {
+		t.Fatalf("initial state did not include model settings: state=%#v ai=%#v", state, content)
 	}
 }
 
@@ -140,6 +170,9 @@ func TestCodexThreadChatInfoSyncsMetadataNameAndBackfill(t *testing.T) {
 	}
 	if !info.ExcludeChangesFromTimeline || !info.CanBackfill {
 		t.Fatalf("expected hidden metadata update with backfill enabled: %#v", info)
+	}
+	if info.Avatar == nil || string(info.Avatar.MXC) != defaultCodexAvatarMXC {
+		t.Fatalf("expected thread metadata changes to preserve Codex avatar %q, got %#v", defaultCodexAvatarMXC, info.Avatar)
 	}
 	portal := &bridgev2.Portal{Portal: &database.Portal{
 		PortalKey: networkid.PortalKey{ID: "project", Receiver: "codex"},
@@ -181,6 +214,172 @@ func TestThreadMetadataUpdaterPersistsPortalMetadata(t *testing.T) {
 	}
 }
 
+func TestCodexThreadChatInfoExtraUpdatesSyncRoomState(t *testing.T) {
+	ctx := context.Background()
+	matrix := &fakeMatrixConnector{}
+	_, br := testBridgeWithDB(t, matrix)
+	key := projectPortalKey("/tmp/project", "sh-codex")
+	if err := br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := codexThreadState("thread/settings/updated", "thread-1", "/tmp/project", []byte(`{
+		"threadId": "thread-1",
+		"threadSettings": {
+			"cwd": "/tmp/project",
+			"model": "gpt-5",
+			"modelProvider": "openai",
+			"effort": "high"
+		}
+	}`))
+	info := codexThreadChatInfo("/tmp/project", "thread-1", state)
+	if !info.ExtraUpdates(ctx, portal) {
+		t.Fatal("expected chat info extra updater to sync room state")
+	}
+
+	threadState := findFakeState(matrix.api.states, codexThreadStateType)
+	if threadState == nil || threadState.RoomID != portal.MXID {
+		t.Fatalf("Codex thread state was not synced to the portal room: %#v", matrix.api.states)
+	}
+	if threadState.Content == nil || threadState.Content.Raw["threadId"] != "thread-1" || threadState.Content.Raw["model"] != "gpt-5" {
+		t.Fatalf("Codex thread state content was wrong: %#v", threadState.Content)
+	}
+	modelState := findFakeState(matrix.api.states, beeperAIModelStateType)
+	if modelState == nil || modelState.RoomID != portal.MXID {
+		t.Fatalf("Beeper AI model state was not synced to the portal room: %#v", matrix.api.states)
+	}
+	if modelState.Content == nil || modelState.Content.Raw["model"] != "openai/gpt-5" || modelState.Content.Raw["reasoning"] != "high" {
+		t.Fatalf("Beeper AI model state content was wrong: %#v", modelState.Content)
+	}
+	if findFakeState(matrix.api.states, event.StateMSC4391BotCommand.Type) == nil {
+		t.Fatalf("command state was not synced with thread metadata: %#v", matrix.api.states)
+	}
+}
+
+func TestCodexThreadChatInfoExtraUpdatesClearsMissingAIModelState(t *testing.T) {
+	ctx := context.Background()
+	matrix := &fakeMatrixConnector{}
+	_, br := testBridgeWithDB(t, matrix)
+	key := projectPortalKey("/tmp/project", "sh-codex")
+	if err := br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := codexThreadState("thread/status/changed", "thread-1", "/tmp/project", []byte(`{
+		"threadId": "thread-1",
+		"cwd": "/tmp/project",
+		"status": {"type": "notLoaded"}
+	}`))
+	info := codexThreadChatInfo("/tmp/project", "thread-1", state)
+	if !info.ExtraUpdates(ctx, portal) {
+		t.Fatal("expected chat info extra updater to sync room state")
+	}
+
+	modelState := findFakeState(matrix.api.states, beeperAIModelStateType)
+	if modelState == nil || modelState.RoomID != portal.MXID {
+		t.Fatalf("Beeper AI model state was not cleared in the portal room: %#v", matrix.api.states)
+	}
+	if modelState.Content == nil || len(modelState.Content.Raw) != 0 {
+		t.Fatalf("Beeper AI model state clear used wrong content: %#v", modelState.Content)
+	}
+}
+
+func TestPortalInfoWithThreadStateSyncsAllRoomState(t *testing.T) {
+	ctx := context.Background()
+	matrix := &fakeMatrixConnector{}
+	_, br := testBridgeWithDB(t, matrix)
+	key := projectPortalKey("/tmp/project", "sh-codex")
+	if err := br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := codexThreadState("thread/settings/updated", "thread-1", "/tmp/project", []byte(`{
+		"threadId": "thread-1",
+		"threadSettings": {
+			"cwd": "/tmp/project",
+			"model": "gpt-5",
+			"modelProvider": "openai",
+			"effort": "high"
+		}
+	}`))
+	info := portalInfo("project", (&Client{}).codexMembers(), "/tmp/project", "thread-1", state)
+	if !info.ExtraUpdates(ctx, portal) {
+		t.Fatal("expected portal info extra updater to sync initial room state")
+	}
+	meta := portalMetadata(portal.Metadata)
+	if meta.ThreadID != "thread-1" || meta.Cwd != "/tmp/project" {
+		t.Fatalf("portal metadata was not persisted: %#v", meta)
+	}
+	for _, eventType := range []string{codexThreadStateType, beeperAIModelStateType, event.StateMSC4391BotCommand.Type} {
+		if findFakeState(matrix.api.states, eventType) == nil {
+			t.Fatalf("%s was not synced by portal info: %#v", eventType, matrix.api.states)
+		}
+	}
+}
+
+func TestBridgeInfoIncludesSelfHostedIdentity(t *testing.T) {
+	ctx := context.Background()
+	matrix := &fakeMatrixConnector{}
+	_, br := testBridgeWithDB(t, matrix)
+	key := projectPortalKey("/tmp/project", "sh-codex")
+	if err := br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	portal.UpdateBridgeInfo(ctx)
+
+	for _, eventType := range []string{event.StateBridge.Type, event.StateHalfShotBridge.Type} {
+		state := findFakeState(matrix.api.states, eventType)
+		if state == nil {
+			t.Fatalf("%s was not synced: %#v", eventType, matrix.api.states)
+		}
+		content, ok := state.Content.Parsed.(*event.BridgeEventContent)
+		if !ok {
+			t.Fatalf("%s used unexpected content: %#v", eventType, state.Content)
+		}
+		if content.BeeperBridgeName != "sh-codex" || !content.BeeperSelfHosted {
+			t.Fatalf("%s did not include self-hosted bridge identity: %#v", eventType, content)
+		}
+	}
+}
+
 func TestBlankPortalMetadataUpdaterDoesNotClearSessionMetadata(t *testing.T) {
 	portal := &bridgev2.Portal{Portal: &database.Portal{
 		PortalKey: networkid.PortalKey{ID: "project", Receiver: "codex"},
@@ -214,6 +413,82 @@ func TestConnectorUsesTypedMessageMetadata(t *testing.T) {
 	}
 }
 
+func TestNormalizeStoredMessageMetadata(t *testing.T) {
+	msg := &database.Message{
+		ID:       "msg-turn-1",
+		PartID:   partID("text"),
+		SenderID: codexUserID,
+		Metadata: &MessageMetadata{
+			ThreadID: "thread-1",
+		},
+	}
+	if !normalizeStoredMessageMetadata(msg) {
+		t.Fatal("expected legacy assistant metadata to be normalized")
+	}
+	meta, ok := msg.Metadata.(*MessageMetadata)
+	if !ok || meta.Role != "assistant" || meta.TurnID != "turn-1" || meta.StreamStatus != "complete" {
+		t.Fatalf("unexpected normalized assistant metadata: %#v", msg.Metadata)
+	}
+
+	msg = &database.Message{
+		ID:       "user:$event",
+		PartID:   partID("text"),
+		SenderID: "login:sh-codex",
+		Metadata: &MessageMetadata{
+			Role:     "user",
+			ThreadID: "thread-1",
+		},
+	}
+	if !normalizeStoredMessageMetadata(msg) {
+		t.Fatal("expected legacy user metadata to be normalized")
+	}
+	meta = msg.Metadata.(*MessageMetadata)
+	if meta.StreamStatus != "done" {
+		t.Fatalf("unexpected normalized user metadata: %#v", meta)
+	}
+}
+
+func TestConnectorNormalizesStoredMessageMetadata(t *testing.T) {
+	ctx := context.Background()
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
+	key := projectPortalKey("/tmp/project", "sh-codex")
+	if err := br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := br.DB.Ghost.Insert(ctx, &database.Ghost{ID: codexUserID, Name: "Codex"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := br.DB.Message.Insert(ctx, &database.Message{
+		ID:         "msg-turn-1",
+		PartID:     partID("text"),
+		MXID:       "$assistant:example.com",
+		Room:       key,
+		SenderID:   codexUserID,
+		SenderMXID: "@sh-codex_codex:example.com",
+		Timestamp:  time.Unix(10, 0),
+		Metadata:   &MessageMetadata{Role: "assistant", ThreadID: "thread-1", TurnID: "turn-1"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	connector.normalizeStoredMessageMetadata(ctx)
+
+	msg, err := br.DB.Message.GetPartByID(ctx, key.Receiver, "msg-turn-1", partID("text"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := msg.Metadata.(*MessageMetadata)
+	if !ok || meta.Role != "assistant" || meta.ThreadID != "thread-1" || meta.TurnID != "turn-1" || meta.StreamStatus != "complete" {
+		t.Fatalf("stored metadata was not normalized: %#v", msg.Metadata)
+	}
+}
+
 func TestThreadNoticeText(t *testing.T) {
 	if got := threadNoticeText("thread/compacted", []byte(`{"threadId":"thread-1"}`)); got == "" {
 		t.Fatal("thread compaction should produce a user-visible notice")
@@ -229,6 +504,10 @@ func TestThreadNoticeText(t *testing.T) {
 	got = threadNoticeText("thread/realtime/error", []byte(`{"threadId":"thread-1","message":"audio failed"}`))
 	if got != "Codex realtime error:\n\naudio failed" {
 		t.Fatalf("unexpected realtime error notice: %q", got)
+	}
+	got = threadNoticeText("thread/status/changed", []byte(`{"threadId":"thread-1","model":"openai/gpt-5.5","status":{"type":"systemError"}}`))
+	if got != "Codex entered system error state while using openai/gpt-5.5." {
+		t.Fatalf("unexpected system error notice: %q", got)
 	}
 	got = threadNoticeText("configWarning", []byte(`{"summary":"bad config","details":"line 4"}`))
 	if got != "Codex configWarning:\n\nbad config\n\nline 4" {
@@ -285,26 +564,295 @@ func TestNotificationProcessID(t *testing.T) {
 
 func TestCanStartActiveRunFromNotification(t *testing.T) {
 	for _, method := range []string{
+		"error",
 		"turn/started",
+		"turn/completed",
 		"item/started",
 		"item/agentMessage/delta",
 		"hook/started",
 		"turn/diff/updated",
 		"model/rerouted",
+		"thread/goal/updated",
+		"thread/tokenUsage/updated",
+		"thread/compacted",
+		"thread/realtime/closed",
+		"serverRequest/resolved",
+		"configWarning",
 	} {
 		if !canStartActiveRunFromNotification(method) {
 			t.Fatalf("expected %s to be able to start an active run", method)
 		}
 	}
 	for _, method := range []string{
-		"turn/completed",
-		"serverRequest/resolved",
-		"thread/status/changed",
-		"thread/compacted",
-		"thread/realtime/closed",
+		"account/updated",
+		"remoteControl/status/changed",
 	} {
 		if canStartActiveRunFromNotification(method) {
 			t.Fatalf("did not expect %s to start an active run", method)
 		}
 	}
+}
+
+func TestThreadMetadataNotificationUpdatesCachedRoomState(t *testing.T) {
+	connector := &Connector{threadRooms: map[string]threadRoom{}}
+	client := &Client{Main: connector, UserLogin: testUserLogin("sh-codex")}
+	oldKey := projectPortalKey("/old/project", "sh-codex")
+	connector.rememberThreadRoom("thread-1", client, oldKey, "/old/project", "openai", "gpt-4")
+
+	connector.handleThreadMetadataNotification("thread/settings/updated", "thread-1", []byte(`{
+		"threadId": "thread-1",
+		"threadSettings": {
+			"cwd": "/new/project",
+			"model": "gpt-5",
+			"modelProvider": "openai",
+			"effort": "high"
+		}
+	}`))
+
+	room, ok := connector.threadRoom("thread-1")
+	if !ok {
+		t.Fatal("expected cached thread room")
+	}
+	if room.portalKey != oldKey {
+		t.Fatalf("metadata notification without bridge should not re-id portal: %#v", room)
+	}
+	if room.cwd != "/new/project" || room.modelProvider != "openai" || room.model != "openai/gpt-5" || room.reasoningEffort != "high" {
+		t.Fatalf("metadata notification did not update cached state: %#v", room)
+	}
+}
+
+func TestThreadMetadataNotificationUpdatesActiveRunPortalKey(t *testing.T) {
+	ctx := context.Background()
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
+	login := testUserLogin("sh-codex")
+	client := &Client{Main: connector, UserLogin: login}
+	oldKey := projectPortalKey("/old/project", login.ID)
+	targetKey := projectPortalKey("/new/project", login.ID)
+	if err := br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: oldKey,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/old/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connector.rememberThreadRoom("thread-1", client, oldKey, "/old/project", "openai", "gpt-4")
+	run := newActiveRun(client, oldKey, "thread-1", "turn-1")
+	connector.setActive("thread-1", run)
+
+	connector.handleThreadMetadataNotification("thread/settings/updated", "thread-1", []byte(`{
+		"threadId": "thread-1",
+		"threadSettings": {
+			"cwd": "/new/project",
+			"model": "gpt-5",
+			"modelProvider": "openai"
+		}
+	}`))
+
+	room, ok := connector.threadRoom("thread-1")
+	if !ok {
+		t.Fatal("expected cached thread room")
+	}
+	if room.portalKey != targetKey || room.cwd != "/new/project" || room.model != "openai/gpt-5" {
+		t.Fatalf("thread room was not canonicalized: %#v", room)
+	}
+	run.mu.Lock()
+	activeKey := run.portalKey
+	activeLogin := run.client.UserLogin
+	activeModel := run.run.Model
+	run.writer.Text("after metadata")
+	activeEventModel := run.run.Events[len(run.run.Events)-1].Get("model")
+	run.mu.Unlock()
+	if activeKey != targetKey {
+		t.Fatalf("active run kept stale portal key: got %#v want %#v", activeKey, targetKey)
+	}
+	if activeLogin != login {
+		t.Fatalf("active run login changed unexpectedly: %#v", activeLogin)
+	}
+	if activeModel != "openai/gpt-5" || activeEventModel != "openai/gpt-5" {
+		t.Fatalf("active run kept stale model: run=%q event=%#v", activeModel, activeEventModel)
+	}
+	if portal, err := br.GetExistingPortalByKey(ctx, targetKey); err != nil {
+		t.Fatal(err)
+	} else if portal == nil || portal.MXID != "!room:example.com" {
+		t.Fatalf("canonical portal missing after metadata update: %#v", portal)
+	}
+}
+
+func TestThreadMetadataNotificationQueuesBridgeV2StateSync(t *testing.T) {
+	ctx := context.Background()
+	oldPortalEventBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	t.Cleanup(func() { bridgev2.PortalEventBuffer = oldPortalEventBuffer })
+
+	matrix := &fakeMatrixConnector{}
+	connector, br := testBridgeWithDB(t, matrix)
+	user, err := br.GetUserByMXID(ctx, id.UserID("@user:example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := user.NewLogin(ctx, &database.UserLogin{
+		ID:            "sh-codex",
+		RemoteName:    "Codex",
+		RemoteProfile: status.RemoteProfile{Name: "Codex"},
+		Metadata:      map[string]any{},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", "openai", "gpt-4")
+
+	connector.handleThreadMetadataNotification("thread/settings/updated", "thread-1", []byte(`{
+		"threadId": "thread-1",
+		"threadSettings": {
+			"cwd": "/tmp/project",
+			"model": "gpt-5",
+			"modelProvider": "openai",
+			"effort": "high"
+		}
+	}`))
+
+	threadState := findFakeState(matrix.api.states, codexThreadStateType)
+	if threadState == nil || threadState.RoomID != "!room:example.com" || threadState.Content.Raw["threadId"] != "thread-1" {
+		t.Fatalf("thread metadata notification did not sync Codex state: %#v", matrix.api.states)
+	}
+	modelState := findFakeState(matrix.api.states, beeperAIModelStateType)
+	if modelState == nil || modelState.Content.Raw["model"] != "openai/gpt-5" || modelState.Content.Raw["reasoning"] != "high" {
+		t.Fatalf("thread metadata notification did not sync AI model state: %#v", matrix.api.states)
+	}
+	if findFakeState(matrix.api.states, event.StateMSC4391BotCommand.Type) == nil {
+		t.Fatalf("thread metadata notification did not sync command state: %#v", matrix.api.states)
+	}
+}
+
+func TestModelVerificationNotificationKeepsCachedAIModelState(t *testing.T) {
+	ctx := context.Background()
+	oldPortalEventBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	t.Cleanup(func() { bridgev2.PortalEventBuffer = oldPortalEventBuffer })
+
+	matrix := &fakeMatrixConnector{}
+	connector, br := testBridgeWithDB(t, matrix)
+	user, err := br.GetUserByMXID(ctx, id.UserID("@user:example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := user.NewLogin(ctx, &database.UserLogin{
+		ID:            "sh-codex",
+		RemoteName:    "Codex",
+		RemoteProfile: status.RemoteProfile{Name: "Codex"},
+		Metadata:      map[string]any{},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", "openai", "gpt-5", "high")
+
+	connector.handleThreadMetadataNotification("model/verification", "thread-1", []byte(`{
+		"threadId": "thread-1",
+		"turnId": "turn-1",
+		"verifications": [{"type": "trustedAccessForCyber"}]
+	}`))
+
+	threadState := findFakeState(matrix.api.states, codexThreadStateType)
+	if threadState == nil || threadState.Content.Raw["lastNotification"] != "model/verification" {
+		t.Fatalf("model verification did not sync Codex thread state: %#v", matrix.api.states)
+	}
+	modelState := findFakeState(matrix.api.states, beeperAIModelStateType)
+	if modelState == nil || modelState.Content.Raw["model"] != "openai/gpt-5" || modelState.Content.Raw["reasoning"] != "high" {
+		t.Fatalf("model verification did not keep AI model state: %#v", matrix.api.states)
+	}
+}
+
+func TestThreadNoticeNotificationQueuesBeeperAINotice(t *testing.T) {
+	ctx := context.Background()
+	oldPortalEventBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	t.Cleanup(func() { bridgev2.PortalEventBuffer = oldPortalEventBuffer })
+
+	matrix := &fakeMatrixConnector{}
+	connector, br := testBridgeWithDB(t, matrix)
+	user, err := br.GetUserByMXID(ctx, id.UserID("@user:example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := user.NewLogin(ctx, &database.UserLogin{
+		ID:            "sh-codex",
+		RemoteName:    "Codex",
+		RemoteProfile: status.RemoteProfile{Name: "Codex"},
+		Metadata:      map[string]any{},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", "openai", "gpt-5", "high")
+
+	connector.handleThreadNoticeNotification("thread/compacted", "thread-1", []byte(`{"threadId":"thread-1"}`))
+
+	if len(matrix.api.messages) != 1 {
+		t.Fatalf("expected one notice message, got %#v", matrix.api.messages)
+	}
+	msg := matrix.api.messages[0]
+	if msg.RoomID != "!room:example.com" || msg.Type != event.EventMessage {
+		t.Fatalf("notice sent to wrong Matrix target: %#v", msg)
+	}
+	content, ok := msg.Content.Parsed.(*event.MessageEventContent)
+	if !ok || !strings.Contains(content.Body, "Codex compacted the thread context.") {
+		t.Fatalf("notice used unexpected Matrix content: %#v", msg.Content)
+	}
+	if content.BeeperPerMessageProfile == nil || content.BeeperPerMessageProfile.Displayname != "Codex" {
+		t.Fatalf("notice missing Codex per-message profile: %#v", content.BeeperPerMessageProfile)
+	}
+	ai, ok := msg.Content.Raw[aistream.BeeperAIKey].(aistream.BeeperAI)
+	if !ok || ai.Kind != aistream.AIKindFinal || ai.ThreadID != "thread-1" || ai.Model != "openai/gpt-5" {
+		t.Fatalf("notice missing final Beeper AI payload: %#v", msg.Content.Raw)
+	}
+	dbMsg, err := br.DB.Message.GetPartByID(ctx, key.Receiver, msg.Extra.MessageMeta.ID, partID("command"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, ok := dbMsg.Metadata.(*MessageMetadata)
+	if !ok || meta.Role != "assistant" || meta.ThreadID != "thread-1" || meta.StreamStatus != "notice" {
+		t.Fatalf("notice DB metadata was wrong: %#v", dbMsg.Metadata)
+	}
+}
+
+func findFakeState(states []fakeStateEvent, eventType string) *fakeStateEvent {
+	for i := range states {
+		if states[i].Type.Type == eventType {
+			return &states[i]
+		}
+	}
+	return nil
 }

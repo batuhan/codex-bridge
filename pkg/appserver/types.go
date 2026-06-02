@@ -21,8 +21,29 @@ type ThreadReadResponse struct {
 	Thread Thread `json:"thread"`
 }
 
-type ThreadStartResponse struct {
-	Thread Thread `json:"thread"`
+type ThreadTurnsListResponse struct {
+	Data            []Turn `json:"data"`
+	NextCursor      string `json:"nextCursor"`
+	BackwardsCursor string `json:"backwardsCursor"`
+}
+
+type ThreadOpenResponse struct {
+	Thread          Thread `json:"thread"`
+	Model           string `json:"model"`
+	ModelProvider   string `json:"modelProvider"`
+	ServiceTier     string `json:"serviceTier"`
+	Cwd             string `json:"cwd"`
+	ReasoningEffort string `json:"reasoningEffort"`
+}
+
+type ModelListResponse struct {
+	Data       []Model `json:"data"`
+	NextCursor string  `json:"nextCursor"`
+}
+
+type Model struct {
+	ID    string `json:"id"`
+	Model string `json:"model"`
 }
 
 type TurnStartResponse struct {
@@ -41,6 +62,35 @@ type Thread struct {
 	ModelProvider string         `json:"modelProvider"`
 	Turns         []Turn         `json:"turns"`
 	Raw           map[string]any `json:"-"`
+}
+
+func (r ThreadOpenResponse) HydratedThread() Thread {
+	thread := r.Thread
+	if r.Cwd != "" {
+		thread.Cwd = r.Cwd
+	}
+	if r.ModelProvider != "" {
+		thread.ModelProvider = r.ModelProvider
+	}
+	if thread.Raw == nil {
+		thread.Raw = map[string]any{}
+	}
+	if r.Model != "" {
+		thread.Raw["model"] = r.Model
+	}
+	if r.ModelProvider != "" {
+		thread.Raw["modelProvider"] = r.ModelProvider
+	}
+	if r.ServiceTier != "" {
+		thread.Raw["serviceTier"] = r.ServiceTier
+	}
+	if r.ReasoningEffort != "" {
+		thread.Raw["effort"] = r.ReasoningEffort
+	}
+	if r.Cwd != "" {
+		thread.Raw["cwd"] = r.Cwd
+	}
+	return thread
 }
 
 func (t *Thread) UnmarshalJSON(raw []byte) error {
@@ -68,6 +118,7 @@ type Turn struct {
 
 type TurnItem struct {
 	ID               string           `json:"id"`
+	ClientID         string           `json:"clientId"`
 	Type             string           `json:"type"`
 	Text             string           `json:"text"`
 	Phase            string           `json:"phase"`
@@ -89,6 +140,7 @@ func (t *TurnItem) UnmarshalJSON(raw []byte) error {
 	}
 	var item TurnItem
 	_ = json.Unmarshal(fields["id"], &item.ID)
+	_ = json.Unmarshal(fields["clientId"], &item.ClientID)
 	_ = json.Unmarshal(fields["type"], &item.Type)
 	_ = json.Unmarshal(fields["text"], &item.Text)
 	_ = json.Unmarshal(fields["phase"], &item.Phase)

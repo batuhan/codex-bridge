@@ -43,9 +43,14 @@ func TestBackfillAssistantMessageUsesBeeperAI(t *testing.T) {
 	if len(messages) != 2 {
 		t.Fatalf("expected user and assistant backfill messages, got %d", len(messages))
 	}
+	userPart := messages[0].ConvertedMessage.Parts[0]
+	userMeta, ok := userPart.DBMetadata.(*MessageMetadata)
+	if !ok || userMeta.Role != "user" || userMeta.ThreadID != "thread-1" || userMeta.TurnID != "turn-1" || userMeta.StreamStatus != "done" {
+		t.Fatalf("user backfill has wrong DB metadata: %#v", userPart.DBMetadata)
+	}
 	part := messages[1].ConvertedMessage.Parts[0]
 	meta, ok := part.DBMetadata.(*MessageMetadata)
-	if !ok || meta.Role != "assistant" || meta.ThreadID != "thread-1" || meta.TurnID != "turn-1" {
+	if !ok || meta.Role != "assistant" || meta.ThreadID != "thread-1" || meta.TurnID != "turn-1" || meta.StreamStatus != "complete" {
 		t.Fatalf("assistant backfill has wrong DB metadata: %#v", part.DBMetadata)
 	}
 	ai, ok := part.Extra[aistream.BeeperAIKey].(aistream.BeeperAI)
@@ -58,8 +63,96 @@ func TestBackfillAssistantMessageUsesBeeperAI(t *testing.T) {
 	if len(ai.Message.Parts) < 2 {
 		t.Fatalf("expected text and tool parts, got %#v", ai.Message.Parts)
 	}
+	assertCodexProfile(t, part.Content)
 	if !strings.Contains(part.Content.Body, "done") {
 		t.Fatalf("assistant fallback body missing text: %q", part.Content.Body)
+	}
+}
+
+func TestBackfillAssistantMessageUploadsOversizedFinalParts(t *testing.T) {
+	intent := &recordingMediaIntent{}
+	client := &Client{
+		Main:      &Connector{Bridge: &bridgev2.Bridge{Bot: intent}},
+		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "codex"}},
+	}
+	thread := appserver.Thread{
+		ID:            "thread-1",
+		ModelProvider: "openai/gpt-5",
+		CreatedAt:     100,
+		Turns: []appserver.Turn{{
+			ID:        "turn-1",
+			StartedAt: 100,
+			Items: []appserver.TurnItem{
+				{ID: "cmd-1", Type: "commandExecution", Command: "cat huge.txt", AggregatedOutput: strings.Repeat("x", aistream.FinalMessageBudgetBytes)},
+				{ID: "agent-1", Type: "agentMessage", Text: "done"},
+			},
+		}},
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{ID: "portal", Receiver: "codex"},
+		MXID:      "!room:example.com",
+	}}
+	messages, err := client.projectBackfillMessages(context.Background(), portal, thread)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected one assistant backfill message, got %d", len(messages))
+	}
+	part := messages[0].ConvertedMessage.Parts[0]
+	assertCodexProfile(t, part.Content)
+	if intent.roomID != portal.MXID {
+		t.Fatalf("backfill upload used wrong room: %q", intent.roomID)
+	}
+	if intent.mimeType != aistream.FinalPartsMediaType {
+		t.Fatalf("backfill upload used wrong MIME type: %q", intent.mimeType)
+	}
+	ai, ok := part.Extra[aistream.BeeperAIKey].(aistream.BeeperAI)
+	if !ok {
+		t.Fatalf("assistant backfill missing com.beeper.ai payload: %#v", part.Extra)
+	}
+	if ai.Final == nil || ai.Final.Delivery != "attachment" || ai.Final.PartsComplete {
+		t.Fatalf("backfill final metadata should advertise attachment delivery: %#v", ai.Final)
+	}
+	if ai.Final.PartsRef == nil || ai.Final.PartsRef.URL != string(intent.url) {
+		t.Fatalf("missing uploaded backfill parts ref: %#v", ai.Final)
+	}
+	if ai.Message == nil || len(ai.Message.Parts) != 0 {
+		t.Fatalf("inline backfill final parts should be empty after upload: %#v", ai.Message)
+	}
+	var payload aistream.FinalPartsPayload
+	if err := json.Unmarshal(intent.data, &payload); err != nil {
+		t.Fatalf("uploaded backfill payload is not final parts JSON: %v", err)
+	}
+	if payload.Schema != aistream.FinalPartsPayloadSchema || payload.ThreadID != thread.ID || payload.RunID != "turn-1" || payload.MessageID == "" {
+		t.Fatalf("bad uploaded backfill final parts payload: %#v", payload)
+	}
+}
+
+func TestBackfillUserMessageUsesCodexClientID(t *testing.T) {
+	client := &Client{UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "codex"}}}
+	thread := appserver.Thread{
+		ID:            "thread-1",
+		ModelProvider: "openai/gpt-5",
+		CreatedAt:     100,
+		Turns: []appserver.Turn{{
+			ID:        "turn-1",
+			StartedAt: 100,
+			Items: []appserver.TurnItem{
+				{ID: "item-1", ClientID: "$event:beeper.local", Type: "userMessage", Content: []appserver.InputPart{{Type: "text", Text: "status"}}},
+			},
+		}},
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: networkid.PortalKey{ID: "portal", Receiver: "codex"}}}
+	messages, err := client.projectBackfillMessages(context.Background(), portal, thread)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected one user message, got %d", len(messages))
+	}
+	if messages[0].ID != "user:$event:beeper.local" || messages[0].TxnID != "user:$event:beeper.local" {
+		t.Fatalf("backfilled user message did not use clientId: id=%q txn=%q", messages[0].ID, messages[0].TxnID)
 	}
 }
 
@@ -93,6 +186,7 @@ func TestBackfillContextCompactionProducesVisibleAIText(t *testing.T) {
 	if !strings.Contains(part.Content.Body, codexCompactionNotice) {
 		t.Fatalf("fallback body missing compaction notice: %q", part.Content.Body)
 	}
+	assertCodexProfile(t, part.Content)
 	if !aiMessageHasText(ai, codexCompactionNotice) {
 		t.Fatalf("AI parts missing compaction notice: %#v", ai.Message.Parts)
 	}
@@ -293,6 +387,18 @@ func TestPaginateBackfillMessagesUsesAnchor(t *testing.T) {
 	}
 }
 
+func TestCodexBackfillMaxBatchCountIsUnlimitedForRooms(t *testing.T) {
+	client := &Client{}
+	portal := &bridgev2.Portal{Portal: &database.Portal{RoomType: database.RoomTypeDM}}
+	if got := client.GetBackfillMaxBatchCount(context.Background(), portal, nil); got != -1 {
+		t.Fatalf("Codex room backfill should be unlimited, got %d", got)
+	}
+	portal.RoomType = database.RoomTypeSpace
+	if got := client.GetBackfillMaxBatchCount(context.Background(), portal, nil); got != 0 {
+		t.Fatalf("space backfill should be disabled, got %d", got)
+	}
+}
+
 func TestBackfillAssistantUsesGhostSender(t *testing.T) {
 	client := &Client{UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "codex"}}}
 	thread := appserver.Thread{
@@ -385,6 +491,14 @@ func TestGeneratedCodexThreadItemsAreBackfilled(t *testing.T) {
 	}
 }
 
+func TestTypeScriptV2CodexThreadItemsAreBackfilled(t *testing.T) {
+	for _, itemType := range generatedTypeScriptThreadItemTypes(t) {
+		if !isBackfilledThreadItemType(itemType) {
+			t.Fatalf("TypeScript v2 Codex thread item %q is not covered by backfill", itemType)
+		}
+	}
+}
+
 func TestBackfillToolNameAndResultUseRichItemData(t *testing.T) {
 	data := map[string]any{
 		"id":     "mcp-1",
@@ -409,6 +523,25 @@ func TestBackfillToolNameAndResultUseRichItemData(t *testing.T) {
 	if result := backfillToolResultText(data); !strings.Contains(result, "done") {
 		t.Fatalf("unexpected dynamic tool result: %q", result)
 	}
+}
+
+func TestBackfillAssistantRunSequenceIsValid(t *testing.T) {
+	run := aistream.NewRun("turn-1", "thread-1", "openai/gpt-5", "codex", "Codex", time.Unix(0, 0))
+	writer := aistream.NewWriter(run, func() time.Time { return time.Unix(0, 0) })
+	writer.Start()
+	writer.StepStart("turn-1")
+	for _, item := range []appserver.TurnItem{
+		{ID: "cmd-1", Type: "commandExecution", Raw: map[string]any{"id": "cmd-1", "type": "commandExecution", "command": "go test ./...", "status": "completed", "aggregatedOutput": "ok"}},
+		{ID: "agent-1", Type: "agentMessage", Text: "done"},
+	} {
+		if !mapBackfillItem(writer, run.MessageID, item) {
+			t.Fatalf("expected %s item to be backfilled", item.Type)
+		}
+	}
+	writer.StepFinish("turn-1")
+	writer.Finish(agui.FinishReasonStop)
+
+	assertAGUISequenceValid(t, run)
 }
 
 func TestBackfillToolItemPreservesFailureState(t *testing.T) {
@@ -457,6 +590,9 @@ func TestBackfillCommandExecutionUsesRawAggregatedOutput(t *testing.T) {
 	if !hasToolResultState(run.Events, "cmd-1", "ok", agui.ToolResultStateComplete) {
 		t.Fatalf("expected raw aggregated output to map to tool result, got %#v", run.Events)
 	}
+	if !hasToolArgsContaining(run.Events, "cmd-1", "go test ./...") {
+		t.Fatalf("expected command input to map to tool args, got %#v", run.Events)
+	}
 }
 
 func TestBackfillFileChangeIncludesPatchDiff(t *testing.T) {
@@ -501,6 +637,23 @@ func TestBackfillPlanItemMapsToActivitySnapshot(t *testing.T) {
 	}
 }
 
+func TestBackfillHookPromptMapsTextState(t *testing.T) {
+	run := aistream.NewRun("turn-1", "thread-1", "codex", "codex", "Codex", time.Unix(0, 0))
+	writer := aistream.NewWriter(run, func() time.Time { return time.Unix(0, 0) })
+	item := appserver.TurnItem{
+		ID:        "hook-prompt-1",
+		Type:      "hookPrompt",
+		Fragments: []appserver.PromptFragment{{Text: "Preserve approval context."}},
+	}
+
+	if !mapBackfillItem(writer, run.MessageID, item) {
+		t.Fatal("expected hook prompt item to be backfilled")
+	}
+	if !hasStateDeltaText(run.Events, "hookPromptText", "Preserve approval context.") {
+		t.Fatalf("expected hook prompt text state, got %#v", run.Events)
+	}
+}
+
 func generatedCodexThreadItemTypes(t *testing.T) []string {
 	t.Helper()
 	raw, err := os.ReadFile(codexGeneratedSchemaPath)
@@ -508,6 +661,25 @@ func generatedCodexThreadItemTypes(t *testing.T) []string {
 		t.Fatalf("read generated Codex schema: %v", err)
 	}
 	re := regexp.MustCompile(`(?s)type:\s*Annotated\[\s*Literal\["([^"]+)"\].{0,300}?ThreadItemType`)
+	seen := map[string]bool{}
+	for _, match := range re.FindAllSubmatch(raw, -1) {
+		seen[string(match[1])] = true
+	}
+	types := make([]string, 0, len(seen))
+	for itemType := range seen {
+		types = append(types, itemType)
+	}
+	sort.Strings(types)
+	return types
+}
+
+func generatedTypeScriptThreadItemTypes(t *testing.T) []string {
+	t.Helper()
+	raw, err := os.ReadFile(codexTypeScriptV2ThreadItemPath)
+	if err != nil {
+		t.Fatalf("read generated Codex TypeScript thread item schema: %v", err)
+	}
+	re := regexp.MustCompile(`"type":\s*"([^"]+)"`)
 	seen := map[string]bool{}
 	for _, match := range re.FindAllSubmatch(raw, -1) {
 		seen[string(match[1])] = true

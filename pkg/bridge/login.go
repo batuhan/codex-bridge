@@ -129,6 +129,7 @@ func (c *Connector) ensureLoginID(ctx context.Context, user *bridgev2.User, logi
 		if cached.Client != nil {
 			cached.Client.Connect(ctx)
 		}
+		c.syncLoginGhost(ctx, loginID)
 		return cached, nil
 	}
 	login, err := user.NewLogin(ctx, &database.UserLogin{
@@ -144,7 +145,21 @@ func (c *Connector) ensureLoginID(ctx context.Context, user *bridgev2.User, logi
 	if login.Client != nil {
 		login.Client.Connect(ctx)
 	}
+	c.syncLoginGhost(ctx, loginID)
 	return login, nil
+}
+
+func (c *Connector) syncLoginGhost(ctx context.Context, loginID networkid.UserLoginID) {
+	if c == nil || c.Bridge == nil || loginID == "" {
+		return
+	}
+	userID := networkid.UserID("login:" + string(loginID))
+	ghost, err := c.Bridge.GetGhostByID(ctx, userID)
+	if err != nil {
+		logFromContext(ctx).Warn().Err(err).Str("user_id", string(userID)).Msg("Failed to load Codex login ghost")
+		return
+	}
+	ghost.UpdateInfo(ctx, loginUserInfo())
 }
 
 func (c *Connector) defaultLoginIDForUser(user *bridgev2.User) networkid.UserLoginID {

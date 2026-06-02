@@ -1,10 +1,14 @@
 package bridge
 
 import (
+	"context"
+	"encoding/json"
 	"os"
 	"regexp"
 	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"maunium.net/go/mautrix/bridgev2/status"
 )
@@ -12,6 +16,9 @@ import (
 const codexGeneratedSchemaPath = "/Users/batuhan/projects/codex/sdk/python/src/openai_codex/generated/v2_all.py"
 const codexTypeScriptNotificationPath = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/typescript/ServerNotification.ts"
 const codexTypeScriptServerRequestPath = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/typescript/ServerRequest.ts"
+const codexJSONNotificationPath = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/json/ServerNotification.json"
+const codexJSONServerRequestPath = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/json/ServerRequest.json"
+const codexTypeScriptV2ThreadItemPath = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/typescript/v2/ThreadItem.ts"
 
 func TestClientFillsBridgeStateWithCodexGlobalState(t *testing.T) {
 	connector := &Connector{globalState: map[string]any{
@@ -28,6 +35,127 @@ func TestClientFillsBridgeStateWithCodexGlobalState(t *testing.T) {
 	}
 	if codex["lastNotification"] != "account/rateLimits/updated" {
 		t.Fatalf("unexpected codex bridge state: %#v", codex)
+	}
+}
+
+func TestGlobalCodexNotificationsBroadcastBridgeState(t *testing.T) {
+	tests := []struct {
+		method    string
+		params    string
+		wantState status.BridgeStateEvent
+		wantMsg   string
+	}{
+		{
+			method:    "account/rateLimits/updated",
+			params:    `{"marker":"rate-limits","rateLimits":{"planType":"plus"}}`,
+			wantState: status.StateConnected,
+		},
+		{
+			method:    "configWarning",
+			params:    `{"marker":"config-warning","message":"bad config","details":"line 4"}`,
+			wantState: status.StateConnected,
+			wantMsg:   "bad config",
+		},
+		{
+			method:    "error",
+			params:    `{"marker":"error","message":"boom"}`,
+			wantState: status.StateUnknownError,
+			wantMsg:   "boom",
+		},
+		{
+			method:    "account/login/completed",
+			params:    `{"marker":"login-failed","success":false,"error":"bad login"}`,
+			wantState: status.StateLoggedOut,
+			wantMsg:   "bad login",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.method, func(t *testing.T) {
+			ctx := context.Background()
+			matrix := &fakeMatrixConnector{bridgeStateCh: make(chan status.BridgeState, 8)}
+			connector, br := testBridgeWithDB(t, matrix)
+			user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+			if err != nil {
+				t.Fatal(err)
+			}
+			login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+			if err != nil {
+				t.Fatal(err)
+			}
+			login.Client = &Client{Main: connector, UserLogin: login, loggedIn: true}
+			drainBridgeStates(matrix.bridgeStateCh)
+
+			connector.handleGlobalNotification(tt.method, []byte(tt.params))
+			state := waitBridgeState(t, matrix.bridgeStateCh)
+			if state.StateEvent != tt.wantState {
+				t.Fatalf("state event = %s, want %s: %#v", state.StateEvent, tt.wantState, state)
+			}
+			if tt.wantMsg != "" && !strings.Contains(state.Message, tt.wantMsg) {
+				t.Fatalf("state message %q did not contain %q", state.Message, tt.wantMsg)
+			}
+			codex, ok := state.Info["codex"].(map[string]any)
+			if !ok {
+				t.Fatalf("bridge state missing Codex info: %#v", state.Info)
+			}
+			if codex["lastNotification"] != tt.method {
+				t.Fatalf("last notification = %#v, want %s: %#v", codex["lastNotification"], tt.method, codex)
+			}
+			payload, ok := codex[tt.method].(map[string]any)
+			if !ok || payload["marker"] == "" {
+				t.Fatalf("bridge state did not preserve global Codex payload: %#v", codex)
+			}
+		})
+	}
+}
+
+func TestGlobalCodexNotificationsPreserveRawBridgeInfo(t *testing.T) {
+	for _, method := range currentCodexServerNotifications {
+		if !handledAsGlobalNotification(method) {
+			continue
+		}
+		t.Run(method, func(t *testing.T) {
+			connector := &Connector{globalState: map[string]any{}}
+			connector.handleGlobalNotification(method, []byte(`{"marker":"raw-global"}`))
+
+			codex := connector.globalBridgeInfo()
+			if codex["lastNotification"] != method {
+				t.Fatalf("last notification = %#v, want %s: %#v", codex["lastNotification"], method, codex)
+			}
+			payload, ok := codex[method].(map[string]any)
+			if !ok || payload["marker"] != "raw-global" {
+				t.Fatalf("global bridge info did not preserve raw payload: %#v", codex)
+			}
+		})
+	}
+}
+
+func handledAsGlobalNotification(method string) bool {
+	switch method {
+	case "warning", "configWarning", "deprecationNotice", "guardianWarning", "error":
+		return true
+	default:
+		return isGlobalNotification(method)
+	}
+}
+
+func drainBridgeStates(ch <-chan status.BridgeState) {
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
+func waitBridgeState(t *testing.T, ch <-chan status.BridgeState) status.BridgeState {
+	t.Helper()
+	select {
+	case state := <-ch:
+		return state
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for bridge state")
+		return status.BridgeState{}
 	}
 }
 
@@ -63,6 +191,48 @@ func TestTypeScriptCodexServerNotificationsAreClassified(t *testing.T) {
 	}
 }
 
+func TestTypeScriptCodexThreadNotificationsHaveDispatchLane(t *testing.T) {
+	methods := generatedTypeScriptMethods(t, codexTypeScriptNotificationPath)
+	if len(methods) == 0 {
+		t.Fatal("TypeScript Codex schema did not contain notification methods")
+	}
+	for _, method := range methods {
+		if !isThreadNotification(method) {
+			continue
+		}
+		if !isThreadMetadataNotification(method) && !isThreadNoticeNotification(method) && !isActiveRunNotification(method) {
+			t.Fatalf("TypeScript Codex thread notification %q has no metadata, notice, or active-run dispatch lane", method)
+		}
+	}
+}
+
+func TestJSONCodexServerNotificationsAreClassified(t *testing.T) {
+	methods := generatedJSONMethods(t, codexJSONNotificationPath)
+	if len(methods) == 0 {
+		t.Fatal("JSON Codex schema did not contain notification methods")
+	}
+	for _, method := range methods {
+		if !isThreadNotification(method) && !isGlobalNotification(method) {
+			t.Fatalf("JSON Codex server notification %q is not classified", method)
+		}
+	}
+}
+
+func TestJSONCodexThreadNotificationsHaveDispatchLane(t *testing.T) {
+	methods := generatedJSONMethods(t, codexJSONNotificationPath)
+	if len(methods) == 0 {
+		t.Fatal("JSON Codex schema did not contain notification methods")
+	}
+	for _, method := range methods {
+		if !isThreadNotification(method) {
+			continue
+		}
+		if !isThreadMetadataNotification(method) && !isThreadNoticeNotification(method) && !isActiveRunNotification(method) {
+			t.Fatalf("JSON Codex thread notification %q has no metadata, notice, or active-run dispatch lane", method)
+		}
+	}
+}
+
 func TestTypeScriptCodexServerRequestsAreHandled(t *testing.T) {
 	methods := generatedTypeScriptMethods(t, codexTypeScriptServerRequestPath)
 	if len(methods) == 0 {
@@ -71,6 +241,18 @@ func TestTypeScriptCodexServerRequestsAreHandled(t *testing.T) {
 	for _, method := range methods {
 		if !isHandledCodexServerRequest(method) {
 			t.Fatalf("TypeScript Codex server request %q is not handled", method)
+		}
+	}
+}
+
+func TestJSONCodexServerRequestsAreHandled(t *testing.T) {
+	methods := generatedJSONMethods(t, codexJSONServerRequestPath)
+	if len(methods) == 0 {
+		t.Fatal("JSON Codex schema did not contain server request methods")
+	}
+	for _, method := range methods {
+		if !isHandledCodexServerRequest(method) {
+			t.Fatalf("JSON Codex server request %q is not handled", method)
 		}
 	}
 }
@@ -85,6 +267,40 @@ func generatedCodexNotificationMethods(t *testing.T) []string {
 	seen := map[string]bool{}
 	for _, match := range re.FindAllSubmatch(raw, -1) {
 		seen[string(match[1])] = true
+	}
+	methods := make([]string, 0, len(seen))
+	for method := range seen {
+		methods = append(methods, method)
+	}
+	sort.Strings(methods)
+	return methods
+}
+
+func generatedJSONMethods(t *testing.T, path string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read generated Codex JSON schema: %v", err)
+	}
+	var schema struct {
+		OneOf []struct {
+			Properties struct {
+				Method struct {
+					Enum []string `json:"enum"`
+				} `json:"method"`
+			} `json:"properties"`
+		} `json:"oneOf"`
+	}
+	if err = json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("parse generated Codex JSON schema: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, item := range schema.OneOf {
+		for _, method := range item.Properties.Method.Enum {
+			if method != "" {
+				seen[method] = true
+			}
+		}
 	}
 	methods := make([]string, 0, len(seen))
 	for method := range seen {

@@ -2,19 +2,24 @@ package bridge
 
 import (
 	"context"
+	"strings"
 
 	aistream "github.com/beeper/ai-bridge/pkg/ai-stream"
+	"github.com/beeper/ai-bridge/pkg/aiid"
 	"maunium.net/go/mautrix/bridgev2"
+	"maunium.net/go/mautrix/bridgev2/database"
+	"maunium.net/go/mautrix/bridgev2/networkid"
 )
 
 const (
 	codexThreadStateType   = "com.beeper.codex.thread"
-	beeperAIModelStateType = "com.beeper.ai.model"
+	beeperAIModelStateType = aiid.RoomModelType
 )
 
 type PortalMetadata struct {
-	ThreadID string `json:"thread_id,omitempty"`
-	Cwd      string `json:"cwd,omitempty"`
+	ThreadID        string `json:"thread_id,omitempty"`
+	Cwd             string `json:"cwd,omitempty"`
+	BackfillVersion int    `json:"backfill_version,omitempty"`
 }
 
 type MessageMetadata struct {
@@ -83,4 +88,57 @@ func codexPortalMetadataUpdater(cwd, threadID string) bridgev2.ExtraUpdater[*bri
 		}
 		return changed
 	}
+}
+
+func normalizeStoredMessageMetadata(msg *database.Message) bool {
+	if msg == nil {
+		return false
+	}
+	meta, ok := msg.Metadata.(*MessageMetadata)
+	if !ok || meta == nil {
+		meta = &MessageMetadata{}
+	}
+	changed := false
+	if meta.Role == "" {
+		switch {
+		case msg.SenderID == codexUserID:
+			meta.Role = "assistant"
+			changed = true
+		case strings.HasPrefix(string(msg.SenderID), "login:"):
+			meta.Role = "user"
+			changed = true
+		}
+	}
+	if meta.Role == "assistant" && meta.TurnID == "" {
+		if turnID := turnIDFromMessageID(msg.ID); turnID != "" {
+			meta.TurnID = turnID
+			changed = true
+		}
+	}
+	if meta.StreamStatus == "" {
+		switch meta.Role {
+		case "assistant":
+			meta.StreamStatus = "complete"
+			changed = true
+		case "user":
+			meta.StreamStatus = "done"
+			changed = true
+		}
+	}
+	if changed {
+		msg.Metadata = meta
+	}
+	return changed
+}
+
+func turnIDFromMessageID(messageID networkid.MessageID) string {
+	raw := string(messageID)
+	if strings.HasPrefix(raw, "msg-") {
+		return strings.TrimPrefix(raw, "msg-")
+	}
+	if before, turnID, ok := strings.Cut(raw, ":"); ok && before == "codex" {
+		turnID, _, _ = strings.Cut(turnID, ":")
+		return turnID
+	}
+	return ""
 }

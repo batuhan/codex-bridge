@@ -74,14 +74,26 @@ func (r *activeRun) handleServerRequest(ctx context.Context, msg appserver.Messa
 			}},
 			"success": false,
 		}, nil
-	case "account/chatgptAuthTokens/refresh":
-		return nil, fmt.Errorf("Codex auth token refresh must be handled by the local Codex login")
 	default:
 		return nil, fmt.Errorf("unsupported Codex server request %s", msg.Method)
 	}
 }
 
+func directServerRequestError(method string) (int, string, bool) {
+	switch method {
+	case "attestation/generate":
+		return -32002, "Codex bridge does not provide attestation tokens", true
+	case "account/chatgptAuthTokens/refresh":
+		return -32002, "Codex auth token refresh must be handled by the local Codex login", true
+	default:
+		return 0, "", false
+	}
+}
+
 func isHandledCodexServerRequest(method string) bool {
+	if _, _, ok := directServerRequestError(method); ok {
+		return true
+	}
 	switch method {
 	case "item/commandExecution/requestApproval",
 		"item/fileChange/requestApproval",
@@ -90,9 +102,7 @@ func isHandledCodexServerRequest(method string) bool {
 		"execCommandApproval",
 		"item/tool/requestUserInput",
 		"mcpServer/elicitation/request",
-		"item/tool/call",
-		"account/chatgptAuthTokens/refresh",
-		"attestation/generate":
+		"item/tool/call":
 		return true
 	default:
 		return false
@@ -166,6 +176,7 @@ func (r *activeRun) queueApprovalPromptLocked(request aistream.ApprovalRequest) 
 		Choices:     choices,
 		AgentID:     "codex",
 		AgentName:   "Codex",
+		Model:       r.run.Model,
 		Metadata:    request.Metadata,
 	}
 	msg := r.approvalPromptMessage(ctxMeta, time.Now())
@@ -193,6 +204,7 @@ func (r *activeRun) approvalPromptMessage(ctxMeta aistream.ApprovalContext, ts t
 				choices = aistream.DefaultApprovalChoices()
 			}
 			content, extra := aimatrix.ApprovalContent(data, choices)
+			applyCodexMessageProfile(content)
 			return &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{
 				ID:         networkid.PartID("0"),
 				Type:       event.EventMessage,
@@ -322,14 +334,35 @@ func (r *activeRun) resolvePendingValue(id string, value any) bool {
 		return false
 	}
 	delete(r.pending, id)
-	if approval, ok := value.(aistream.ToolApprovalResponse); ok {
-		r.writer.ToolApprovalResponded(pending.ToolCallID, pending.ToolName, pending.Input, approval)
+	if response, ok := streamResponseForResolvedPending(pending, value); ok {
+		r.writer.ToolApprovalResponded(pending.ToolCallID, pending.ToolName, pending.Input, response)
 		r.publishLocked()
-		r.client.queueCodexTyping(r.portalKey, 30*time.Second)
+		if r.client != nil {
+			r.client.queueCodexTyping(r.portalKey, 30*time.Second)
+		}
 	}
 	r.mu.Unlock()
 	pending.Response <- value
 	return true
+}
+
+func streamResponseForResolvedPending(pending *pendingServerRequest, value any) (aistream.ToolApprovalResponse, bool) {
+	if response, ok := value.(aistream.ToolApprovalResponse); ok {
+		return response, true
+	}
+	if pending == nil || pending.ID == "" {
+		return aistream.ToolApprovalResponse{}, false
+	}
+	return aistream.ToolApprovalResponse{
+		ID:          pending.ID,
+		Approved:    true,
+		Choice:      "answer",
+		RespondedAt: responseTime(""),
+		Metadata: map[string]any{
+			"method":   pending.Method,
+			"response": value,
+		},
+	}, true
 }
 
 func (r *activeRun) cancelPending(id string) {
@@ -504,23 +537,24 @@ func (cl *Client) commandHandledResponse(msg *bridgev2.MatrixMessage, status str
 	if msg != nil && msg.Portal != nil {
 		meta = portalMetadata(msg.Portal.Metadata)
 	}
+	timestamp := matrixEventTime(msg.Event)
 	return &bridgev2.MatrixMessageResponse{DB: &database.Message{
 		ID:        networkid.MessageID("command:" + string(msg.Event.ID)),
 		PartID:    partID("command"),
 		Room:      msg.Portal.PortalKey,
 		SenderID:  cl.GetUserID(),
-		Timestamp: matrixEventTime(msg.Event),
+		Timestamp: timestamp,
 		Metadata:  &MessageMetadata{Role: "command", ThreadID: meta.ThreadID, StreamStatus: status},
-	}}
+	}, StreamOrder: timestamp.UnixNano()}
 }
 
 func (cl *Client) queueCommandNotice(portal *bridgev2.Portal, threadID, text string) {
-	if cl == nil || cl.UserLogin == nil || portal == nil || strings.TrimSpace(text) == "" {
+	if cl == nil || cl.UserLogin == nil || cl.UserLogin.Bridge == nil || portal == nil || strings.TrimSpace(text) == "" {
 		return
 	}
 	now := time.Now()
 	msgID := networkid.MessageID(fmt.Sprintf("command-notice:%d", now.UnixNano()))
-	run := commandNoticeRun(text, string(msgID), threadID, now)
+	run := commandNoticeRun(text, string(msgID), threadID, activeRunInitialModel(cl, threadID), now)
 	res := cl.UserLogin.QueueRemoteEvent(&simplevent.Message[aistream.Run]{
 		EventMeta: remoteEventMeta(bridgev2.RemoteEventMessage, portal.PortalKey, codexUserID, now),
 		ID:        msgID,
@@ -547,8 +581,8 @@ func (cl *Client) queueCommandNotice(portal *bridgev2.Portal, threadID, text str
 	}
 }
 
-func commandNoticeRun(text string, messageID string, threadID string, now time.Time) aistream.Run {
-	run := aistream.NewRun(fmt.Sprintf("command-%d", now.UnixNano()), threadID, "codex", "codex", "Codex", now)
+func commandNoticeRun(text string, messageID string, threadID string, model string, now time.Time) aistream.Run {
+	run := aistream.NewRun(fmt.Sprintf("command-%d", now.UnixNano()), threadID, model, "codex", "Codex", now)
 	run.MessageID = messageID
 	run.Data["capabilities"] = codexAgentCapabilities()
 	writer := aistream.NewWriter(run, func() time.Time { return now })

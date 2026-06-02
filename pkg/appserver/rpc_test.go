@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseVersion(t *testing.T) {
@@ -66,6 +68,76 @@ func TestRequestReturnsRPCError(t *testing.T) {
 	}
 	if string(rpcErr.Data) != `{"detail":"kept"}` {
 		t.Fatalf("unexpected RPC error data: %s", rpcErr.Data)
+	}
+}
+
+func TestReadLoopAcceptsLargeMessages(t *testing.T) {
+	stdoutReader, stdoutWriter := io.Pipe()
+	client := &Client{
+		stdout:   stdoutReader,
+		waiting:  map[string]chan Message{},
+		incoming: make(chan Message, 1),
+		done:     make(chan struct{}),
+	}
+	go client.readLoop()
+	defer client.Close()
+
+	largeDelta := strings.Repeat("x", 5*1024*1024)
+	go func() {
+		_ = json.NewEncoder(stdoutWriter).Encode(Message{
+			Method: "item/agentMessage/delta",
+			Params: json.RawMessage(`{"delta":"` + largeDelta + `"}`),
+		})
+	}()
+
+	select {
+	case msg := <-client.Incoming():
+		if msg.Method != "item/agentMessage/delta" || len(msg.Params) < len(largeDelta) {
+			t.Fatalf("large message was not preserved: method=%q params=%d", msg.Method, len(msg.Params))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for large app-server message")
+	}
+}
+
+func TestReadLoopBackpressuresInsteadOfDroppingNotifications(t *testing.T) {
+	stdoutReader, stdoutWriter := io.Pipe()
+	client := &Client{
+		stdout:   stdoutReader,
+		waiting:  map[string]chan Message{},
+		incoming: make(chan Message, 1),
+		done:     make(chan struct{}),
+	}
+	go client.readLoop()
+	defer client.Close()
+
+	writeDone := make(chan error, 1)
+	go func() {
+		if err := json.NewEncoder(stdoutWriter).Encode(Message{Method: "first"}); err != nil {
+			writeDone <- err
+			return
+		}
+		writeDone <- json.NewEncoder(stdoutWriter).Encode(Message{Method: "second"})
+	}()
+
+	select {
+	case msg := <-client.Incoming():
+		if msg.Method != "first" {
+			t.Fatalf("unexpected first message: %#v", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first notification")
+	}
+	select {
+	case msg := <-client.Incoming():
+		if msg.Method != "second" {
+			t.Fatalf("unexpected second message: %#v", msg)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second notification was dropped")
+	}
+	if err := <-writeDone; err != nil {
+		t.Fatalf("write notifications: %v", err)
 	}
 }
 

@@ -10,9 +10,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/bridgev2/simplevent"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/id"
 
@@ -20,47 +22,65 @@ import (
 	aistream "github.com/beeper/ai-bridge/pkg/ai-stream"
 	aibridgev2 "github.com/beeper/ai-bridge/pkg/ai-stream/bridgev2"
 	aimatrix "github.com/beeper/ai-bridge/pkg/ai-stream/matrix"
+	"github.com/beeper/ai-bridge/pkg/aidb"
+	"github.com/beeper/ai-bridge/pkg/aiid"
 )
 
+const streamAnchorEventIDTimeout = 30 * time.Second
+const interruptedStreamMessage = "Codex stream was interrupted before completion"
+
+var activeStreamIdleTimeout = 5 * time.Minute
+var activeStreamUnregisterDelay = 30 * time.Second
+
 type activeRun struct {
-	mu         sync.Mutex
-	client     *Client
-	portalKey  networkid.PortalKey
-	threadID   string
-	turnID     string
-	messageID  networkid.MessageID
-	anchorMXID id.EventID
-	roomID     id.RoomID
-	publisher  bridgev2.BeeperStreamPublisher
-	run        *aistream.Run
-	writer     *aistream.Writer
-	pending    map[string]*pendingServerRequest
-	processes  map[string]string
-	toolResult map[string]bool
-	agentText  map[string]string
-	reasoning  map[string]string
-	nextSeq    int
-	started    bool
+	mu           sync.Mutex
+	client       *Client
+	portalKey    networkid.PortalKey
+	threadID     string
+	turnID       string
+	messageID    networkid.MessageID
+	anchorMXID   id.EventID
+	roomID       id.RoomID
+	publisher    bridgev2.BeeperStreamPublisher
+	run          *aistream.Run
+	writer       *aistream.Writer
+	pending      map[string]*pendingServerRequest
+	processes    map[string]string
+	toolStarted  map[string]bool
+	toolArgsSent map[string]bool
+	toolEnded    map[string]bool
+	toolResult   map[string]bool
+	agentText    map[string]string
+	reasoning    map[string]string
+	published    int
+	nextSeq      int
+	started      bool
+	unregistered bool
 }
 
 func newActiveRun(cl *Client, portalKey networkid.PortalKey, threadID, turnID string) *activeRun {
 	now := time.Now()
-	run := aistream.NewRun(turnID, threadID, "codex", "codex", "Codex", now)
+	run := aistream.NewRun(turnID, threadID, activeRunInitialModel(cl, threadID), "codex", "Codex", now)
 	run.Data["capabilities"] = codexAgentCapabilities()
+	writer := aistream.NewWriter(run, time.Now)
+	writer.Start()
 	return &activeRun{
-		client:     cl,
-		portalKey:  portalKey,
-		threadID:   threadID,
-		turnID:     turnID,
-		messageID:  networkid.MessageID(run.MessageID),
-		run:        run,
-		writer:     aistream.NewWriter(run, time.Now),
-		pending:    map[string]*pendingServerRequest{},
-		processes:  map[string]string{},
-		toolResult: map[string]bool{},
-		agentText:  map[string]string{},
-		reasoning:  map[string]string{},
-		nextSeq:    1,
+		client:       cl,
+		portalKey:    portalKey,
+		threadID:     threadID,
+		turnID:       turnID,
+		messageID:    networkid.MessageID(run.MessageID),
+		run:          run,
+		writer:       writer,
+		pending:      map[string]*pendingServerRequest{},
+		processes:    map[string]string{},
+		toolStarted:  map[string]bool{},
+		toolArgsSent: map[string]bool{},
+		toolEnded:    map[string]bool{},
+		toolResult:   map[string]bool{},
+		agentText:    map[string]string{},
+		reasoning:    map[string]string{},
+		nextSeq:      1,
 	}
 }
 
@@ -101,6 +121,10 @@ func codexAgentCapabilities() agui.AgentCapabilities {
 func (r *activeRun) start(ctx context.Context) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	return r.startLocked(ctx)
+}
+
+func (r *activeRun) startLocked(ctx context.Context) error {
 	if r.started {
 		return nil
 	}
@@ -112,15 +136,19 @@ func (r *activeRun) start(ctx context.Context) error {
 		return err
 	}
 	r.client.queueCodexTyping(r.portalKey, 30*time.Second)
-	r.writer.Start()
-	msg := aibridgev2.Anchor(r.portalKey, codexUserID, *r.run, time.Now())
-	if len(msg.Data.Parts) > 0 {
-		msg.Data.Parts[0].ID = partID("text")
-		msg.Data.Parts[0].Content.BeeperStream = descriptor
-		msg.Data.Parts[0].DBMetadata = &MessageMetadata{Role: "assistant", ThreadID: r.threadID, TurnID: r.turnID}
+	publisherStarted := false
+	if r.resolvePredictableAnchorEventIDLocked(ctx) {
+		if err := r.startPublisherLocked(ctx, descriptor); err != nil {
+			return err
+		}
+		publisherStarted = true
 	}
+	msg := r.anchorMessage(descriptor, time.Now())
 	res := r.client.UserLogin.QueueRemoteEvent(msg)
 	if !res.Success {
+		if publisherStarted {
+			r.stopPublisherLocked(ctx)
+		}
 		if res.Error != nil {
 			return res.Error
 		}
@@ -129,16 +157,37 @@ func (r *activeRun) start(ctx context.Context) error {
 	if res.EventID != "" {
 		r.anchorMXID = res.EventID
 	}
-	r.resolveAnchorEventIDLocked(ctx)
-	if r.anchorMXID == "" {
-		return fmt.Errorf("failed to resolve Codex stream anchor event ID")
+	if !publisherStarted {
+		r.resolveAnchorEventIDLocked(ctx)
+		if r.anchorMXID == "" {
+			return fmt.Errorf("failed to resolve Codex stream anchor event ID")
+		}
+		if err := r.startPublisherLocked(ctx, descriptor); err != nil {
+			return err
+		}
 	}
-	if err := r.publisher.Register(ctx, r.roomID, r.anchorMXID, descriptor); err != nil {
-		return fmt.Errorf("failed to register Codex stream publisher: %w", err)
-	}
-	r.started = true
-	r.publishLocked()
+	r.persistLocked(ctx)
 	return nil
+}
+
+func (r *activeRun) startAsync(ctx context.Context, source string) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx = context.WithoutCancel(ctx)
+	go func() {
+		if err := r.start(ctx); err != nil {
+			if r.client != nil && r.client.Main != nil {
+				r.client.Main.setActive(r.threadID, nil)
+				r.client.Main.queueThreadNotice(r.threadID, "Failed to start Codex stream:\n\n"+err.Error())
+			}
+			logFromContext(ctx).Err(err).
+				Str("thread_id", r.threadID).
+				Str("turn_id", r.turnID).
+				Str("source", source).
+				Msg("Failed to start Codex stream")
+		}
+	}()
 }
 
 func (r *activeRun) prepareStreamLocked(ctx context.Context) (*event.BeeperStreamInfo, error) {
@@ -157,27 +206,140 @@ func (r *activeRun) prepareStreamLocked(ctx context.Context) (*event.BeeperStrea
 		}
 		roomID = portal.MXID
 	}
-	descriptor, err := publisher.NewDescriptor(ctx, roomID, "com.beeper.stream")
+	descriptor, err := publisher.NewDescriptor(ctx, roomID, aiid.StreamType)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Codex stream descriptor: %w", err)
 	}
+	logFromContext(ctx).Debug().
+		Str("room_id", string(roomID)).
+		Str("descriptor_user_id", string(descriptor.UserID)).
+		Str("descriptor_device_id", string(descriptor.DeviceID)).
+		Str("stream_type", descriptor.Type).
+		Str("thread_id", r.threadID).
+		Str("turn_id", r.turnID).
+		Msg("Created Codex stream descriptor")
 	r.publisher = publisher
 	r.roomID = roomID
 	return descriptor, nil
+}
+
+func (r *activeRun) startPublisherLocked(ctx context.Context, descriptor *event.BeeperStreamInfo) error {
+	if r.anchorMXID == "" {
+		return fmt.Errorf("failed to resolve Codex stream anchor event ID")
+	}
+	if err := r.publisher.Register(ctx, r.roomID, r.anchorMXID, descriptor); err != nil {
+		return fmt.Errorf("failed to register Codex stream publisher: %w", err)
+	}
+	logFromContext(ctx).Debug().
+		Str("room_id", string(r.roomID)).
+		Str("event_id", string(r.anchorMXID)).
+		Str("descriptor_user_id", string(descriptor.UserID)).
+		Str("descriptor_device_id", string(descriptor.DeviceID)).
+		Str("stream_type", descriptor.Type).
+		Str("thread_id", r.threadID).
+		Str("turn_id", r.turnID).
+		Msg("Registered Codex stream publisher")
+	r.started = true
+	r.publishLocked()
+	return nil
+}
+
+func (r *activeRun) stopPublisherLocked(ctx context.Context) {
+	if r.publisher == nil || r.roomID == "" || r.anchorMXID == "" {
+		return
+	}
+	r.publisher.Unregister(r.roomID, r.anchorMXID)
+	r.unregistered = true
+	r.started = false
+	if r.client != nil && r.client.Main != nil && r.client.UserLogin != nil {
+		if err := r.client.Main.Store.DeleteActiveStream(ctx, r.client.UserLogin.ID, r.turnID); err != nil {
+			logFromContext(ctx).Err(err).
+				Str("thread_id", r.threadID).
+				Str("turn_id", r.turnID).
+				Msg("Failed to delete rolled back Codex active stream")
+		}
+	}
+}
+
+func (r *activeRun) anchorMessage(descriptor *event.BeeperStreamInfo, ts time.Time) *simplevent.PreConvertedMessage {
+	msg := aibridgev2.Anchor(r.portalKey, codexUserID, *r.run, ts)
+	if len(msg.Data.Parts) > 0 {
+		msg.Data.Parts[0].ID = partID("text")
+		msg.Data.Parts[0].Content.BeeperStream = descriptor
+		applyCodexMessageProfile(msg.Data.Parts[0].Content)
+		msg.Data.Parts[0].DBMetadata = &MessageMetadata{Role: "assistant", ThreadID: r.threadID, TurnID: r.turnID, StreamStatus: "streaming"}
+	}
+	return msg
 }
 
 func (r *activeRun) resolveAnchorEventIDLocked(ctx context.Context) {
 	if r.anchorMXID != "" || r.client == nil || r.client.Main == nil || r.client.Main.Bridge == nil {
 		return
 	}
-	portal, err := r.client.Main.Bridge.GetExistingPortalByKey(ctx, r.portalKey)
+	bridge := r.client.Main.Bridge
+	portal, err := bridge.GetExistingPortalByKey(ctx, r.portalKey)
 	if err != nil || portal == nil {
 		return
 	}
-	r.anchorMXID = r.anchorEventID(ctx, portal)
-	if r.anchorMXID == "" && portal.MXID != "" && r.client.Main.Bridge.Matrix != nil {
-		r.anchorMXID = r.client.Main.Bridge.Matrix.GenerateDeterministicEventID(portal.MXID, r.portalKey, r.messageID, partID("text"))
+	if eventID := r.anchorEventID(ctx, portal); eventID != "" {
+		logFromContext(ctx).Debug().
+			Str("room_id", string(portal.MXID)).
+			Str("event_id", string(eventID)).
+			Str("thread_id", r.threadID).
+			Str("turn_id", r.turnID).
+			Msg("Resolved Codex stream anchor event ID")
+		return
 	}
+	if portal.MXID != "" && bridge.Matrix != nil {
+		r.anchorMXID = bridge.Matrix.GenerateDeterministicEventID(portal.MXID, r.portalKey, r.messageID, partID("text"))
+		logFromContext(ctx).Debug().
+			Str("room_id", string(portal.MXID)).
+			Str("event_id", string(r.anchorMXID)).
+			Str("thread_id", r.threadID).
+			Str("turn_id", r.turnID).
+			Msg("Using deterministic Codex stream anchor event ID")
+		return
+	}
+	eventID, waitErr := aibridgev2.WaitForMessageEventID(ctx, bridge, portal.Receiver, r.messageID, partID("text"), streamAnchorEventIDTimeout)
+	if eventID != "" {
+		r.anchorMXID = eventID
+		logFromContext(ctx).Debug().
+			Str("room_id", string(portal.MXID)).
+			Str("event_id", string(r.anchorMXID)).
+			Str("thread_id", r.threadID).
+			Str("turn_id", r.turnID).
+			Msg("Resolved Codex stream anchor event ID from bridge DB")
+		return
+	}
+	logFromContext(ctx).Warn().
+		Err(waitErr).
+		Str("room_id", string(portal.MXID)).
+		Str("thread_id", r.threadID).
+		Str("turn_id", r.turnID).
+		Msg("Failed to resolve Codex stream anchor event ID")
+}
+
+func (r *activeRun) resolvePredictableAnchorEventIDLocked(ctx context.Context) bool {
+	if r.anchorMXID != "" {
+		return true
+	}
+	if r.client == nil || r.client.Main == nil || r.client.Main.Bridge == nil {
+		return false
+	}
+	portal, err := r.client.Main.Bridge.GetExistingPortalByKey(ctx, r.portalKey)
+	if err != nil || portal == nil {
+		return false
+	}
+	if eventID := r.anchorEventID(ctx, portal); eventID != "" {
+		logFromContext(ctx).Debug().
+			Str("room_id", string(portal.MXID)).
+			Str("event_id", string(eventID)).
+			Str("thread_id", r.threadID).
+			Str("turn_id", r.turnID).
+			Msg("Resolved predictable Codex stream anchor event ID")
+		return true
+	}
+	return false
 }
 
 func (r *activeRun) handle(method string, params json.RawMessage) {
@@ -185,8 +347,11 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 	defer r.mu.Unlock()
 	r.client.queueCodexTyping(r.portalKey, 30*time.Second)
 	switch method {
-	case "thread/status/changed", "thread/goal/updated", "thread/goal/cleared", "thread/settings/updated", "thread/tokenUsage/updated", "thread/archived", "thread/unarchived", "thread/closed", "thread/name/updated", "thread/compacted":
-		r.writer.StateDelta(map[string]any{"codexThread": codexThreadState(method, r.threadID, "", params)})
+	case "thread/started", "thread/status/changed", "thread/goal/updated", "thread/goal/cleared", "thread/settings/updated", "thread/tokenUsage/updated", "thread/archived", "thread/unarchived", "thread/closed", "thread/name/updated", "thread/compacted":
+		state := codexThreadState(method, r.threadID, "", params)
+		r.applyModelStateLocked(state)
+		r.writeActiveNoticeLocked(method, params)
+		r.writer.StateDelta(map[string]any{"codexThread": state})
 		r.writer.Custom(method, rawPayload(params))
 	case "turn/started":
 		r.writer.StepStart(r.turnID)
@@ -202,10 +367,12 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		payload := rawPayload(params)
 		id, name := hookRunIdentity(payload)
 		if id != "" {
-			r.writer.ToolEnd(id, name, payload["run"], map[string]any{"state": toolStateFromStatus(hookRunStatus(payload)), "status": hookRunStatus(payload)})
+			r.ensureToolStarted(id, name, map[string]any{"codexHook": payload["run"]})
+			r.endToolCall(id, name, payload["run"], map[string]any{"state": toolStateFromStatus(hookRunStatus(payload)), "status": hookRunStatus(payload)})
 		}
 		r.writer.Custom(method, payload)
 	case "item/agentMessage/delta":
+		raw := rawPayload(params)
 		var payload struct {
 			ItemID string `json:"itemId"`
 			Delta  string `json:"delta"`
@@ -217,7 +384,9 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 			}
 			r.writer.Text(payload.Delta)
 		}
+		r.writer.Custom(method, raw)
 	case "item/reasoning/summaryTextDelta", "item/reasoning/textDelta":
+		raw := rawPayload(params)
 		var payload struct {
 			Delta        string `json:"delta"`
 			ItemID       string `json:"itemId"`
@@ -230,6 +399,7 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 			r.reasoning[reasoningContentKey(payload.ItemID, reasoningKind(payload.SummaryIndex), index)] += payload.Delta
 			r.writer.ReasoningDelta(reasoningSectionIndex(payload.ItemID, index), payload.Delta)
 		}
+		r.writer.Custom(method, raw)
 	case "item/reasoning/summaryPartAdded":
 		var payload struct {
 			ItemID       string `json:"itemId"`
@@ -242,6 +412,7 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 	case "item/commandExecution/outputDelta", "item/fileChange/outputDelta", "command/exec/outputDelta", "process/outputDelta":
 		if itemID, delta := outputDelta(params); itemID != "" && delta != "" {
 			itemID = r.toolIDForProcess(itemID)
+			r.ensureToolStarted(itemID, inferredToolName(method, itemID), map[string]any{"codexNotification": method})
 			r.writer.ToolResult(itemID, delta, agui.ToolResultStateStreaming)
 			r.toolResult[itemID] = true
 		}
@@ -253,6 +424,7 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		r.rememberProcessTool(processID, itemID)
 		stdin, _ := payload["stdin"].(string)
 		if itemID != "" && stdin != "" {
+			r.ensureToolStarted(itemID, inferredToolName(method, itemID), map[string]any{"codexNotification": method})
 			r.writer.ToolResult(itemID, stdin, agui.ToolResultStateStreaming)
 			r.toolResult[itemID] = true
 		}
@@ -280,6 +452,7 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		payload := rawPayload(params)
 		if itemID, result, state := processExitResult(payload); itemID != "" && result != "" {
 			itemID = r.toolIDForProcess(itemID)
+			r.ensureToolStarted(itemID, inferredToolName(method, itemID), map[string]any{"codexNotification": method})
 			r.writer.ToolResult(itemID, result, state)
 			r.toolResult[itemID] = true
 		}
@@ -290,6 +463,7 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		itemID, _ := payload["itemId"].(string)
 		message, _ := payload["message"].(string)
 		if itemID != "" && strings.TrimSpace(message) != "" {
+			r.ensureToolStarted(itemID, inferredToolName(method, itemID), map[string]any{"codexNotification": method})
 			r.writer.ToolResult(itemID, strings.TrimSpace(message), agui.ToolResultStateStreaming)
 			r.toolResult[itemID] = true
 		}
@@ -300,6 +474,7 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		itemID, _ := payload["itemId"].(string)
 		if itemID != "" {
 			if text := patchUpdateText(payload); text != "" {
+				r.ensureToolStarted(itemID, inferredToolName(method, itemID), map[string]any{"codexNotification": method})
 				r.writer.ToolResult(itemID, text, agui.ToolResultStateStreaming)
 				r.toolResult[itemID] = true
 			}
@@ -321,12 +496,15 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 			if method == "item/autoApprovalReview/completed" {
 				state = agui.ToolResultStateComplete
 			}
+			r.ensureToolStarted(targetID, "approval review", map[string]any{"codexNotification": method})
 			r.writer.ToolResult(targetID, approvalReviewText(payload), state)
 			r.toolResult[targetID] = true
 		}
 		r.writer.StateDelta(map[string]any{"codex": map[string]any{method: payload}})
 		r.writer.Custom(method, payload)
 	case "model/rerouted", "model/verification", "warning", "guardianWarning", "deprecationNotice", "configWarning":
+		r.applyModelStateLocked(codexThreadState(method, r.threadID, "", params))
+		r.writeActiveNoticeLocked(method, params)
 		r.writer.StateDelta(map[string]any{"codex": map[string]any{method: rawPayload(params)}})
 		r.writer.Custom(method, rawPayload(params))
 	case "error":
@@ -343,7 +521,17 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		}
 		r.writer.StateDelta(map[string]any{"codexRealtime": map[string]any{method: payload}})
 		r.writer.Custom(method, payload)
-	case "thread/realtime/started", "thread/realtime/itemAdded", "thread/realtime/transcript/done", "thread/realtime/outputAudio/delta", "thread/realtime/sdp", "thread/realtime/closed":
+	case "thread/realtime/transcript/done":
+		payload := rawPayload(params)
+		if role, _ := payload["role"].(string); role == agui.RoleAssistant && !r.writer.HasTextContent() {
+			if text, _ := payload["text"].(string); strings.TrimSpace(text) != "" {
+				r.writer.Text(text)
+			}
+		}
+		r.writer.StateDelta(map[string]any{"codexRealtime": map[string]any{method: payload}})
+		r.writer.Custom(method, payload)
+	case "thread/realtime/started", "thread/realtime/itemAdded", "thread/realtime/outputAudio/delta", "thread/realtime/sdp", "thread/realtime/closed":
+		r.writeActiveNoticeLocked(method, params)
 		r.writer.StateDelta(map[string]any{"codexRealtime": map[string]any{method: rawPayload(params)}})
 		r.writer.Custom(method, rawPayload(params))
 	case "thread/realtime/error":
@@ -356,9 +544,7 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		if item.Type == "commandExecution" {
 			r.rememberProcessTool(firstString(item.Raw, "processId", "processHandle"), item.ID)
 		}
-		if item.ID != "" && item.IsToolLike() {
-			r.writer.ToolStartWithMetadata(item.ID, item.Name(), 0, nil, map[string]any{"codexItem": item.Raw})
-		}
+		r.startToolLikeItem(item)
 		r.writer.Custom(method, rawPayload(params))
 	case "item/completed":
 		item := notificationItem(params)
@@ -374,13 +560,18 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 			if activity := planItemActivity(r.run.MessageID, item.Raw); activity.Len() > 0 {
 				r.writer.Add(activity)
 			}
+		} else if item.Type == "hookPrompt" {
+			if text := liveHookPromptText(item.Raw); text != "" {
+				r.writer.StateDelta(map[string]any{"codex": map[string]any{"hookPrompt": item.Raw, "hookPromptText": text}})
+			}
 		} else if item.ID != "" && item.IsToolLike() {
+			r.startToolLikeItem(item)
 			state := codexItemToolState(item.Raw)
 			if result := completedToolResultText(item.Raw, r.toolResult[item.ID]); result != "" {
 				r.writer.ToolResult(item.ID, result, state)
 				r.toolResult[item.ID] = true
 			}
-			r.writer.ToolEnd(item.ID, item.Name(), item.Raw, map[string]any{"state": state, "status": codexItemStatusText(item.Raw, state)})
+			r.endToolCall(item.ID, item.Name(), item.Raw, map[string]any{"state": state, "status": codexItemStatusText(item.Raw, state)})
 		}
 		r.writer.Custom(method, rawPayload(params))
 	case "turn/completed":
@@ -393,6 +584,20 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 			} `json:"turn"`
 		}
 		_ = json.Unmarshal(params, &payload)
+		if !r.started {
+			if err := r.startLocked(context.Background()); err != nil {
+				if r.client != nil && r.client.Main != nil {
+					r.client.Main.setActive(r.threadID, nil)
+					r.client.Main.queueThreadNotice(r.threadID, "Failed to start Codex stream:\n\n"+err.Error())
+				}
+				logFromContext(context.Background()).Err(err).
+					Str("thread_id", r.threadID).
+					Str("turn_id", r.turnID).
+					Str("source", "turn-completed").
+					Msg("Failed to start Codex stream")
+				return
+			}
+		}
 		r.writer.StepFinish(r.turnID)
 		if payload.Turn.Status == "failed" {
 			message := "Codex turn failed"
@@ -414,6 +619,70 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 	r.publishLocked()
 }
 
+func (r *activeRun) writeActiveNoticeLocked(method string, params json.RawMessage) {
+	text := threadNoticeText(method, params)
+	if text == "" {
+		return
+	}
+	if method == "thread/status/changed" || method == "thread/realtime/error" || method == "error" {
+		r.writer.Error(text)
+		return
+	}
+	r.writer.Text(text)
+}
+
+func activeRunInitialModel(cl *Client, threadID string) string {
+	if cl == nil || cl.Main == nil {
+		return ""
+	}
+	room, ok := cl.Main.threadRoom(threadID)
+	if !ok {
+		return ""
+	}
+	if room.model != "" {
+		return room.model
+	}
+	if strings.Contains(room.modelProvider, "/") {
+		return strings.TrimSpace(room.modelProvider)
+	}
+	return ""
+}
+
+func (r *activeRun) applyModelStateLocked(state map[string]any) {
+	if r == nil || r.run == nil {
+		return
+	}
+	if model := codexModelStateRef(state, r.modelProviderHintLocked()); model != "" {
+		r.setModelLocked(model)
+	}
+}
+
+func (r *activeRun) setModelLocked(model string) {
+	model = strings.TrimSpace(model)
+	if r == nil || r.run == nil || model == "" {
+		return
+	}
+	if r.writer != nil {
+		r.writer.SetModel(model)
+		return
+	}
+	r.run.Model = model
+}
+
+func (r *activeRun) modelProviderHintLocked() string {
+	if r != nil && r.client != nil && r.client.Main != nil {
+		if room, ok := r.client.Main.threadRoom(r.threadID); ok && room.modelProvider != "" {
+			return room.modelProvider
+		}
+	}
+	if r != nil && r.run != nil {
+		if before, _, ok := strings.Cut(r.run.Model, "/"); ok {
+			return before
+		}
+	}
+	return ""
+}
+
 func (r *activeRun) rememberProcessTool(processID, toolID string) {
 	if r == nil || processID == "" {
 		return
@@ -427,6 +696,90 @@ func (r *activeRun) rememberProcessTool(processID, toolID string) {
 	if r.client != nil && r.client.Main != nil {
 		r.client.Main.rememberProcess(processID, r)
 	}
+}
+
+func (r *activeRun) startToolLikeItem(item codexItem) {
+	if r == nil || item.ID == "" || !item.IsToolLike() {
+		return
+	}
+	if r.toolStarted[item.ID] {
+		r.writeToolArgs(item.ID, item.Raw)
+		return
+	}
+	r.ensureToolStarted(item.ID, item.Name(), map[string]any{"codexItem": item.Raw})
+	r.writeToolArgs(item.ID, item.Raw)
+}
+
+func (r *activeRun) ensureToolStarted(toolID, name string, metadata map[string]any) {
+	if r == nil || toolID == "" {
+		return
+	}
+	if r.toolStarted == nil {
+		r.toolStarted = map[string]bool{}
+	}
+	if r.toolStarted[toolID] {
+		return
+	}
+	if strings.TrimSpace(name) == "" {
+		name = toolID
+	}
+	r.writer.ToolStartWithMetadata(toolID, name, 0, nil, metadata)
+	r.toolStarted[toolID] = true
+}
+
+func (r *activeRun) writeToolArgs(toolID string, data map[string]any) {
+	if r == nil || toolID == "" {
+		return
+	}
+	if r.toolArgsSent == nil {
+		r.toolArgsSent = map[string]bool{}
+	}
+	if r.toolArgsSent[toolID] {
+		return
+	}
+	input, ok := codexItemToolInput(data)
+	if !ok {
+		return
+	}
+	if text := rawToolInputText(input); text != "" {
+		r.writer.ToolArgs(toolID, text, input)
+		r.toolArgsSent[toolID] = true
+	}
+}
+
+func (r *activeRun) endToolCall(toolID, name string, input, result any) {
+	if r == nil || toolID == "" {
+		return
+	}
+	if r.toolEnded == nil {
+		r.toolEnded = map[string]bool{}
+	}
+	if r.toolEnded[toolID] {
+		return
+	}
+	if strings.TrimSpace(name) == "" {
+		name = toolID
+	}
+	r.writer.ToolEnd(toolID, name, input, result)
+	r.toolEnded[toolID] = true
+	r.toolResult[toolID] = true
+}
+
+func (r *activeRun) completeToolInput(toolID, name string, input any) {
+	if r == nil || toolID == "" {
+		return
+	}
+	if r.toolEnded == nil {
+		r.toolEnded = map[string]bool{}
+	}
+	if r.toolEnded[toolID] {
+		return
+	}
+	if strings.TrimSpace(name) == "" {
+		name = toolID
+	}
+	r.writer.ToolInputComplete(toolID, name, input)
+	r.toolEnded[toolID] = true
 }
 
 func (r *activeRun) toolIDForProcess(processID string) string {
@@ -446,11 +799,14 @@ func (r *activeRun) publish() {
 }
 
 func (r *activeRun) publishLocked() {
-	if !r.started || r.nextSeq > len(r.run.Events) {
+	if !r.started || r.published >= len(r.run.Events) {
 		return
 	}
+	if r.nextSeq <= 0 {
+		r.nextSeq = 1
+	}
 	copyRun := *r.run
-	copyRun.Events = append([]agui.Event(nil), r.run.Events[r.nextSeq-1:]...)
+	copyRun.Events = append([]agui.Event(nil), r.run.Events[r.published:]...)
 	carriers, err := aistream.PackRunFromSeq(copyRun, r.nextSeq)
 	if err != nil {
 		return
@@ -463,7 +819,7 @@ func (r *activeRun) publishLocked() {
 		if r.publisher == nil || r.roomID == "" || r.anchorMXID == "" {
 			return
 		}
-		if err := r.publisher.Publish(context.Background(), r.roomID, r.anchorMXID, aistream.CarrierContent(copyRun, carrier.Envelopes)); err != nil {
+		if err := r.publisher.Publish(suppressStreamCarrierRequestLogs(context.Background()), r.roomID, r.anchorMXID, aistream.CarrierContent(copyRun, carrier.Envelopes)); err != nil {
 			logFromContext(context.Background()).Err(err).
 				Str("thread_id", r.threadID).
 				Str("turn_id", r.turnID).
@@ -471,16 +827,78 @@ func (r *activeRun) publishLocked() {
 				Msg("Failed to publish Codex stream carrier")
 			return
 		}
-		for _, env := range carrier.Envelopes {
-			if env.Seq >= r.nextSeq {
-				r.nextSeq = env.Seq + 1
-			}
-		}
+		logFromContext(context.Background()).Debug().
+			Str("room_id", string(r.roomID)).
+			Str("event_id", string(r.anchorMXID)).
+			Str("thread_id", r.threadID).
+			Str("turn_id", r.turnID).
+			Int("envelope_count", len(carrier.Envelopes)).
+			Int("seq_start", firstSeq).
+			Msg("Published Codex stream carrier")
 	}
+	r.nextSeq = aistream.NextSeq(carriers)
+	r.published = len(r.run.Events)
+	r.persistLocked(context.Background())
+}
+
+func (r *activeRun) persistLocked(ctx context.Context) {
+	if r == nil || r.client == nil || r.client.Main == nil || r.client.Main.Store == nil || r.client.UserLogin == nil || r.run == nil || !r.started || r.anchorMXID == "" || r.roomID == "" {
+		return
+	}
+	modelID := r.run.Model
+	providerID := "codex"
+	if before, after, ok := strings.Cut(modelID, "/"); ok {
+		providerID = before
+		modelID = after
+	}
+	now := time.Now()
+	if err := r.client.Main.Store.UpsertActiveStream(ctx, aidb.ActiveStreamRecord{
+		RunID:      r.turnID,
+		LoginID:    r.client.UserLogin.ID,
+		PortalKey:  r.portalKey,
+		RoomID:     r.roomID,
+		EventID:    r.anchorMXID,
+		MessageID:  r.messageID,
+		ProviderID: providerID,
+		ModelID:    modelID,
+		Run:        *r.run,
+		CreatedAt:  now,
+		UpdatedAt:  now,
+	}); err != nil {
+		logFromContext(ctx).Warn().Err(err).
+			Str("thread_id", r.threadID).
+			Str("turn_id", r.turnID).
+			Msg("Failed to persist Codex active stream")
+	}
+}
+
+func (r *activeRun) deletePersistedLocked(ctx context.Context) {
+	if r == nil || r.client == nil || r.client.Main == nil || r.client.Main.Store == nil || r.client.UserLogin == nil || r.turnID == "" {
+		return
+	}
+	if err := r.client.Main.Store.DeleteActiveStream(ctx, r.client.UserLogin.ID, r.turnID); err != nil {
+		logFromContext(ctx).Warn().Err(err).
+			Str("thread_id", r.threadID).
+			Str("turn_id", r.turnID).
+			Msg("Failed to delete Codex active stream")
+	}
+}
+
+func suppressStreamCarrierRequestLogs(ctx context.Context) context.Context {
+	log := zerolog.Ctx(ctx)
+	level := log.GetLevel()
+	if level >= zerolog.FatalLevel && level != zerolog.Disabled {
+		return ctx
+	}
+	return log.Level(zerolog.FatalLevel).WithContext(ctx)
 }
 
 func (r *activeRun) anchorEventID(ctx context.Context, portal *bridgev2.Portal) id.EventID {
 	if r.anchorMXID != "" {
+		return r.anchorMXID
+	}
+	if portal != nil && portal.MXID != "" && portal.Bridge != nil && portal.Bridge.Matrix != nil && portal.Bridge.Config != nil && portal.Bridge.Config.OutgoingMessageReID {
+		r.anchorMXID = portal.Bridge.Matrix.GenerateDeterministicEventID(portal.MXID, r.portalKey, r.messageID, partID("text"))
 		return r.anchorMXID
 	}
 	if portal == nil || portal.Bridge == nil || portal.Bridge.DB == nil {
@@ -502,7 +920,186 @@ func (r *activeRun) finalize(ts time.Time) {
 
 func (r *activeRun) finalizeLocked(ts time.Time) {
 	r.client.queueCodexTyping(r.portalKey, 0)
-	edit := aibridgev2.FinalMetadataEdit(r.portalKey, codexUserID, r.messageID, *r.run, ts)
+	edit := codexFinalStreamEdit(r.portalKey, r.messageID, *r.run, r.threadID, r.turnID, ts)
+	res := r.client.UserLogin.QueueRemoteEvent(edit)
+	if !res.Success {
+		logCodexQueueFailure(context.Background(), res, "Failed to queue Codex final stream edit", map[string]any{
+			"thread_id":  r.threadID,
+			"turn_id":    r.turnID,
+			"message_id": string(r.messageID),
+		})
+		return
+	}
+	r.schedulePublisherUnregisterLocked()
+	r.deletePersistedLocked(context.Background())
+}
+
+func (r *activeRun) schedulePublisherUnregisterLocked() {
+	if r.unregistered || r.publisher == nil || r.roomID == "" || r.anchorMXID == "" {
+		return
+	}
+	publisher := r.publisher
+	roomID := r.roomID
+	eventID := r.anchorMXID
+	threadID := r.threadID
+	turnID := r.turnID
+	unregister := func() {
+		publisher.Unregister(roomID, eventID)
+		logFromContext(context.Background()).Debug().
+			Str("room_id", string(roomID)).
+			Str("event_id", string(eventID)).
+			Str("thread_id", threadID).
+			Str("turn_id", turnID).
+			Msg("Unregistered Codex stream publisher")
+	}
+	r.unregistered = true
+	if activeStreamUnregisterDelay <= 0 {
+		unregister()
+		return
+	}
+	time.AfterFunc(activeStreamUnregisterDelay, unregister)
+	logFromContext(context.Background()).Debug().
+		Str("room_id", string(roomID)).
+		Str("event_id", string(eventID)).
+		Str("thread_id", threadID).
+		Str("turn_id", turnID).
+		Dur("delay", activeStreamUnregisterDelay).
+		Msg("Scheduled Codex stream publisher unregister")
+}
+
+func (cl *Client) failPersistedActiveStreams(ctx context.Context) {
+	if cl == nil || cl.Main == nil || cl.Main.Store == nil || cl.UserLogin == nil {
+		return
+	}
+	records, err := cl.Main.Store.ListActiveStreams(ctx, cl.UserLogin.ID)
+	if err != nil {
+		logFromContext(ctx).Warn().Err(err).Msg("Failed to load persisted Codex active streams")
+		return
+	}
+	for _, record := range records {
+		if cl.hasLiveActiveStream(record) {
+			continue
+		}
+		cl.finishPersistedActiveStream(ctx, record)
+	}
+}
+
+func (cl *Client) startActiveStreamJanitor(ctx context.Context) {
+	if cl == nil || cl.Main == nil || cl.Main.Store == nil || cl.UserLogin == nil {
+		return
+	}
+	cl.activeStreamJanitorMu.Lock()
+	defer cl.activeStreamJanitorMu.Unlock()
+	if cl.activeStreamJanitorStop != nil {
+		return
+	}
+	janitorCtx, stop := context.WithCancel(ctx)
+	cl.activeStreamJanitorStop = stop
+	go cl.runActiveStreamJanitor(janitorCtx)
+}
+
+func (cl *Client) stopActiveStreamJanitor() {
+	if cl == nil {
+		return
+	}
+	cl.activeStreamJanitorMu.Lock()
+	stop := cl.activeStreamJanitorStop
+	cl.activeStreamJanitorStop = nil
+	cl.activeStreamJanitorMu.Unlock()
+	if stop != nil {
+		stop()
+	}
+}
+
+func (cl *Client) runActiveStreamJanitor(ctx context.Context) {
+	cl.failStaleActiveStreams(ctx)
+	ticker := time.NewTicker(activeStreamJanitorInterval())
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cl.failStaleActiveStreams(ctx)
+		}
+	}
+}
+
+func activeStreamJanitorInterval() time.Duration {
+	if activeStreamIdleTimeout <= 0 {
+		return time.Minute
+	}
+	interval := activeStreamIdleTimeout / 5
+	if interval <= 0 {
+		return activeStreamIdleTimeout
+	}
+	if interval < time.Second {
+		return time.Second
+	}
+	return interval
+}
+
+func (cl *Client) failStaleActiveStreams(ctx context.Context) {
+	if cl == nil || cl.Main == nil || cl.Main.Store == nil || cl.UserLogin == nil {
+		return
+	}
+	cutoff := time.Now().Add(-activeStreamIdleTimeout)
+	records, err := cl.Main.Store.ListStaleActiveStreams(ctx, cl.UserLogin.ID, cutoff)
+	if err != nil {
+		logFromContext(ctx).Warn().Err(err).Msg("Failed to load stale Codex active streams")
+		return
+	}
+	for _, record := range records {
+		if cl.hasLiveActiveStream(record) {
+			continue
+		}
+		cl.finishPersistedActiveStream(ctx, record)
+	}
+}
+
+func (cl *Client) hasLiveActiveStream(record aidb.ActiveStreamRecord) bool {
+	if cl == nil || cl.Main == nil || record.RunID == "" || record.Run.ThreadID == "" {
+		return false
+	}
+	active := cl.Main.activeRun(record.Run.ThreadID)
+	return active != nil && active.turnID == record.RunID
+}
+
+func (cl *Client) finishPersistedActiveStream(ctx context.Context, record aidb.ActiveStreamRecord) {
+	if cl == nil || cl.Main == nil || cl.Main.Store == nil || cl.UserLogin == nil {
+		return
+	}
+	run := record.Run
+	switch run.Status.State {
+	case "complete", "aborted", "error", "interrupted":
+	default:
+		writer := aistream.NewWriter(&run, time.Now)
+		writer.Error(interruptedStreamMessage)
+	}
+	messageID := record.MessageID
+	if messageID == "" {
+		messageID = networkid.MessageID(run.MessageID)
+	}
+	edit := codexFinalStreamEdit(record.PortalKey, messageID, run, run.ThreadID, run.RunID, time.Now())
+	res := cl.UserLogin.QueueRemoteEvent(edit)
+	if !res.Success {
+		logCodexQueueFailure(ctx, res, "Failed to queue persisted Codex final stream edit", map[string]any{
+			"thread_id":  run.ThreadID,
+			"turn_id":    run.RunID,
+			"message_id": string(messageID),
+		})
+		return
+	}
+	if err := cl.Main.Store.DeleteActiveStream(ctx, cl.UserLogin.ID, record.RunID); err != nil {
+		logFromContext(ctx).Warn().Err(err).
+			Str("thread_id", run.ThreadID).
+			Str("turn_id", run.RunID).
+			Msg("Failed to delete persisted Codex active stream")
+	}
+}
+
+func codexFinalStreamEdit(portalKey networkid.PortalKey, messageID networkid.MessageID, run aistream.Run, threadID, turnID string, ts time.Time) *simplevent.Message[*aistream.Run] {
+	edit := aibridgev2.FinalMetadataEdit(portalKey, codexUserID, messageID, run, ts)
 	edit.ConvertEditFunc = func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, existing []*database.Message, data *aistream.Run) (*bridgev2.ConvertedEdit, error) {
 		if len(existing) == 0 {
 			return nil, nil
@@ -511,30 +1108,18 @@ func (r *activeRun) finalizeLocked(ts time.Time) {
 		if err != nil {
 			return nil, err
 		}
-		applyFinalMessageMetadata(existing[0], *data, r.threadID, r.turnID)
+		applyFinalMessageMetadata(existing[0], *data, threadID, turnID)
 		return &bridgev2.ConvertedEdit{
 			ModifiedParts: []*bridgev2.ConvertedEditPart{{
-				Part:    existing[0],
-				Type:    event.EventMessage,
-				Content: content,
-				Extra:   extra,
-				TopLevelExtra: map[string]any{
-					"com.beeper.dont_render_edited": true,
-				},
+				Part:          existing[0],
+				Type:          event.EventMessage,
+				Content:       content,
+				Extra:         aibridgev2.FinalEditExtra(extra),
+				TopLevelExtra: aibridgev2.FinalEditTopLevelExtra(),
 			}},
 		}, nil
 	}
-	res := r.client.UserLogin.QueueRemoteEvent(edit)
-	if !res.Success {
-		logCodexQueueFailure(context.Background(), res, "Failed to queue Codex final stream edit", map[string]any{
-			"thread_id":  r.threadID,
-			"turn_id":    r.turnID,
-			"message_id": string(r.messageID),
-		})
-	}
-	if r.publisher != nil && r.roomID != "" && r.anchorMXID != "" {
-		r.publisher.Unregister(r.roomID, r.anchorMXID)
-	}
+	return edit
 }
 
 func applyFinalMessageMetadata(message *database.Message, run aistream.Run, threadID, turnID string) {
@@ -613,6 +1198,18 @@ func (i codexItem) Name() string {
 		return i.Type
 	}
 	return "codex item"
+}
+
+func codexItemToolInput(data map[string]any) (any, bool) {
+	for _, key := range []string{"arguments", "input", "action", "tools"} {
+		if value, ok := data[key]; ok && hasNonEmptyValue(value) {
+			return value, true
+		}
+	}
+	if command, _ := data["command"].(string); strings.TrimSpace(command) != "" {
+		return strings.TrimSpace(command), true
+	}
+	return nil, false
 }
 
 func notificationItem(params json.RawMessage) codexItem {
@@ -718,12 +1315,16 @@ func (r *activeRun) mapRawToolCall(item map[string]any) {
 		return
 	}
 	name := rawToolName(item)
-	r.writer.ToolStartWithMetadata(callID, name, 0, nil, map[string]any{"codexRawResponseItem": item})
+	r.ensureToolStarted(callID, name, map[string]any{"codexRawResponseItem": item})
 	args := rawToolInput(item)
 	if argsText := rawToolInputText(args); argsText != "" {
 		r.writer.ToolArgs(callID, argsText, args)
+		if r.toolArgsSent == nil {
+			r.toolArgsSent = map[string]bool{}
+		}
+		r.toolArgsSent[callID] = true
 	}
-	r.writer.ToolInputComplete(callID, name, args)
+	r.completeToolInput(callID, name, args)
 }
 
 func (r *activeRun) mapRawToolResult(item map[string]any) {
@@ -731,7 +1332,9 @@ func (r *activeRun) mapRawToolResult(item map[string]any) {
 	if callID == "" {
 		return
 	}
+	r.ensureToolStarted(callID, rawToolName(item), map[string]any{"codexRawResponseItem": item})
 	r.writer.ToolResult(callID, rawToolOutputText(item["output"]), agui.ToolResultStateComplete)
+	r.toolResult[callID] = true
 }
 
 func (r *activeRun) mapRawToolEnd(item map[string]any) {
@@ -744,8 +1347,25 @@ func (r *activeRun) mapRawToolEnd(item map[string]any) {
 	if toolStateFromStatus(firstString(item, "status")) == agui.ToolResultStateError {
 		state = agui.ToolResultStateError
 	}
-	r.writer.ToolStartWithMetadata(callID, name, 0, nil, map[string]any{"codexRawResponseItem": item})
-	r.writer.ToolEnd(callID, name, rawToolInput(item), map[string]any{"state": state, "status": firstString(item, "status")})
+	r.ensureToolStarted(callID, name, map[string]any{"codexRawResponseItem": item})
+	r.endToolCall(callID, name, rawToolInput(item), map[string]any{"state": state, "status": firstString(item, "status")})
+}
+
+func inferredToolName(method, toolID string) string {
+	switch {
+	case strings.Contains(method, "fileChange"):
+		return "file change"
+	case strings.Contains(method, "mcpToolCall"):
+		return "mcp tool"
+	case strings.Contains(method, "autoApprovalReview"):
+		return "approval review"
+	case strings.Contains(method, "process"):
+		return "process: " + toolID
+	case strings.Contains(method, "command"):
+		return "command: " + toolID
+	default:
+		return toolID
+	}
 }
 
 func rawPayload(params json.RawMessage) map[string]any {
@@ -887,6 +1507,22 @@ func rawTextItems(value any) []string {
 		}
 	}
 	return out
+}
+
+func liveHookPromptText(item map[string]any) string {
+	fragments, _ := item["fragments"].([]any)
+	out := make([]string, 0, len(fragments))
+	for _, rawFragment := range fragments {
+		fragment, _ := rawFragment.(map[string]any)
+		if text, _ := fragment["text"].(string); strings.TrimSpace(text) != "" {
+			out = append(out, strings.TrimSpace(text))
+		}
+	}
+	if len(out) > 0 {
+		return strings.Join(out, "\n\n")
+	}
+	text, _ := item["text"].(string)
+	return strings.TrimSpace(text)
 }
 
 func rawToolName(item map[string]any) string {
@@ -1143,7 +1779,9 @@ func hasNonEmptyValue(value any) bool {
 }
 
 func matrixFinalContent(run aistream.Run) (*event.MessageEventContent, map[string]any) {
-	return aimatrix.FinalContent(run)
+	content, extra := aimatrix.FinalContent(run)
+	applyCodexMessageProfile(content)
+	return content, extra
 }
 
 func matrixFinalContentWithAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, run aistream.Run) (*event.MessageEventContent, map[string]any, error) {
@@ -1155,7 +1793,21 @@ func matrixFinalContentWithAttachment(ctx context.Context, portal *bridgev2.Port
 		}
 		projection = aimatrix.ProjectFinal(run, partsRef)
 	}
+	applyCodexMessageProfile(projection.Content)
 	return projection.Content, projection.Extra, nil
+}
+
+func applyCodexMessageProfile(content *event.MessageEventContent) {
+	if content == nil {
+		return
+	}
+	avatarURL := id.ContentURIString(defaultCodexAvatarMXC)
+	content.BeeperPerMessageProfile = &event.BeeperPerMessageProfile{
+		ID:          string(codexUserID),
+		Displayname: "Codex",
+		AvatarURL:   &avatarURL,
+		HasFallback: true,
+	}
 }
 
 func uploadFinalPartsRef(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, run aistream.Run, message aistream.UIMessage) (*aistream.FinalPartsRef, error) {

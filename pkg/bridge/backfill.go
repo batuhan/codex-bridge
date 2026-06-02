@@ -34,7 +34,7 @@ func (cl *Client) projectBackfillMessages(ctx context.Context, portal *bridgev2.
 			}
 			if body := backfillUserBody(item); strings.TrimSpace(body) != "" {
 				streamOrder = nextBackfillStreamOrder(streamOrder, ts)
-				messages = append(messages, cl.backfillTextMessage(portal.PortalKey, "codex:"+turn.ID+":"+item.ID, cl.GetUserID(), body, ts, streamOrder))
+				messages = append(messages, cl.backfillUserMessage(portal.PortalKey, thread.ID, turn.ID, item, body, ts, streamOrder))
 				ts = ts.Add(time.Millisecond)
 			}
 		}
@@ -131,14 +131,16 @@ func sortedBackfillTurns(thread appserver.Thread) []appserver.Turn {
 	return turns
 }
 
-func (cl *Client) backfillTextMessage(portalKey networkid.PortalKey, msgID string, sender networkid.UserID, body string, ts time.Time, streamOrder int64) *bridgev2.BackfillMessage {
+func (cl *Client) backfillUserMessage(portalKey networkid.PortalKey, threadID, turnID string, item appserver.TurnItem, body string, ts time.Time, streamOrder int64) *bridgev2.BackfillMessage {
+	msgID := backfillUserMessageID(item, turnID)
 	return &bridgev2.BackfillMessage{
 		ConvertedMessage: &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{
-			ID:      partID("text"),
-			Type:    event.EventMessage,
-			Content: msgconv.TextContent(body),
+			ID:         partID("text"),
+			Type:       event.EventMessage,
+			Content:    msgconv.TextContent(body),
+			DBMetadata: &MessageMetadata{Role: "user", ThreadID: threadID, TurnID: turnID, StreamStatus: "done"},
 		}}},
-		Sender:      bridgev2.EventSender{Sender: sender, IsFromMe: sender == cl.GetUserID(), SenderLogin: cl.UserLogin.ID},
+		Sender:      bridgev2.EventSender{Sender: cl.GetUserID(), IsFromMe: true, SenderLogin: cl.UserLogin.ID},
 		ID:          networkid.MessageID(msgID),
 		TxnID:       networkid.TransactionID(msgID),
 		Timestamp:   ts,
@@ -147,7 +149,7 @@ func (cl *Client) backfillTextMessage(portalKey networkid.PortalKey, msgID strin
 }
 
 func (cl *Client) backfillAssistantMessage(ctx context.Context, portal *bridgev2.Portal, thread appserver.Thread, turn appserver.Turn, ts time.Time, streamOrder int64) (*bridgev2.BackfillMessage, bool, error) {
-	run := aistream.NewRun(turn.ID, thread.ID, thread.ModelProvider, "codex", "Codex", ts)
+	run := aistream.NewRun(turn.ID, thread.ID, threadModelRef(thread), "codex", "Codex", ts)
 	run.Data["capabilities"] = codexAgentCapabilities()
 	writer := aistream.NewWriter(run, func() time.Time { return ts })
 	writer.Start()
@@ -181,7 +183,7 @@ func (cl *Client) backfillAssistantMessage(ctx context.Context, portal *bridgev2
 			Type:       event.EventMessage,
 			Content:    content,
 			Extra:      extra,
-			DBMetadata: &MessageMetadata{Role: "assistant", ThreadID: thread.ID, TurnID: turn.ID},
+			DBMetadata: &MessageMetadata{Role: "assistant", ThreadID: thread.ID, TurnID: turn.ID, StreamStatus: "complete"},
 		}}},
 		Sender:      bridgev2.EventSender{Sender: codexUserID},
 		ID:          networkid.MessageID(msgID),
@@ -219,7 +221,7 @@ func mapBackfillItem(writer *aistream.Writer, messageID string, item appserver.T
 		}
 	case "hookPrompt":
 		if text := hookPromptText(item); text != "" {
-			writer.StateDelta(map[string]any{"codex": map[string]any{"hookPrompt": backfillItemData(item)}})
+			writer.StateDelta(map[string]any{"codex": map[string]any{"hookPrompt": backfillItemData(item), "hookPromptText": text}})
 		}
 	case "enteredReviewMode", "exitedReviewMode":
 		writer.Text(reviewModeText(item))
@@ -230,24 +232,8 @@ func mapBackfillItem(writer *aistream.Writer, messageID string, item appserver.T
 			"plan":        []any{data},
 		}))
 		writer.StateDelta(map[string]any{"codex": map[string]any{"turn/plan/updated": data}})
-	case "commandExecution":
-		data := backfillItemData(item)
-		name := backfillToolName(item, data)
-		state := codexItemToolState(data)
-		writer.ToolStartWithMetadata(item.ID, name, 0, nil, map[string]any{"codexItem": data})
-		if result := backfillToolResultText(data); result != "" {
-			writer.ToolResult(item.ID, result, state)
-		}
-		writer.ToolEnd(item.ID, name, data, map[string]any{"state": state, "status": codexItemStatusText(data, state)})
-	case "fileChange", "mcpToolCall", "dynamicToolCall", "collabAgentToolCall", "webSearch", "imageView", "imageGeneration":
-		data := backfillItemData(item)
-		name := backfillToolName(item, data)
-		state := codexItemToolState(data)
-		writer.ToolStartWithMetadata(item.ID, name, 0, nil, map[string]any{"codexItem": data})
-		if result := backfillToolResultText(data); result != "" {
-			writer.ToolResult(item.ID, result, state)
-		}
-		writer.ToolEnd(item.ID, name, data, map[string]any{"state": state, "status": codexItemStatusText(data, state)})
+	case "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "collabAgentToolCall", "webSearch", "imageView", "imageGeneration":
+		writeBackfillToolItem(writer, item)
 	default:
 		if strings.TrimSpace(item.Text) == "" {
 			writer.Custom("codex/item", backfillItemData(item))
@@ -257,6 +243,22 @@ func mapBackfillItem(writer *aistream.Writer, messageID string, item appserver.T
 	}
 	writer.Custom("codex/item", backfillItemData(item))
 	return true
+}
+
+func writeBackfillToolItem(writer *aistream.Writer, item appserver.TurnItem) {
+	data := backfillItemData(item)
+	name := backfillToolName(item, data)
+	state := codexItemToolState(data)
+	writer.ToolStartWithMetadata(item.ID, name, 0, nil, map[string]any{"codexItem": data})
+	if input, ok := codexItemToolInput(data); ok {
+		if text := rawToolInputText(input); text != "" {
+			writer.ToolArgs(item.ID, text, input)
+		}
+	}
+	if result := backfillToolResultText(data); result != "" {
+		writer.ToolResult(item.ID, result, state)
+	}
+	writer.ToolEnd(item.ID, name, data, map[string]any{"state": state, "status": codexItemStatusText(data, state)})
 }
 
 func backfillToolName(item appserver.TurnItem, data map[string]any) string {
@@ -343,6 +345,9 @@ func backfillItemData(item appserver.TurnItem) map[string]any {
 	if _, ok := data["id"]; !ok && item.ID != "" {
 		data["id"] = item.ID
 	}
+	if _, ok := data["clientId"]; !ok && item.ClientID != "" {
+		data["clientId"] = item.ClientID
+	}
 	if _, ok := data["type"]; !ok && item.Type != "" {
 		data["type"] = item.Type
 	}
@@ -374,6 +379,13 @@ func backfillItemData(item appserver.TurnItem) map[string]any {
 		data["arguments"] = item.Arguments
 	}
 	return data
+}
+
+func backfillUserMessageID(item appserver.TurnItem, turnID string) networkid.MessageID {
+	if item.ClientID != "" {
+		return networkid.MessageID("user:" + item.ClientID)
+	}
+	return networkid.MessageID("codex:" + turnID + ":" + item.ID)
 }
 
 func backfillUserBody(item appserver.TurnItem) string {
