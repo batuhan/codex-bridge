@@ -11,6 +11,7 @@ import (
 	agui "github.com/beeper/ai-bridge/pkg/ag-ui"
 	aistream "github.com/beeper/ai-bridge/pkg/ai-stream"
 	aimatrix "github.com/beeper/ai-bridge/pkg/ai-stream/matrix"
+	"github.com/beeper/codex-bridge/pkg/appserver"
 	"maunium.net/go/mautrix/event"
 	"maunium.net/go/mautrix/event/cmdschema"
 )
@@ -65,6 +66,40 @@ func TestResolveApprovalCommandDefaultsToApprove(t *testing.T) {
 	}
 }
 
+func TestDynamicToolCallServerRequestStreamsUnsupportedToolCall(t *testing.T) {
+	run := newActiveRun(&Client{}, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	response, err := run.handleServerRequest(context.Background(), appserver.Message{
+		ID:     "rpc-1",
+		Method: "item/tool/call",
+		Params: json.RawMessage(`{"threadId":"thread-1","turnId":"turn-1","callId":"call-1","namespace":"browser","tool":"open","arguments":{"url":"https://example.com"}}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, ok := response.(map[string]any)
+	if !ok || got["success"] != false {
+		t.Fatalf("unexpected dynamic tool response: %#v", response)
+	}
+	if !hasToolCallStartName(run.run.Events, "call-1", "browser: open") {
+		t.Fatalf("dynamic tool request did not start visible AG-UI tool call: %#v", run.run.Events)
+	}
+	if !hasToolStartMetadataContaining(run.run.Events, "call-1", `"request":"item/tool/call"`) {
+		t.Fatalf("dynamic tool request did not sync tool start metadata: %#v", run.run.Events)
+	}
+	if !hasToolArgsContaining(run.run.Events, "call-1", `"url":"https://example.com"`) || !hasToolArgsContaining(run.run.Events, "call-1", `"namespace":"browser"`) {
+		t.Fatalf("dynamic tool request did not sync full input args: %#v", run.run.Events)
+	}
+	if !hasToolResultStateContaining(run.run.Events, "call-1", unsupportedDynamicToolCallText, agui.ToolResultStateError) {
+		t.Fatalf("dynamic tool request did not stream unsupported error result: %#v", run.run.Events)
+	}
+	if !toolEventsInOrder(run.run.Events, "call-1", agui.EventToolCallStart, agui.EventToolCallArgs, agui.EventToolCallResult, agui.EventToolCallEnd) {
+		t.Fatalf("dynamic tool request events out of order: %#v", run.run.Events)
+	}
+	if countToolResults(run.run.Events, "call-1") != 1 {
+		t.Fatalf("dynamic tool request should have one visible result: %#v", run.run.Events)
+	}
+}
+
 func TestParseCodexCommand(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -90,24 +125,24 @@ func TestParseCodexCommand(t *testing.T) {
 			want:    codexCommand{name: "approve", arg: "approval-1 deny"},
 			ok:      true,
 		},
-			{
-				name: "structured approve",
-				content: &event.MessageEventContent{MSC4391BotCommand: &event.MSC4391BotCommandInput{
-					Command:   "approve",
-					Arguments: json.RawMessage(`{"id":"approval-1","choice":"always"}`),
+		{
+			name: "structured approve",
+			content: &event.MessageEventContent{MSC4391BotCommand: &event.MSC4391BotCommandInput{
+				Command:   "approve",
+				Arguments: json.RawMessage(`{"id":"approval-1","choice":"always"}`),
 			}},
-				want: codexCommand{name: "approve", arg: "approval-1 always"},
-				ok:   true,
-			},
-			{
-				name: "structured approve default",
-				content: &event.MessageEventContent{MSC4391BotCommand: &event.MSC4391BotCommandInput{
-					Command:   "approve",
-					Arguments: json.RawMessage(`{"id":"approval-1"}`),
-				}},
-				want: codexCommand{name: "approve", arg: "approval-1"},
-				ok:   true,
-			},
+			want: codexCommand{name: "approve", arg: "approval-1 always"},
+			ok:   true,
+		},
+		{
+			name: "structured approve default",
+			content: &event.MessageEventContent{MSC4391BotCommand: &event.MSC4391BotCommandInput{
+				Command:   "approve",
+				Arguments: json.RawMessage(`{"id":"approval-1"}`),
+			}},
+			want: codexCommand{name: "approve", arg: "approval-1"},
+			ok:   true,
+		},
 		{
 			name: "structured answer",
 			content: &event.MessageEventContent{MSC4391BotCommand: &event.MSC4391BotCommandInput{
@@ -156,6 +191,23 @@ func TestParseCodexCommand(t *testing.T) {
 				t.Fatalf("unexpected command: %#v ok=%v", got, ok)
 			}
 		})
+	}
+}
+
+func TestParseCodexCommandMessageFromRawBeeperCommand(t *testing.T) {
+	msg := testMatrixMessage("thread-1", "")
+	msg.Content = &event.MessageEventContent{MsgType: matrixCommandMsgType}
+	msg.Event.Content.Raw = map[string]any{
+		"msgtype": string(matrixCommandMsgType),
+		"command": "approve",
+		"arguments": map[string]any{
+			"id":     "approval-1",
+			"choice": "always",
+		},
+	}
+	command, ok := parseCodexCommandMessage(msg)
+	if !ok || command != (codexCommand{name: "approve", arg: "approval-1 always"}) {
+		t.Fatalf("unexpected raw command: ok=%v command=%#v", ok, command)
 	}
 }
 
@@ -372,6 +424,10 @@ func TestHandleMatrixMessageResolvesStructuredPendingCommands(t *testing.T) {
 	default:
 		t.Fatal("structured approval did not reach pending request")
 	}
+	if !hasCodexRunStateDelta(run.run.Events, "command/approve", "id", "approval-1") ||
+		!hasCodexRunStateDelta(run.run.Events, "command/approve", "choice", "approve") {
+		t.Fatalf("structured approval command was not synced as AG-UI client state: %#v", run.run.Events)
+	}
 
 	answerMsg := testMatrixMessage("thread-1", "")
 	answerMsg.Content = &event.MessageEventContent{MSC4391BotCommand: &event.MSC4391BotCommandInput{
@@ -393,6 +449,12 @@ func TestHandleMatrixMessageResolvesStructuredPendingCommands(t *testing.T) {
 		}
 	default:
 		t.Fatal("structured answer did not reach pending request")
+	}
+	if !hasCodexRunStateDelta(run.run.Events, "command/answer", "id", "input-1") {
+		t.Fatalf("structured answer command was not synced as AG-UI client state: %#v", run.run.Events)
+	}
+	if hasCodexRunStatePayloadText(run.run.Events, "command/answer", "/tmp/project") {
+		t.Fatalf("answer client request state should not duplicate answer text: %#v", run.run.Events)
 	}
 }
 
@@ -650,6 +712,20 @@ func TestUserInputApprovalResponseBecomesEmptyAnswers(t *testing.T) {
 func hasToolCallResult(events []agui.Event, toolCallID string) bool {
 	for _, event := range events {
 		if event.Type() == agui.EventToolCallResult && event.Get("toolCallId") == toolCallID {
+			return true
+		}
+	}
+	return false
+}
+
+func hasCodexRunStatePayloadText(events []agui.Event, method, text string) bool {
+	for _, event := range events {
+		if event.Type() != agui.EventStateDelta {
+			continue
+		}
+		delta, _ := event.Get("delta").(map[string]any)
+		run, _ := delta["codexRun"].(map[string]any)
+		if strings.Contains(anyString(run[method]), text) {
 			return true
 		}
 	}

@@ -48,6 +48,7 @@ var _ bridgev2.ContactListingNetworkAPI = (*Client)(nil)
 var _ bridgev2.UserSearchingNetworkAPI = (*Client)(nil)
 var _ bridgev2.BackfillingNetworkAPI = (*Client)(nil)
 var _ bridgev2.BackfillingNetworkAPIWithLimits = (*Client)(nil)
+var _ bridgev2.EditHandlingNetworkAPI = (*Client)(nil)
 var _ bridgev2.RoomNameHandlingNetworkAPI = (*Client)(nil)
 var _ bridgev2.RoomTopicHandlingNetworkAPI = (*Client)(nil)
 var _ bridgev2.RoomStateHandlingNetworkAPI = (*Client)(nil)
@@ -58,8 +59,10 @@ func (cl *Client) Connect(ctx context.Context) {
 	if cl.UserLogin != nil && cl.UserLogin.BridgeState != nil {
 		cl.UserLogin.BridgeState.Send(status.BridgeState{StateEvent: status.StateConnected})
 	}
-	cl.failPersistedActiveStreams(ctx)
-	cl.startActiveStreamJanitor(ctx)
+	recoveryCtx, cancel := context.WithTimeout(context.Background(), activeStreamRecoveryTimeout)
+	defer cancel()
+	cl.failPersistedActiveStreams(recoveryCtx)
+	cl.startActiveStreamJanitor()
 }
 
 func (cl *Client) Disconnect() {
@@ -173,6 +176,7 @@ func (cl *Client) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) 
 			beeperAIModelStateType:   {Level: event.CapLevelFullySupported},
 		},
 		TypingNotifications: true,
+		Edit:                event.CapLevelFullySupported,
 	}
 }
 
@@ -268,21 +272,34 @@ func (cl *Client) handleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixM
 		return resp, nil
 	}
 	clientUserMessageID := string(msg.Event.ID)
+	resp := &bridgev2.MatrixMessageResponse{DB: userDB, StreamOrder: userDB.Timestamp.UnixNano()}
 	if active := cl.Main.activeRun(meta.ThreadID); active != nil {
 		setMessageMetadataTurnID(userDB, active.turnID)
 		startKey := matrixStartKey(cl.UserLogin.ID, msg.Portal.PortalKey, msg.Event.ID)
 		if cl.Main.claimMatrixStart(startKey) {
-			go cl.steerMatrixTurn(startKey, msg.Portal, meta.ThreadID, active.turnID, clientUserMessageID, prompt)
+			threadID := meta.ThreadID
+			turnID := active.turnID
+			resp.PostSave = func(ctx context.Context, saved *database.Message) {
+				go cl.steerMatrixTurn(startKey, msg.Portal, threadID, turnID, clientUserMessageID, prompt)
+			}
 		}
 	} else {
 		metaCopy := *meta
 		startKey := matrixStartKey(cl.UserLogin.ID, msg.Portal.PortalKey, msg.Event.ID)
 		if cl.Main.claimMatrixStart(startKey) {
-			go cl.startMatrixTurn(startKey, msg.Portal, &metaCopy, startedThread, clientUserMessageID, prompt, userDB.ID, userDB.PartID)
+			resp.PostSave = func(ctx context.Context, saved *database.Message) {
+				messageID := userDB.ID
+				part := userDB.PartID
+				if saved != nil {
+					messageID = saved.ID
+					part = saved.PartID
+				}
+				go cl.startMatrixTurn(startKey, msg.Portal, &metaCopy, startedThread, clientUserMessageID, prompt, messageID, part)
+			}
 		}
 	}
 	log.Debug().Str("thread_id", meta.ThreadID).Msg("Accepted Codex Matrix message")
-	return &bridgev2.MatrixMessageResponse{DB: userDB, StreamOrder: userDB.Timestamp.UnixNano()}, nil
+	return resp, nil
 }
 
 func (cl *Client) startDirectorySelection(startKey string, portal *bridgev2.Portal, cwd string, messageID networkid.MessageID, part networkid.PartID) {
@@ -311,6 +328,62 @@ func validateMatrixPromptMessage(msg *bridgev2.MatrixMessage) error {
 	}
 	if msg.ThreadRoot != nil || msg.ReplyTo != nil {
 		return fmt.Errorf("%w: replies and Matrix threads are not supported by Codex prompts", bridgev2.ErrUnsupportedMessageType)
+	}
+	switch msg.Content.MsgType {
+	case "", event.MsgText:
+		return nil
+	case event.MsgNotice:
+		return bridgev2.ErrIgnoringMNotice
+	default:
+		return fmt.Errorf("%w: %s", bridgev2.ErrUnsupportedMessageType, msg.Content.MsgType)
+	}
+}
+
+func (cl *Client) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit) error {
+	if err := cl.handleMatrixEdit(ctx, msg); err != nil {
+		cl.logMatrixMessageError(&bridgev2.MatrixMessage{MatrixEventBase: msg.MatrixEventBase}, err, "Codex Matrix edit failed")
+		return matrixMessageStatusForCodexError(err)
+	}
+	return nil
+}
+
+func (cl *Client) handleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit) error {
+	if msg == nil || msg.Portal == nil || msg.Content == nil || msg.EditTarget == nil {
+		return fmt.Errorf("missing Matrix edit")
+	}
+	if cl == nil || cl.Main == nil || cl.UserLogin == nil {
+		return fmt.Errorf("missing Codex bridge login")
+	}
+	if err := validateMatrixPromptEdit(msg); err != nil {
+		return err
+	}
+	meta, _ := msg.EditTarget.Metadata.(*MessageMetadata)
+	if meta == nil || meta.Role != "user" || meta.ThreadID == "" || meta.TurnID == "" {
+		return fmt.Errorf("%w: only previously sent Codex prompts can be edited", bridgev2.ErrUnsupportedMessageType)
+	}
+	prompt := strings.TrimSpace(msg.Content.Body)
+	if prompt == "" {
+		prompt = "Continue."
+	}
+	if err := cl.prepareMatrixTurnRewrite(ctx, msg.Portal, msg.EditTarget); err != nil {
+		return err
+	}
+	target := *msg.EditTarget
+	targetMeta := *meta
+	targetMeta.StreamStatus = "edited"
+	target.Metadata = &targetMeta
+	*msg.EditTarget = target
+
+	startKey := matrixStartKey(cl.UserLogin.ID, msg.Portal.PortalKey, msg.Event.ID)
+	if cl.Main != nil && cl.Main.claimMatrixStart(startKey) {
+		go cl.startMatrixTurnFromEdit(startKey, msg.Portal, &target, string(msg.Event.ID), prompt)
+	}
+	return nil
+}
+
+func validateMatrixPromptEdit(msg *bridgev2.MatrixEdit) error {
+	if msg == nil || msg.Content == nil {
+		return fmt.Errorf("missing Matrix edit")
 	}
 	switch msg.Content.MsgType {
 	case "", event.MsgText:
@@ -424,6 +497,127 @@ func (cl *Client) startMatrixTurn(startKey string, portal *bridgev2.Portal, meta
 	if run != nil {
 		cl.updateStoredUserMessageMetadata(ctx, portal.PortalKey.Receiver, messageID, part, threadID, run.turnID)
 	}
+}
+
+func (cl *Client) prepareMatrixTurnRewrite(ctx context.Context, portal *bridgev2.Portal, target *database.Message) error {
+	if portal == nil || target == nil {
+		return fmt.Errorf("missing Codex edit target")
+	}
+	meta, _ := target.Metadata.(*MessageMetadata)
+	if meta == nil || meta.ThreadID == "" || meta.TurnID == "" {
+		return fmt.Errorf("missing Codex edit metadata")
+	}
+	threadID := meta.ThreadID
+	if active := cl.Main.activeRun(threadID); active != nil {
+		if err := cl.Main.request(ctx, "turn/interrupt", map[string]any{"threadId": threadID, "turnId": active.turnID}, nil); err != nil {
+			return fmt.Errorf("failed to stop active Codex turn before edit: %w", err)
+		}
+		active.writeCodexClientRequestState("turn/interrupt", codexClientTurnRequestState(threadID, active.turnID, "", ""))
+		cl.Main.setActive(threadID, nil)
+	}
+	if err := cl.rollbackThreadToTurn(ctx, threadID, meta.TurnID); err != nil {
+		return fmt.Errorf("failed to roll back Codex thread for edit: %w", err)
+	}
+	if err := cl.redactAndDeleteMessagesAfter(ctx, portal, target); err != nil {
+		logFromContext(ctx).Warn().Err(err).Str("thread_id", threadID).Msg("Failed to remove stale messages after Codex edit")
+	}
+	return nil
+}
+
+func (cl *Client) startMatrixTurnFromEdit(startKey string, portal *bridgev2.Portal, target *database.Message, clientUserMessageID, prompt string) {
+	defer cl.Main.finishMatrixStart(startKey)
+	ctx := context.Background()
+	if portal = cl.freshPortal(ctx, portal); portal == nil || target == nil {
+		return
+	}
+	meta, _ := target.Metadata.(*MessageMetadata)
+	if meta == nil || meta.ThreadID == "" {
+		return
+	}
+	threadID := meta.ThreadID
+	run, err := cl.startTurn(ctx, portal.PortalKey, threadID, clientUserMessageID, prompt)
+	if err != nil {
+		logFromContext(ctx).Err(err).Str("thread_id", threadID).Msg("Failed to start Codex turn from Matrix edit")
+		cl.queueAsyncTurnFailure(ctx, portal, threadID, "Failed to start the replacement Codex response:\n\n"+err.Error())
+		return
+	}
+	if run != nil {
+		cl.updateStoredUserMessageMetadata(ctx, portal.PortalKey.Receiver, target.ID, target.PartID, threadID, run.turnID)
+	}
+}
+
+func (cl *Client) rollbackThreadToTurn(ctx context.Context, threadID, turnID string) error {
+	thread, err := cl.readThread(ctx, threadID, true)
+	if err != nil {
+		return err
+	}
+	targetIndex := -1
+	for i, turn := range thread.Turns {
+		if turn.ID == turnID {
+			targetIndex = i
+			break
+		}
+	}
+	if targetIndex < 0 {
+		return fmt.Errorf("edited turn %s was not found in Codex history", turnID)
+	}
+	numTurns := len(thread.Turns) - targetIndex
+	if numTurns <= 0 {
+		return nil
+	}
+	var resp appserver.ThreadRollbackResponse
+	if err := cl.Main.request(ctx, "thread/rollback", map[string]any{"threadId": threadID, "numTurns": numTurns}, &resp); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (cl *Client) redactAndDeleteMessagesAfter(ctx context.Context, portal *bridgev2.Portal, target *database.Message) error {
+	if cl == nil || cl.Main == nil || cl.Main.Bridge == nil || cl.Main.Bridge.DB == nil || portal == nil || target == nil {
+		return nil
+	}
+	count, err := cl.Main.Bridge.DB.Message.CountMessagesInPortal(ctx, portal.PortalKey)
+	if err != nil {
+		return err
+	}
+	messages, err := cl.Main.Bridge.DB.Message.GetLastNInPortal(ctx, portal.PortalKey, count)
+	if err != nil {
+		return err
+	}
+	seenMXID := map[id.EventID]bool{}
+	for _, msg := range messages {
+		if msg == nil || msg.RowID <= target.RowID {
+			continue
+		}
+		if msg.MXID != "" && !strings.HasPrefix(string(msg.MXID), "~fake:") && !seenMXID[msg.MXID] {
+			seenMXID[msg.MXID] = true
+			if err := cl.redactBridgeMessage(ctx, portal, msg.MXID); err != nil {
+				return err
+			}
+		}
+		if meta, _ := msg.Metadata.(*MessageMetadata); meta != nil && meta.TurnID != "" && cl.Main.Store != nil && cl.UserLogin != nil {
+			if err := cl.Main.Store.DeleteActiveStream(ctx, cl.UserLogin.ID, meta.TurnID); err != nil {
+				logFromContext(ctx).Warn().Err(err).Str("turn_id", meta.TurnID).Msg("Failed to delete stale Codex active stream record after edit")
+			}
+		}
+		if err := cl.Main.Bridge.DB.Message.Delete(ctx, msg.RowID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (cl *Client) redactBridgeMessage(ctx context.Context, portal *bridgev2.Portal, eventID id.EventID) error {
+	if cl == nil || cl.Main == nil || cl.Main.Bridge == nil || cl.Main.Bridge.Bot == nil || portal == nil || portal.MXID == "" || eventID == "" {
+		return nil
+	}
+	_, err := cl.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventRedaction, &event.Content{
+		Parsed: &event.RedactionEventContent{
+			Redacts: eventID,
+			Reason:  "Codex prompt edited",
+		},
+	}, nil)
+	return err
 }
 
 func (cl *Client) freshPortal(ctx context.Context, portal *bridgev2.Portal) *bridgev2.Portal {
@@ -1499,6 +1693,7 @@ func (cl *Client) startTurn(ctx context.Context, portalKey networkid.PortalKey, 
 		if err := run.start(ctx); err != nil {
 			return nil, err
 		}
+		run.writeCodexClientRequestState("turn/start", codexClientTurnRequestState(threadID, resp.Turn.ID, "", clientUserMessageID))
 		return run, nil
 	}
 	run := newActiveRun(cl, portalKey, threadID, resp.Turn.ID)
@@ -1507,6 +1702,7 @@ func (cl *Client) startTurn(ctx context.Context, portalKey networkid.PortalKey, 
 		cl.Main.setActive(threadID, nil)
 		return nil, err
 	}
+	run.writeCodexClientRequestState("turn/start", codexClientTurnRequestState(threadID, resp.Turn.ID, "", clientUserMessageID))
 	return run, nil
 }
 
@@ -1522,6 +1718,9 @@ func (cl *Client) steerTurn(ctx context.Context, threadID, turnID, clientUserMes
 	if err := cl.Main.request(ctx, "turn/steer", params, nil); err != nil {
 		return err
 	}
+	if run := cl.Main.activeRun(threadID); run != nil {
+		run.writeCodexClientRequestState("turn/steer", codexClientTurnRequestState(threadID, "", turnID, clientUserMessageID))
+	}
 	return nil
 }
 
@@ -1530,7 +1729,26 @@ func (cl *Client) interruptTurn(ctx context.Context, portal *bridgev2.Portal, th
 		cl.queueCommandNotice(portal, threadID, "Failed to stop Codex turn:\n\n"+err.Error())
 		return
 	}
+	if run := cl.Main.activeRun(threadID); run != nil {
+		run.writeCodexClientRequestState("turn/interrupt", codexClientTurnRequestState(threadID, turnID, "", ""))
+	}
 	cl.queueCommandNotice(portal, threadID, "Requested Codex to stop the active turn.")
+}
+
+func codexClientTurnRequestState(threadID, turnID, expectedTurnID, clientUserMessageID string) map[string]any {
+	state := map[string]any{
+		"threadId": threadID,
+	}
+	if turnID != "" {
+		state["turnId"] = turnID
+	}
+	if expectedTurnID != "" {
+		state["expectedTurnId"] = expectedTurnID
+	}
+	if clientUserMessageID != "" {
+		state["clientUserMessageId"] = clientUserMessageID
+	}
+	return state
 }
 
 func turnTextInput(prompt string) []map[string]any {
@@ -1567,6 +1785,9 @@ func (cl *Client) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 
 func (cl *Client) GetBackfillMaxBatchCount(ctx context.Context, portal *bridgev2.Portal, task *database.BackfillTask) int {
 	if portal == nil || portal.RoomType == database.RoomTypeSpace {
+		return 0
+	}
+	if portalMetadata(portal.Metadata).ThreadID == "" {
 		return 0
 	}
 	return -1

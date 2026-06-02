@@ -18,6 +18,7 @@ const codexTypeScriptNotificationPath = "/Users/batuhan/projects/codex/codex-rs/
 const codexTypeScriptServerRequestPath = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/typescript/ServerRequest.ts"
 const codexJSONNotificationPath = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/json/ServerNotification.json"
 const codexJSONServerRequestPath = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/json/ServerRequest.json"
+const codexCombinedJSONSchemaPath = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/json/codex_app_server_protocol.schemas.json"
 const codexTypeScriptResponseItemPath = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/typescript/ResponseItem.ts"
 const codexTypeScriptV2NotificationDir = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/typescript/v2"
 const codexTypeScriptV2ThreadItemPath = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/typescript/v2/ThreadItem.ts"
@@ -276,6 +277,18 @@ func TestJSONCodexServerNotificationsAreClassified(t *testing.T) {
 	}
 }
 
+func TestCombinedJSONCodexServerNotificationsAreClassified(t *testing.T) {
+	methods := generatedCombinedJSONMethods(t, "ServerNotification")
+	if len(methods) == 0 {
+		t.Fatal("combined JSON Codex schema did not contain notification methods")
+	}
+	for _, method := range methods {
+		if !isThreadNotification(method) && !isGlobalNotification(method) {
+			t.Fatalf("combined JSON Codex server notification %q is not classified", method)
+		}
+	}
+}
+
 func TestJSONCodexThreadNotificationsHaveDispatchLane(t *testing.T) {
 	methods := generatedJSONMethods(t, codexJSONNotificationPath)
 	if len(methods) == 0 {
@@ -291,11 +304,50 @@ func TestJSONCodexThreadNotificationsHaveDispatchLane(t *testing.T) {
 	}
 }
 
+func TestTypeScriptActiveRunNotificationsHaveMappingDecision(t *testing.T) {
+	methods := generatedTypeScriptMethods(t, codexTypeScriptNotificationPath)
+	if len(methods) == 0 {
+		t.Fatal("TypeScript Codex schema did not contain notification methods")
+	}
+	for _, method := range methods {
+		if !isActiveRunNotification(method) {
+			continue
+		}
+		if !isActiveRunNotificationMapped(method) && !isActiveRunNotificationIntentionallyInvisible(method) {
+			t.Fatalf("active-run notification %q has no visible AG-UI mapping or explicit invisible decision", method)
+		}
+	}
+}
+
 func TestTypeScriptRawResponseCompactionItemsAreMapped(t *testing.T) {
 	itemTypes := generatedTypeScriptResponseItemTypes(t)
 	for _, itemType := range itemTypes {
 		if strings.Contains(itemType, "compaction") && !isRawResponseCompactionItem(itemType) {
 			t.Fatalf("raw response compaction item %q is not mapped to a user-visible notice", itemType)
+		}
+	}
+}
+
+func TestTypeScriptRawResponseItemTypesHaveMappingDecision(t *testing.T) {
+	itemTypes := generatedTypeScriptResponseItemTypes(t)
+	if len(itemTypes) == 0 {
+		t.Fatal("TypeScript Codex schema did not contain response item types")
+	}
+	for _, itemType := range itemTypes {
+		if !isRawResponseItemMapped(itemType) && !isRawResponseItemIntentionallyInvisible(itemType) {
+			t.Fatalf("raw response item type %q has no visible mapping or explicit invisible decision", itemType)
+		}
+	}
+}
+
+func TestTypeScriptRawResponseItemTypesHaveBackfillMappingDecision(t *testing.T) {
+	itemTypes := generatedTypeScriptResponseItemTypes(t)
+	if len(itemTypes) == 0 {
+		t.Fatal("TypeScript Codex schema did not contain response item types")
+	}
+	for _, itemType := range itemTypes {
+		if !isRawResponseItemBackfilled(itemType) && !isRawResponseItemIntentionallyInvisible(itemType) {
+			t.Fatalf("raw response item type %q has no backfill mapping or explicit invisible decision", itemType)
 		}
 	}
 }
@@ -320,6 +372,18 @@ func TestJSONCodexServerRequestsAreHandled(t *testing.T) {
 	for _, method := range methods {
 		if !isHandledCodexServerRequest(method) {
 			t.Fatalf("JSON Codex server request %q is not handled", method)
+		}
+	}
+}
+
+func TestCombinedJSONCodexServerRequestsAreHandled(t *testing.T) {
+	methods := generatedCombinedJSONMethods(t, "ServerRequest")
+	if len(methods) == 0 {
+		t.Fatal("combined JSON Codex schema did not contain server request methods")
+	}
+	for _, method := range methods {
+		if !isHandledCodexServerRequest(method) {
+			t.Fatalf("combined JSON Codex server request %q is not handled", method)
 		}
 	}
 }
@@ -350,19 +414,25 @@ func generatedJSONMethods(t *testing.T, path string) []string {
 		t.Fatalf("read generated Codex JSON schema: %v", err)
 	}
 	var schema struct {
-		OneOf []struct {
-			Properties struct {
-				Method struct {
-					Enum []string `json:"enum"`
-				} `json:"method"`
-			} `json:"properties"`
-		} `json:"oneOf"`
+		OneOf jsonMethodUnion `json:"oneOf"`
 	}
 	if err = json.Unmarshal(raw, &schema); err != nil {
 		t.Fatalf("parse generated Codex JSON schema: %v", err)
 	}
+	return uniqueMethodEnums(schema.OneOf)
+}
+
+type jsonMethodUnion []struct {
+	Properties struct {
+		Method struct {
+			Enum []string `json:"enum"`
+		} `json:"method"`
+	} `json:"properties"`
+}
+
+func uniqueMethodEnums(items jsonMethodUnion) []string {
 	seen := map[string]bool{}
-	for _, item := range schema.OneOf {
+	for _, item := range items {
 		for _, method := range item.Properties.Method.Enum {
 			if method != "" {
 				seen[method] = true
@@ -375,6 +445,27 @@ func generatedJSONMethods(t *testing.T, path string) []string {
 	}
 	sort.Strings(methods)
 	return methods
+}
+
+func generatedCombinedJSONMethods(t *testing.T, definition string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(codexCombinedJSONSchemaPath)
+	if err != nil {
+		t.Fatalf("read combined Codex JSON schema: %v", err)
+	}
+	var schema struct {
+		Definitions map[string]struct {
+			OneOf jsonMethodUnion `json:"oneOf"`
+		} `json:"definitions"`
+	}
+	if err = json.Unmarshal(raw, &schema); err != nil {
+		t.Fatalf("parse combined Codex JSON schema: %v", err)
+	}
+	definitionSchema, ok := schema.Definitions[definition]
+	if !ok {
+		t.Fatalf("combined Codex JSON schema missing %s definition", definition)
+	}
+	return uniqueMethodEnums(definitionSchema.OneOf)
 }
 
 func generatedTypeScriptResponseItemTypes(t *testing.T) []string {
@@ -403,6 +494,96 @@ func isRawResponseCompactionItem(itemType string) bool {
 	default:
 		return false
 	}
+}
+
+func isRawResponseItemMapped(itemType string) bool {
+	switch itemType {
+	case "message",
+		"reasoning",
+		"function_call",
+		"custom_tool_call",
+		"tool_search_call",
+		"function_call_output",
+		"custom_tool_call_output",
+		"tool_search_output",
+		"local_shell_call",
+		"web_search_call",
+		"image_generation_call":
+		return true
+	default:
+		return isRawResponseCompactionItem(itemType)
+	}
+}
+
+func isRawResponseItemBackfilled(itemType string) bool {
+	return isRawResponseItemMapped(itemType)
+}
+
+func isRawResponseItemIntentionallyInvisible(itemType string) bool {
+	return itemType == "other"
+}
+
+func isActiveRunNotificationMapped(method string) bool {
+	switch method {
+	case "thread/started",
+		"thread/status/changed",
+		"thread/archived",
+		"thread/unarchived",
+		"thread/closed",
+		"thread/name/updated",
+		"thread/goal/updated",
+		"thread/goal/cleared",
+		"thread/settings/updated",
+		"thread/tokenUsage/updated",
+		"turn/started",
+		"thread/compacted",
+		"turn/completed",
+		"turn/diff/updated",
+		"turn/plan/updated",
+		"hook/started",
+		"hook/completed",
+		"item/started",
+		"item/completed",
+		"item/agentMessage/delta",
+		"item/reasoning/summaryTextDelta",
+		"item/reasoning/textDelta",
+		"item/reasoning/summaryPartAdded",
+		"item/commandExecution/outputDelta",
+		"item/fileChange/outputDelta",
+		"item/commandExecution/terminalInteraction",
+		"item/plan/delta",
+		"item/mcpToolCall/progress",
+		"item/fileChange/patchUpdated",
+		"serverRequest/resolved",
+		"item/autoApprovalReview/started",
+		"item/autoApprovalReview/completed",
+		"command/exec/outputDelta",
+		"process/outputDelta",
+		"process/exited",
+		"rawResponseItem/completed",
+		"model/rerouted",
+		"model/verification",
+		"warning",
+		"guardianWarning",
+		"deprecationNotice",
+		"configWarning",
+		"error",
+		"thread/realtime/transcript/delta",
+		"thread/realtime/transcript/done",
+		"thread/realtime/started",
+		"thread/realtime/itemAdded",
+		"thread/realtime/outputAudio/delta",
+		"thread/realtime/sdp",
+		"thread/realtime/error",
+		"thread/realtime/closed":
+		return true
+	default:
+		return false
+	}
+}
+
+func isActiveRunNotificationIntentionallyInvisible(method string) bool {
+	return false
 }
 
 func generatedTypeScriptMethods(t *testing.T, path string) []string {

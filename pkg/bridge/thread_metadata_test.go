@@ -954,6 +954,10 @@ func TestThreadMetadataNotificationUpdatesActiveRunPortalKey(t *testing.T) {
 	if activeModel != "openai/gpt-5" || activeEventModel != "openai/gpt-5" {
 		t.Fatalf("active run kept stale model: run=%q event=%#v", activeModel, activeEventModel)
 	}
+	if !hasCodexRoomStateDelta(run.run.Events, codexThreadStateType, "cwd", "/new/project") ||
+		!hasCodexRoomStateDelta(run.run.Events, codexThreadStateType, "model", "gpt-5") {
+		t.Fatalf("active run did not sync Codex thread room state: %#v", run.run.Events)
+	}
 	if portal, err := br.GetExistingPortalByKey(ctx, targetKey); err != nil {
 		t.Fatal(err)
 	} else if portal == nil || portal.MXID != "!room:example.com" {
@@ -1129,6 +1133,27 @@ func TestThreadMetadataNotificationPreservesClearedRoomNameAndTopic(t *testing.T
 		if name != "" {
 			t.Fatalf("chat info sync did not preserve cleared room name: %#v", state.Content.Raw)
 		}
+	}
+}
+
+func TestApplyStoredPortalInfoPreservesClearedTopic(t *testing.T) {
+	name := "Generated"
+	topic := "Generated topic"
+	info := &bridgev2.ChatInfo{Name: &name, Topic: &topic}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		Name:     "",
+		NameSet:  true,
+		Topic:    "",
+		TopicSet: true,
+	}}
+
+	applyStoredPortalInfo(info, portal)
+
+	if info.Name == nil || *info.Name != "" {
+		t.Fatalf("cleared room name was not preserved: %#v", info.Name)
+	}
+	if info.Topic == nil || *info.Topic != "" {
+		t.Fatalf("cleared room topic was not preserved: %#v", info.Topic)
 	}
 }
 

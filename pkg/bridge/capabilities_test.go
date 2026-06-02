@@ -36,8 +36,8 @@ func TestRoomCapabilitiesMatchImplementedHandlers(t *testing.T) {
 	if caps.Reply != event.CapLevelUnsupported {
 		t.Fatalf("reply support should not be advertised until ReplyTo is mapped, got %v", caps.Reply)
 	}
-	if caps.Edit != event.CapLevelUnsupported || caps.EditMaxCount != 0 || caps.EditMaxAge != nil {
-		t.Fatalf("edits should not be advertised, got level=%v count=%d age=%v", caps.Edit, caps.EditMaxCount, caps.EditMaxAge)
+	if caps.Edit != event.CapLevelFullySupported || caps.EditMaxCount != 0 || caps.EditMaxAge != nil {
+		t.Fatalf("prompt edits should be advertised without count/age caps, got level=%v count=%d age=%v", caps.Edit, caps.EditMaxCount, caps.EditMaxAge)
 	}
 	if caps.Delete != event.CapLevelUnsupported || caps.DeleteForMe || caps.DeleteMaxAge != nil {
 		t.Fatalf("message deletes should not be advertised, got level=%v for_me=%v age=%v", caps.Delete, caps.DeleteForMe, caps.DeleteMaxAge)
@@ -141,6 +141,7 @@ func TestClientBridgeV2InterfacesMatchAdvertisedSupport(t *testing.T) {
 		{"UserSearchingNetworkAPI", implements[bridgev2.UserSearchingNetworkAPI](client)},
 		{"BackfillingNetworkAPI", implements[bridgev2.BackfillingNetworkAPI](client)},
 		{"BackfillingNetworkAPIWithLimits", implements[bridgev2.BackfillingNetworkAPIWithLimits](client)},
+		{"EditHandlingNetworkAPI", implements[bridgev2.EditHandlingNetworkAPI](client)},
 		{"RoomNameHandlingNetworkAPI", implements[bridgev2.RoomNameHandlingNetworkAPI](client)},
 		{"RoomTopicHandlingNetworkAPI", implements[bridgev2.RoomTopicHandlingNetworkAPI](client)},
 		{"RoomStateHandlingNetworkAPI", implements[bridgev2.RoomStateHandlingNetworkAPI](client)},
@@ -155,7 +156,6 @@ func TestClientBridgeV2InterfacesMatchAdvertisedSupport(t *testing.T) {
 		name string
 		ok   bool
 	}{
-		{"EditHandlingNetworkAPI", implements[bridgev2.EditHandlingNetworkAPI](client)},
 		{"PollHandlingNetworkAPI", implements[bridgev2.PollHandlingNetworkAPI](client)},
 		{"ReactionHandlingNetworkAPI", implements[bridgev2.ReactionHandlingNetworkAPI](client)},
 		{"RedactionHandlingNetworkAPI", implements[bridgev2.RedactionHandlingNetworkAPI](client)},

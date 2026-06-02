@@ -21,6 +21,10 @@ type ThreadReadResponse struct {
 	Thread Thread `json:"thread"`
 }
 
+type ThreadRollbackResponse struct {
+	Thread Thread `json:"thread"`
+}
+
 type ThreadTurnsListResponse struct {
 	Data            []Turn `json:"data"`
 	NextCursor      string `json:"nextCursor"`

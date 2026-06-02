@@ -21,8 +21,9 @@ import (
 )
 
 const (
-	serverRequestTimeout = 30 * time.Minute
-	matrixCommandMsgType = event.MessageType("com.beeper.command")
+	serverRequestTimeout           = 30 * time.Minute
+	matrixCommandMsgType           = event.MessageType("com.beeper.command")
+	unsupportedDynamicToolCallText = "Codex bridge does not provide dynamic client tools."
 )
 
 type pendingServerRequest struct {
@@ -63,19 +64,65 @@ func (r *activeRun) handleServerRequest(ctx context.Context, msg appserver.Messa
 		return codexInputResponse(pending, response), nil
 	case "item/tool/call":
 		payload := rawPayload(msg.Params)
+		response := unsupportedDynamicToolCallResponse()
 		r.mu.Lock()
-		r.writeCustom(msg.Method, payload)
+		r.writeUnsupportedDynamicToolCallLocked(serverRequestID(msg.ID), payload, response)
 		r.publishLocked()
 		r.mu.Unlock()
-		return map[string]any{
-			"contentItems": []map[string]any{{
-				"type": "inputText",
-				"text": "Codex bridge does not provide dynamic client tools.",
-			}},
-			"success": false,
-		}, nil
+		return response, nil
 	default:
 		return nil, fmt.Errorf("unsupported Codex server request %s", msg.Method)
+	}
+}
+
+func unsupportedDynamicToolCallResponse() map[string]any {
+	return map[string]any{
+		"contentItems": []map[string]any{{
+			"type": "inputText",
+			"text": unsupportedDynamicToolCallText,
+		}},
+		"success": false,
+	}
+}
+
+func (r *activeRun) writeUnsupportedDynamicToolCallLocked(fallbackID string, payload map[string]any, response map[string]any) {
+	if r == nil || r.writer == nil {
+		return
+	}
+	callID := firstString(payload, "callId", "itemId", "id")
+	if callID == "" {
+		callID = strings.TrimSpace(fallbackID)
+	}
+	if callID == "" {
+		callID = "dynamic_tool_call"
+	}
+	name := dynamicToolCallName(payload)
+	input := copyStateMap(payload)
+	r.ensureToolStartedWithMetadata(callID, name, map[string]any{"codex": map[string]any{
+		"request": "item/tool/call",
+		"callId":  callID,
+		"name":    name,
+	}})
+	if len(input) > 0 {
+		r.writeToolArgsText(callID, compactJSONString(input), input)
+	}
+	r.writer.ToolResult(callID, unsupportedDynamicToolCallText, agui.ToolResultStateError)
+	r.toolResult[callID] = true
+	r.endToolCall(callID, name, input, response)
+}
+
+func dynamicToolCallName(payload map[string]any) string {
+	namespace := firstString(payload, "namespace")
+	tool := firstString(payload, "tool", "name")
+	switch {
+	case namespace != "" && tool != "":
+		return namespace + ": " + tool
+	case tool != "":
+		return tool
+	case namespace != "":
+		return namespace
+	default:
+		return "dynamic tool"
 	}
 }
 
@@ -149,11 +196,6 @@ func (r *activeRun) waitForServerRequest(ctx context.Context, pending *pendingSe
 	r.pending[pending.ID] = pending
 	r.writer.ToolApprovalRequestedWithRequest(request)
 	r.writer.InterruptWithUsage(nil)
-	r.writeCustom("codex/serverRequest", map[string]any{
-		"method": msgMethod(request),
-		"id":     pending.ID,
-		"input":  pending.Input,
-	})
 	r.publishLocked()
 	r.queueApprovalPromptLocked(request)
 	r.client.queueCodexTyping(r.portalKey, 0)
@@ -402,7 +444,7 @@ func (r *activeRun) cancelPending(id string) {
 }
 
 func (cl *Client) handleBridgeCommand(ctx context.Context, msg *bridgev2.MatrixMessage) (*bridgev2.MatrixMessageResponse, bool, error) {
-	command, ok := parseCodexCommand(msg.Content)
+	command, ok := parseCodexCommandMessage(msg)
 	if !ok {
 		return nil, false, nil
 	}
@@ -428,20 +470,26 @@ func (cl *Client) handleBridgeCommand(ctx context.Context, msg *bridgev2.MatrixM
 			cl.queueCommandNotice(msg.Portal, meta.ThreadID, "No Codex turn is waiting for an approval.")
 			return cl.commandHandledResponse(msg, "no_pending_approval"), true, nil
 		}
-		if !active.resolveApprovalCommand(command.arg) {
+		response, ok := parseApprovalCommandResponse(command.arg)
+		if !ok || !active.resolveApproval(response) {
 			cl.queueCommandNotice(msg.Portal, meta.ThreadID, "That approval was not pending, or the response was invalid.\n\nUse `/approvals` to list pending Codex requests.")
 			return cl.commandHandledResponse(msg, "invalid_approval"), true, nil
 		}
+		active.writeCodexClientRequestState("command/approve", codexApprovalCommandClientState(response))
 		return cl.commandHandledResponse(msg, "approve"), true, nil
 	case "answer":
 		if active == nil {
 			cl.queueCommandNotice(msg.Portal, meta.ThreadID, "No Codex turn is waiting for input.")
 			return cl.commandHandledResponse(msg, "no_pending_input"), true, nil
 		}
-		if !active.resolveAnswerCommand(command.arg) {
+		requestID, answer, ok := parseAnswerCommandArgs(command.arg)
+		if !ok || !active.resolveAnswer(requestID, answer) {
 			cl.queueCommandNotice(msg.Portal, meta.ThreadID, "That input request was not pending, or the response was invalid.\n\nUse `/approvals` to list pending Codex requests.")
 			return cl.commandHandledResponse(msg, "invalid_answer"), true, nil
 		}
+		active.writeCodexClientRequestState("command/answer", map[string]any{
+			"id": requestID,
+		})
 		return cl.commandHandledResponse(msg, "answer"), true, nil
 	case "stop":
 		if active == nil {
@@ -455,17 +503,21 @@ func (cl *Client) handleBridgeCommand(ctx context.Context, msg *bridgev2.MatrixM
 	}
 }
 
+func parseCodexCommandMessage(msg *bridgev2.MatrixMessage) (codexCommand, bool) {
+	if msg == nil {
+		return codexCommand{}, false
+	}
+	if command, ok := parseCodexCommand(msg.Content); ok {
+		return command, true
+	}
+	if msg.Event == nil {
+		return codexCommand{}, false
+	}
+	return codexCommandFromRawContent(msg.Event.Content.Raw)
+}
+
 func (r *activeRun) resolveApprovalCommand(args string) bool {
-	approvalID, rawChoice, _ := strings.Cut(strings.TrimSpace(args), " ")
-	approvalID = strings.TrimSpace(approvalID)
-	if approvalID == "" {
-		return false
-	}
-	rawChoice = strings.TrimSpace(rawChoice)
-	if rawChoice == "" {
-		rawChoice = "approve"
-	}
-	response, ok := approvalResponseFromCommand(approvalID, rawChoice)
+	response, ok := parseApprovalCommandResponse(args)
 	if !ok {
 		return false
 	}
@@ -473,11 +525,55 @@ func (r *activeRun) resolveApprovalCommand(args string) bool {
 }
 
 func (r *activeRun) resolveAnswerCommand(args string) bool {
-	requestID, rawAnswer, ok := strings.Cut(args, " ")
+	requestID, answer, ok := parseAnswerCommandArgs(args)
 	if !ok {
 		return false
 	}
-	return r.resolveAnswer(strings.TrimSpace(requestID), strings.TrimSpace(rawAnswer))
+	return r.resolveAnswer(requestID, answer)
+}
+
+func parseApprovalCommandResponse(args string) (aistream.ToolApprovalResponse, bool) {
+	approvalID, rawChoice, _ := strings.Cut(strings.TrimSpace(args), " ")
+	approvalID = strings.TrimSpace(approvalID)
+	if approvalID == "" {
+		return aistream.ToolApprovalResponse{}, false
+	}
+	rawChoice = strings.TrimSpace(rawChoice)
+	if rawChoice == "" {
+		rawChoice = "approve"
+	}
+	return approvalResponseFromCommand(approvalID, rawChoice)
+}
+
+func parseAnswerCommandArgs(args string) (requestID, answer string, ok bool) {
+	requestID, answer, ok = strings.Cut(args, " ")
+	if !ok {
+		return "", "", false
+	}
+	requestID = strings.TrimSpace(requestID)
+	if requestID == "" {
+		return "", "", false
+	}
+	return requestID, strings.TrimSpace(answer), true
+}
+
+func codexApprovalCommandClientState(response aistream.ToolApprovalResponse) map[string]any {
+	state := map[string]any{
+		"id":       response.ID,
+		"approved": response.Approved,
+		"choice":   "deny",
+	}
+	if response.Approved {
+		state["choice"] = "approve"
+	}
+	if response.Always {
+		state["choice"] = "always"
+		state["always"] = true
+	}
+	if response.Reason != "" {
+		state["reason"] = response.Reason
+	}
+	return state
 }
 
 type codexCommand struct {
@@ -1051,12 +1147,4 @@ func responseTime(value string) string {
 		return value
 	}
 	return time.Now().UTC().Format(time.RFC3339)
-}
-
-func msgMethod(request aistream.ApprovalRequest) string {
-	if request.Metadata == nil {
-		return ""
-	}
-	method, _ := request.Metadata["method"].(string)
-	return method
 }

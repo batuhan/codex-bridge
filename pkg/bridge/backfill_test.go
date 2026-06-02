@@ -605,11 +605,19 @@ func TestPaginateBackfillMessagesMarksReadOnlyForForwardOrInitialImport(t *testi
 
 func TestCodexBackfillMaxBatchCountIsUnlimitedForRooms(t *testing.T) {
 	client := &Client{}
-	portal := &bridgev2.Portal{Portal: &database.Portal{RoomType: database.RoomTypeDM}}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		RoomType: database.RoomTypeDM,
+		Metadata: &PortalMetadata{ThreadID: "thread-1"},
+	}}
 	if got := client.GetBackfillMaxBatchCount(context.Background(), portal, nil); got != -1 {
 		t.Fatalf("Codex room backfill should be unlimited, got %d", got)
 	}
+	portal.Metadata = &PortalMetadata{}
+	if got := client.GetBackfillMaxBatchCount(context.Background(), portal, nil); got != 0 {
+		t.Fatalf("rooms without a Codex thread should not backfill, got %d", got)
+	}
 	portal.RoomType = database.RoomTypeSpace
+	portal.Metadata = &PortalMetadata{ThreadID: "thread-1"}
 	if got := client.GetBackfillMaxBatchCount(context.Background(), portal, nil); got != 0 {
 		t.Fatalf("space backfill should be disabled, got %d", got)
 	}
@@ -738,8 +746,8 @@ func TestBackfillToolNameAndResultUseRichItemData(t *testing.T) {
 		"_meta":             nil,
 	}
 	result = backfillToolResultText(data)
-	if result != "found two issues" {
-		t.Fatalf("unexpected MCP content text result: %q", result)
+	if !strings.Contains(result, "found two issues") || !strings.Contains(result, `"structuredContent":{"count":2}`) {
+		t.Fatalf("unexpected MCP structured content result: %q", result)
 	}
 
 	data = map[string]any{"type": "dynamicToolCall", "tool": "custom_tool", "contentItems": []any{map[string]any{"text": "done"}}}
@@ -957,6 +965,37 @@ func TestBackfillRawToolResultSynthesizesMissingStart(t *testing.T) {
 	assertAGUISequenceValid(t, run)
 }
 
+func TestBackfillRawToolResultPreservesStructuredOutput(t *testing.T) {
+	run := aistream.NewRun("turn-1", "thread-1", "openai/gpt-5", "codex", "Codex", time.Unix(0, 0))
+	writer := aistream.NewWriter(run, func() time.Time { return time.Unix(0, 0) })
+	writer.Start()
+	writer.StepStart("turn-1")
+	if !mapBackfillItem(writer, run.MessageID, appserver.TurnItem{
+		ID:   "call-1",
+		Type: "function_call_output",
+		Raw: map[string]any{
+			"type":    "function_call_output",
+			"call_id": "call-1",
+			"output": map[string]any{
+				"content":           []any{map[string]any{"type": "text", "text": "found"}},
+				"structuredContent": map[string]any{"count": float64(2)},
+			},
+		},
+	}, nil) {
+		t.Fatal("expected structured raw tool output to be backfilled")
+	}
+	writer.StepFinish("turn-1")
+	writer.Finish(agui.FinishReasonStop)
+
+	if !hasToolResultStateContaining(run.Events, "call-1", "found", agui.ToolResultStateComplete) {
+		t.Fatalf("expected structured raw tool output text, got %#v", run.Events)
+	}
+	if !hasToolResultStateContaining(run.Events, "call-1", `"structuredContent":{"count":2}`, agui.ToolResultStateComplete) {
+		t.Fatalf("expected structured raw tool output data, got %#v", run.Events)
+	}
+	assertAGUISequenceValid(t, run)
+}
+
 func TestBackfillRawToolResultWithoutOutputOnlySynthesizesStart(t *testing.T) {
 	run := aistream.NewRun("turn-1", "thread-1", "openai/gpt-5", "codex", "Codex", time.Unix(0, 0))
 	writer := aistream.NewWriter(run, func() time.Time { return time.Unix(0, 0) })
@@ -1034,6 +1073,15 @@ func TestBackfillRawToolEndMapsResultBeforeEnd(t *testing.T) {
 	}
 	if !hasToolResultStateContaining(run.Events, "image-1", "mxc://example.com/image", agui.ToolResultStateComplete) {
 		t.Fatalf("expected raw image result to map to tool result, got %#v", run.Events)
+	}
+	if got := countToolResults(run.Events, "image-1"); got != 1 {
+		t.Fatalf("expected raw image close to preserve the real output only, got %d events=%#v", got, run.Events)
+	}
+	if !hasToolArgsContaining(run.Events, "image-1", "a clean bridge diagram") {
+		t.Fatalf("expected raw image prompt to map to tool args, got %#v", run.Events)
+	}
+	if hasToolArgsContaining(run.Events, "image-1", "mxc://example.com/image") || hasToolArgsContaining(run.Events, "image-1", `"status"`) {
+		t.Fatalf("raw image tool args should not include result/status fields, got %#v", run.Events)
 	}
 	assertAGUISequenceValid(t, run)
 }
@@ -1196,8 +1244,130 @@ func TestBackfillCommandExecutionUsesRawAggregatedOutput(t *testing.T) {
 	if got := countToolResult(run.Events, "cmd-1", "ok"); got != 1 {
 		t.Fatalf("expected one backfilled tool result, got %d events=%#v", got, run.Events)
 	}
+	if got := countToolResults(run.Events, "cmd-1"); got != 1 {
+		t.Fatalf("expected backfilled command close to preserve the real output only, got %d events=%#v", got, run.Events)
+	}
 	if !hasToolArgsContaining(run.Events, "cmd-1", "go test ./...") {
 		t.Fatalf("expected command input to map to tool args, got %#v", run.Events)
+	}
+}
+
+func TestBackfillCommandExecutionSyncsTerminalMetadataAfterOutput(t *testing.T) {
+	run := aistream.NewRun("turn-1", "thread-1", "codex", "codex", "Codex", time.Unix(0, 0))
+	writer := aistream.NewWriter(run, func() time.Time { return time.Unix(0, 0) })
+	item := appserver.TurnItem{
+		ID:   "cmd-1",
+		Type: "commandExecution",
+		Raw: map[string]any{
+			"id":               "cmd-1",
+			"type":             "commandExecution",
+			"command":          "go test ./...",
+			"status":           "completed",
+			"aggregatedOutput": "ok",
+			"exitCode":         float64(0),
+			"durationMs":       float64(12),
+		},
+	}
+
+	if !mapBackfillItem(writer, run.MessageID, item, nil) {
+		t.Fatal("expected command item to be backfilled")
+	}
+	if countToolResult(run.Events, "cmd-1", "ok") != 1 {
+		t.Fatalf("expected backfilled command output exactly once, got %#v", run.Events)
+	}
+	if !hasToolResultStateContaining(run.Events, "cmd-1", `"exitCode":0`, agui.ToolResultStateComplete) ||
+		!hasToolResultStateContaining(run.Events, "cmd-1", `"durationMs":12`, agui.ToolResultStateComplete) {
+		t.Fatalf("expected terminal command metadata to sync after output, got %#v", run.Events)
+	}
+	assertAGUISequenceValid(t, run)
+}
+
+func TestBackfillToolInputPreservesGeneratedMetadata(t *testing.T) {
+	run := aistream.NewRun("turn-1", "thread-1", "codex", "codex", "Codex", time.Unix(0, 0))
+	writer := aistream.NewWriter(run, func() time.Time { return time.Unix(0, 0) })
+	for _, item := range []appserver.TurnItem{
+		{
+			ID:   "cmd-1",
+			Type: "commandExecution",
+			Raw: map[string]any{
+				"id":               "cmd-1",
+				"type":             "commandExecution",
+				"command":          "go test ./...",
+				"cwd":              "/tmp/project",
+				"processId":        "proc-1",
+				"source":           "user",
+				"status":           "completed",
+				"commandActions":   []any{map[string]any{"type": "exec", "program": "go", "argv": []any{"go", "test", "./..."}}},
+				"aggregatedOutput": "ok",
+				"exitCode":         float64(0),
+				"durationMs":       float64(12),
+			},
+		},
+		{
+			ID:   "mcp-1",
+			Type: "mcpToolCall",
+			Raw: map[string]any{
+				"id":                "mcp-1",
+				"type":              "mcpToolCall",
+				"server":            "github",
+				"tool":              "list_issues",
+				"arguments":         map[string]any{"state": "open"},
+				"mcpAppResourceUri": "app://github",
+				"pluginId":          "github",
+				"status":            "completed",
+			},
+		},
+		{
+			ID:   "collab-1",
+			Type: "collabAgentToolCall",
+			Raw: map[string]any{
+				"id":                "collab-1",
+				"type":              "collabAgentToolCall",
+				"tool":              "spawn",
+				"senderThreadId":    "thread-1",
+				"receiverThreadIds": []any{"thread-2"},
+				"prompt":            "audit mapping",
+				"model":             "gpt-5.5",
+				"reasoningEffort":   "high",
+				"agentsStates":      map[string]any{"thread-2": map[string]any{"status": "running"}},
+				"status":            "completed",
+			},
+		},
+	} {
+		if !mapBackfillItem(writer, run.MessageID, item, nil) {
+			t.Fatalf("expected %s item to be backfilled", item.Type)
+		}
+	}
+
+	for _, want := range []string{`"processId":"proc-1"`, `"source":"user"`, `"commandActions"`, `"program":"go"`} {
+		if !hasToolArgsContaining(run.Events, "cmd-1", want) {
+			t.Fatalf("expected backfilled command input to preserve %s, got %#v", want, run.Events)
+		}
+	}
+	for _, unwanted := range []string{`"status"`, `"aggregatedOutput"`, `"exitCode"`, `"durationMs"`} {
+		if hasToolArgsContaining(run.Events, "cmd-1", unwanted) {
+			t.Fatalf("backfilled command args should not include output/status field %s: %#v", unwanted, run.Events)
+		}
+	}
+	for _, want := range []string{`"mcpAppResourceUri":"app://github"`, `"pluginId":"github"`} {
+		if !hasToolArgsContaining(run.Events, "mcp-1", want) {
+			t.Fatalf("expected backfilled MCP input to preserve %s, got %#v", want, run.Events)
+		}
+	}
+	for _, want := range []string{`"senderThreadId":"thread-1"`, `"receiverThreadIds":["thread-2"]`, `"model":"gpt-5.5"`, `"reasoningEffort":"high"`, `"agentsStates"`} {
+		if !hasToolArgsContaining(run.Events, "collab-1", want) {
+			t.Fatalf("expected backfilled collab input to preserve %s, got %#v", want, run.Events)
+		}
+	}
+	for _, want := range []string{`"type":"commandExecution"`, `"status":"completed"`, `"processId":"proc-1"`} {
+		if !hasToolStartMetadataContaining(run.Events, "cmd-1", want) {
+			t.Fatalf("expected backfilled command start metadata to preserve %s, got %#v", want, run.Events)
+		}
+	}
+	for _, unwanted := range []string{`"aggregatedOutput"`, `"exitCode"`, `"durationMs"`} {
+		if hasToolStartMetadataContaining(run.Events, "cmd-1", unwanted) {
+			t.Fatalf("backfilled command start metadata should not include output field %s: %#v", unwanted, run.Events)
+		}
 	}
 }
 
@@ -1255,7 +1425,8 @@ func TestBackfillHookPromptMapsTextState(t *testing.T) {
 	if !mapBackfillItem(writer, run.MessageID, item, nil) {
 		t.Fatal("expected hook prompt item to be backfilled")
 	}
-	if !hasStateDeltaText(run.Events, "hookPromptText", "Preserve approval context.") {
+	if !hasCodexRunStateDelta(run.Events, "item/hookPrompt", "text", "Preserve approval context.") ||
+		!hasCodexRunStateDelta(run.Events, "item/hookPrompt", "itemId", "hook-prompt-1") {
 		t.Fatalf("expected hook prompt text state, got %#v", run.Events)
 	}
 }

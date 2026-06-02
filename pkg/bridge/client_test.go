@@ -186,6 +186,10 @@ func TestHandleMatrixRoomStateUpdatesAIModelCache(t *testing.T) {
 	if run.run.Model != "anthropic/claude-sonnet-4.5" {
 		t.Fatalf("active run model was not updated: %q", run.run.Model)
 	}
+	if !hasCodexRoomStateDelta(run.run.Events, beeperAIModelStateType, "model", "claude-sonnet-4.5") ||
+		!hasCodexRoomStateDelta(run.run.Events, beeperAIModelStateType, "provider", "anthropic") {
+		t.Fatalf("active run did not sync model room state: %#v", run.run.Events)
+	}
 	run.writer.Text("after room model")
 	if got := run.run.Events[len(run.run.Events)-1].Get("model"); got != "anthropic/claude-sonnet-4.5" {
 		t.Fatalf("future stream event kept stale model: %#v", got)
@@ -201,10 +205,10 @@ func TestHandleMatrixRoomStateUpdatesAIModelCache(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("effort-only room state update failed: ok=%v err=%v", ok, err)
 	}
-		state = connector.modelStateForPortalKey(key)
-		if state["model"] != "anthropic/claude-sonnet-4.5" || state["modelProvider"] != "anthropic" || state["reasoning"] != "low" {
-			t.Fatalf("effort-only model state should preserve cached model while updating reasoning: %#v", state)
-		}
+	state = connector.modelStateForPortalKey(key)
+	if state["model"] != "anthropic/claude-sonnet-4.5" || state["modelProvider"] != "anthropic" || state["reasoning"] != "low" {
+		t.Fatalf("effort-only model state should preserve cached model while updating reasoning: %#v", state)
+	}
 
 	ok, err = client.HandleMatrixRoomState(context.Background(), &bridgev2.MatrixRoomState{
 		MatrixEventBase: bridgev2.MatrixEventBase[map[string]any]{
@@ -218,6 +222,9 @@ func TestHandleMatrixRoomStateUpdatesAIModelCache(t *testing.T) {
 	}
 	if state = connector.modelStateForPortalKey(key); state != nil {
 		t.Fatalf("cleared model state should not stay cached: %#v", state)
+	}
+	if !hasCodexRoomStateDelta(run.run.Events, beeperAIModelStateType, "model", "") {
+		t.Fatalf("active run did not sync cleared model room state: %#v", run.run.Events)
 	}
 }
 
@@ -1638,6 +1645,338 @@ func TestHandleMatrixMessageAcksNewProjectDirectoryBeforeAppServerWork(t *testin
 	}
 }
 
+func TestHandleMatrixMessageDefersTurnStartUntilMessageSave(t *testing.T) {
+	ctx := context.Background()
+	matrix := &streamStartMatrix{publisher: &recordingBeeperStreamPublisher{}, eventID: "$deterministic:example.com"}
+	connector, br := testBridgeWithDB(t, matrix)
+	logPath := filepath.Join(t.TempDir(), "fake-appserver.jsonl")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := appserver.Start(ctx, exe, map[string]string{
+		fakeAppServerEnv:    "1",
+		fakeAppServerLogEnv: logPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	connector.appMu.Lock()
+	connector.app = app
+	connector.appMu.Unlock()
+
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{Main: connector, UserLogin: login, loggedIn: true}
+	login.Client = client
+	cwd := t.TempDir()
+	key := projectPortalKey(cwd, login.ID)
+	connector.rememberThreadRoom("thread-1", client, key, cwd)
+	connector.rememberWarmThread("thread-1")
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: cwd},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg := &bridgev2.MatrixMessage{MatrixEventBase: bridgev2.MatrixEventBase[*event.MessageEventContent]{
+		Event: &event.Event{
+			ID:        "$matrix-event",
+			Timestamp: 1000,
+		},
+		Content: &event.MessageEventContent{
+			MsgType: event.MsgText,
+			Body:    "hello after save",
+		},
+		Portal: portal,
+	}}
+
+	resp, err := client.HandleMatrixMessage(ctx, msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.PostSave == nil {
+		t.Fatal("normal prompt should start Codex from PostSave after DB insert")
+	}
+	if _, err = os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("app-server work started before message save: stat err=%v requests=%#v", err, readFakeAppServerRequestsIfExists(t, logPath))
+	}
+	if err = br.DB.Message.Insert(ctx, resp.DB); err != nil {
+		t.Fatal(err)
+	}
+	resp.PostSave(ctx, resp.DB)
+
+	requireEventually(t, time.Second, func() bool {
+		return countFakeAppServerRequests(readFakeAppServerRequestsIfExists(t, logPath), "turn/start") == 1
+	})
+}
+
+func TestHandleMatrixMessageDefersTurnSteerUntilMessageSave(t *testing.T) {
+	ctx := context.Background()
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
+	logPath := filepath.Join(t.TempDir(), "fake-appserver.jsonl")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := appserver.Start(ctx, exe, map[string]string{
+		fakeAppServerEnv:    "1",
+		fakeAppServerLogEnv: logPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	connector.appMu.Lock()
+	connector.app = app
+	connector.appMu.Unlock()
+
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{Main: connector, UserLogin: login, loggedIn: true}
+	login.Client = client
+	cwd := t.TempDir()
+	key := projectPortalKey(cwd, login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: cwd},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := newActiveRun(client, key, "thread-1", "turn-1")
+	connector.setActive("thread-1", run)
+	msg := &bridgev2.MatrixMessage{MatrixEventBase: bridgev2.MatrixEventBase[*event.MessageEventContent]{
+		Event: &event.Event{
+			ID:        "$matrix-event",
+			Timestamp: 1000,
+		},
+		Content: &event.MessageEventContent{
+			MsgType: event.MsgText,
+			Body:    "steer after save",
+		},
+		Portal: portal,
+	}}
+
+	resp, err := client.HandleMatrixMessage(ctx, msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.PostSave == nil {
+		t.Fatal("steer should be sent from PostSave after DB insert")
+	}
+	if _, err = os.Stat(logPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("app-server steer started before message save: stat err=%v requests=%#v", err, readFakeAppServerRequestsIfExists(t, logPath))
+	}
+	if err = br.DB.Message.Insert(ctx, resp.DB); err != nil {
+		t.Fatal(err)
+	}
+	resp.PostSave(ctx, resp.DB)
+
+	requireEventually(t, time.Second, func() bool {
+		return countFakeAppServerRequests(readFakeAppServerRequestsIfExists(t, logPath), "turn/steer") == 1
+	})
+}
+
+func TestHandleMatrixEditRollsBackDeletesFollowingMessagesAndStartsReplacementTurn(t *testing.T) {
+	ctx := context.Background()
+	matrixAPI := &fakeMatrixAPI{}
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{api: matrixAPI})
+	logPath := filepath.Join(t.TempDir(), "fake-appserver.jsonl")
+	app := startTestFakeAppServer(t, ctx, connector, logPath)
+	defer app.Close()
+
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{Main: connector, UserLogin: login, loggedIn: true}
+	login.Client = client
+	cwd := t.TempDir()
+	key := projectPortalKey(cwd, login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: cwd},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := &database.Message{
+		ID:        "user:$prompt-1",
+		PartID:    partID("text"),
+		MXID:      "$prompt-1",
+		Room:      key,
+		SenderID:  client.GetUserID(),
+		Timestamp: time.Unix(1, 0),
+		Metadata:  &MessageMetadata{Role: "user", ThreadID: "thread-1", TurnID: "turn-1", StreamStatus: "done"},
+	}
+	following := []*database.Message{
+		{
+			ID:        "codex:turn-1:assistant",
+			PartID:    partID("text"),
+			MXID:      "$assistant-1",
+			Room:      key,
+			SenderID:  codexUserID,
+			Timestamp: time.Unix(2, 0),
+			Metadata:  &MessageMetadata{Role: "assistant", ThreadID: "thread-1", TurnID: "turn-1", StreamStatus: "complete"},
+		},
+		{
+			ID:        "user:$prompt-2",
+			PartID:    partID("text"),
+			MXID:      "$prompt-2",
+			Room:      key,
+			SenderID:  client.GetUserID(),
+			Timestamp: time.Unix(3, 0),
+			Metadata:  &MessageMetadata{Role: "user", ThreadID: "thread-1", TurnID: "turn-2", StreamStatus: "done"},
+		},
+		{
+			ID:        "codex:turn-2:assistant",
+			PartID:    partID("text"),
+			MXID:      "$assistant-2",
+			Room:      key,
+			SenderID:  codexUserID,
+			Timestamp: time.Unix(4, 0),
+			Metadata:  &MessageMetadata{Role: "assistant", ThreadID: "thread-1", TurnID: "turn-2", StreamStatus: "complete"},
+		},
+	}
+	if err = br.DB.Message.Insert(ctx, target); err != nil {
+		t.Fatal(err)
+	}
+	for _, msg := range following {
+		if err = br.DB.Message.Insert(ctx, msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target, err = br.DB.Message.GetPartByID(ctx, key.Receiver, target.ID, target.PartID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	edit := &bridgev2.MatrixEdit{
+		MatrixEventBase: bridgev2.MatrixEventBase[*event.MessageEventContent]{
+			Event: &event.Event{ID: "$edit-1", Timestamp: 5000},
+			Content: &event.MessageEventContent{
+				MsgType: event.MsgText,
+				Body:    "edited prompt",
+			},
+			Portal: portal,
+		},
+		EditTarget: target,
+	}
+
+	if err = client.HandleMatrixEdit(ctx, edit); err != nil {
+		t.Fatal(err)
+	}
+	if err = br.DB.Message.Update(ctx, edit.EditTarget); err != nil {
+		t.Fatal(err)
+	}
+	requireEventually(t, time.Second, func() bool {
+		return countFakeAppServerRequests(readFakeAppServerRequestsIfExists(t, logPath), "turn/start") == 1
+	})
+
+	requests := readFakeAppServerRequests(t, logPath)
+	if read, ok := findFakeAppServerRequest(requests, "thread/read"); !ok || read.Params["threadId"] != "thread-1" || read.Params["includeTurns"] != true {
+		t.Fatalf("thread/read with turns missing or bad: req=%#v requests=%#v", read, requests)
+	}
+	rollback, ok := findFakeAppServerRequest(requests, "thread/rollback")
+	if !ok {
+		t.Fatalf("thread/rollback request missing: %#v", requests)
+	}
+	if rollback.Params["threadId"] != "thread-1" || rollback.Params["numTurns"] != float64(2) {
+		t.Fatalf("bad thread/rollback params: %#v", rollback.Params)
+	}
+	start, ok := findFakeAppServerRequest(requests, "turn/start")
+	if !ok {
+		t.Fatalf("turn/start request missing: %#v", requests)
+	}
+	if start.Params["clientUserMessageId"] != "$edit-1" || fakeAppServerInputText(start.Params) != "edited prompt" {
+		t.Fatalf("replacement turn/start used wrong edit input: %#v", start.Params)
+	}
+	if got := countRedactions(matrixAPI.messages); got != len(following) {
+		t.Fatalf("expected stale messages to be redacted, got %d events=%#v", got, matrixAPI.messages)
+	}
+	for _, msg := range following {
+		got, err := br.DB.Message.GetPartByID(ctx, key.Receiver, msg.ID, msg.PartID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != nil {
+			t.Fatalf("stale message was not deleted: %#v", got)
+		}
+	}
+	updated, err := br.DB.Message.GetPartByID(ctx, key.Receiver, target.ID, target.PartID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta, _ := updated.Metadata.(*MessageMetadata)
+	if meta == nil || meta.Role != "user" || meta.ThreadID != "thread-1" || meta.TurnID != "turn-1" || meta.StreamStatus != "edited" {
+		t.Fatalf("edited target metadata not preserved: %#v", meta)
+	}
+}
+
+func TestHandleMatrixEditRejectsNonPromptTargetsBeforeCodexRollback(t *testing.T) {
+	ctx := context.Background()
+	connector, _ := testBridgeWithDB(t, &fakeMatrixConnector{})
+	logPath := filepath.Join(t.TempDir(), "fake-appserver.jsonl")
+	app := startTestFakeAppServer(t, ctx, connector, logPath)
+	defer app.Close()
+	client := &Client{Main: connector, UserLogin: testUserLogin("sh-codex"), loggedIn: true}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: projectPortalKey("/tmp/project", "sh-codex"),
+		MXID:      "!room:example.com",
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}}
+	err := client.HandleMatrixEdit(ctx, &bridgev2.MatrixEdit{
+		MatrixEventBase: bridgev2.MatrixEventBase[*event.MessageEventContent]{
+			Event:   &event.Event{ID: "$edit-1"},
+			Content: &event.MessageEventContent{MsgType: event.MsgText, Body: "edited"},
+			Portal:  portal,
+		},
+		EditTarget: &database.Message{Metadata: &MessageMetadata{Role: "assistant", ThreadID: "thread-1", TurnID: "turn-1"}},
+	})
+	if err == nil {
+		t.Fatal("expected assistant edit target to be rejected")
+	}
+	if requests := readFakeAppServerRequestsIfExists(t, logPath); len(requests) != 0 {
+		t.Fatalf("rejected edit should not touch Codex app-server: %#v", requests)
+	}
+}
+
 func TestDirectorySelectionPostSaveStartsThreadAndCanonicalizesMessage(t *testing.T) {
 	ctx := context.Background()
 	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
@@ -1713,14 +2052,14 @@ func TestDirectorySelectionPostSaveStartsThreadAndCanonicalizesMessage(t *testin
 		meta := portalMetadata(projectPortal.Metadata)
 		return meta.ThreadID != "" && meta.Cwd == cwd
 	})
-	dbMsg, err := br.DB.Message.GetPartByID(ctx, login.ID, resp.DB.ID, resp.DB.PartID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	meta, _ := dbMsg.Metadata.(*MessageMetadata)
-	if dbMsg.Room != projectKey || meta == nil || meta.Role != "command" || meta.ThreadID == "" || meta.StreamStatus != "directory" {
-		t.Fatalf("directory selection DB message was not canonicalized: msg=%#v meta=%#v", dbMsg, meta)
-	}
+	requireEventually(t, time.Second, func() bool {
+		dbMsg, err := br.DB.Message.GetPartByID(ctx, login.ID, resp.DB.ID, resp.DB.PartID)
+		if err != nil {
+			return false
+		}
+		meta, _ := dbMsg.Metadata.(*MessageMetadata)
+		return dbMsg.Room == projectKey && meta != nil && meta.Role == "command" && meta.ThreadID != "" && meta.StreamStatus == "directory"
+	})
 	requests := readFakeAppServerRequests(t, logPath)
 	if got := countFakeAppServerRequests(requests, "thread/start"); got != 1 {
 		t.Fatalf("directory selection should start exactly one thread, got %d requests=%#v", got, requests)
@@ -1805,6 +2144,7 @@ func TestHandleMatrixMessageStartsTurnThroughAppServerTransport(t *testing.T) {
 	if err = br.DB.Message.Insert(ctx, resp.DB); err != nil {
 		t.Fatal(err)
 	}
+	resp.PostSave(ctx, resp.DB)
 	requireEventually(t, time.Second, func() bool {
 		run := connector.activeRun("thread-1")
 		return run != nil && run.turnID == "turn-1"
@@ -1916,9 +2256,14 @@ func TestHandleMatrixMessageSkipsResumeForWarmThread(t *testing.T) {
 		Portal: portal,
 	}}
 
-	if _, err = client.HandleMatrixMessage(ctx, msg); err != nil {
+	resp, err := client.HandleMatrixMessage(ctx, msg)
+	if err != nil {
 		t.Fatal(err)
 	}
+	if err = br.DB.Message.Insert(ctx, resp.DB); err != nil {
+		t.Fatal(err)
+	}
+	resp.PostSave(ctx, resp.DB)
 	requireEventually(t, time.Second, func() bool {
 		if _, err := os.Stat(logPath); err != nil {
 			return false
@@ -2000,6 +2345,7 @@ func TestHandleMatrixMessageDeduplicatesRetryWhileTurnStartInFlight(t *testing.T
 	if err = br.DB.Message.Insert(ctx, resp.DB); err != nil {
 		t.Fatal(err)
 	}
+	resp.PostSave(ctx, resp.DB)
 	duplicate, err := client.HandleMatrixMessage(ctx, msg)
 	if err != nil {
 		t.Fatal(err)
@@ -2026,7 +2372,7 @@ func TestHandleMatrixMessageDeduplicatesRetryWhileTurnStartInFlight(t *testing.T
 
 func TestHandleMatrixMessageSteersActiveTurnWithTurnMetadata(t *testing.T) {
 	ctx := context.Background()
-	connector, _ := testBridgeWithDB(t, &fakeMatrixConnector{})
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
 	logPath := filepath.Join(t.TempDir(), "fake-appserver.jsonl")
 	exe, err := os.Executable()
 	if err != nil {
@@ -2048,6 +2394,15 @@ func TestHandleMatrixMessageSteersActiveTurnWithTurnMetadata(t *testing.T) {
 	client := &Client{Main: connector, UserLogin: login, loggedIn: true}
 	login.Client = client
 	msg := testMatrixMessage("thread-1", "steer this")
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: msg.Portal.PortalKey,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	run := newActiveRun(client, msg.Portal.PortalKey, "thread-1", "turn-1")
 	connector.setActive("thread-1", run)
 
@@ -2062,6 +2417,10 @@ func TestHandleMatrixMessageSteersActiveTurnWithTurnMetadata(t *testing.T) {
 	if meta == nil || meta.Role != "user" || meta.ThreadID != "thread-1" || meta.TurnID != "turn-1" || meta.StreamStatus != "done" {
 		t.Fatalf("unexpected Matrix response DB: resp=%#v meta=%#v", resp, meta)
 	}
+	if err = br.DB.Message.Insert(ctx, resp.DB); err != nil {
+		t.Fatal(err)
+	}
+	resp.PostSave(ctx, resp.DB)
 
 	requireEventually(t, time.Second, func() bool {
 		if _, err := os.Stat(logPath); err != nil {
@@ -2081,6 +2440,52 @@ func TestHandleMatrixMessageSteersActiveTurnWithTurnMetadata(t *testing.T) {
 	}
 	if text := fakeAppServerInputText(steer.Params); text != "steer this" {
 		t.Fatalf("turn/steer prompt mismatch: %q", text)
+	}
+	requireEventually(t, time.Second, func() bool {
+		return hasCodexRunStateDelta(run.run.Events, "turn/steer", "expectedTurnId", "turn-1") &&
+			hasCodexRunStateDelta(run.run.Events, "turn/steer", "clientUserMessageId", "$event")
+	})
+}
+
+func TestInterruptTurnSyncsClientRequestState(t *testing.T) {
+	ctx := context.Background()
+	connector, _ := testBridgeWithDB(t, &fakeMatrixConnector{})
+	logPath := filepath.Join(t.TempDir(), "fake-appserver.jsonl")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := appserver.Start(ctx, exe, map[string]string{
+		fakeAppServerEnv:    "1",
+		fakeAppServerLogEnv: logPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	connector.appMu.Lock()
+	connector.app = app
+	connector.appMu.Unlock()
+
+	login := testUserLogin("codex")
+	client := &Client{Main: connector, UserLogin: login, loggedIn: true}
+	login.Client = client
+	msg := testMatrixMessage("thread-1", "stop")
+	run := newActiveRun(client, msg.Portal.PortalKey, "thread-1", "turn-1")
+	connector.setActive("thread-1", run)
+
+	client.interruptTurn(ctx, msg.Portal, "thread-1", "turn-1")
+
+	requireEventually(t, time.Second, func() bool {
+		if _, err := os.Stat(logPath); err != nil {
+			return false
+		}
+		requests := readFakeAppServerRequests(t, logPath)
+		_, ok := findFakeAppServerRequest(requests, "turn/interrupt")
+		return ok
+	})
+	if !hasCodexRunStateDelta(run.run.Events, "turn/interrupt", "turnId", "turn-1") {
+		t.Fatalf("turn/interrupt client request was not synced to AG-UI state: %#v", run.run.Events)
 	}
 }
 
@@ -2137,7 +2542,8 @@ func TestStartTurnClearsUnsupportedRoomModel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err = client.startTurn(ctx, key, "thread-1", "$matrix-event", "hello"); err != nil {
+	run, err := client.startTurn(ctx, key, "thread-1", "$matrix-event", "hello")
+	if err != nil {
 		t.Fatal(err)
 	}
 	requests := readFakeAppServerRequests(t, logPath)
@@ -2157,6 +2563,9 @@ func TestStartTurnClearsUnsupportedRoomModel(t *testing.T) {
 	}
 	if state := connector.modelStateForPortalKey(key); state != nil {
 		t.Fatalf("unsupported room model cache was not cleared: %#v", state)
+	}
+	if !hasCodexRunStateDelta(run.run.Events, "turn/start", "clientUserMessageId", "$matrix-event") {
+		t.Fatalf("turn/start client request was not synced to AG-UI state: %#v", run.run.Events)
 	}
 }
 
@@ -2599,6 +3008,25 @@ func testBridgeWithDB(t *testing.T, matrix bridgev2.MatrixConnector) (*Connector
 	return connector, br
 }
 
+func startTestFakeAppServer(t *testing.T, ctx context.Context, connector *Connector, logPath string) *appserver.Client {
+	t.Helper()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := appserver.Start(ctx, exe, map[string]string{
+		fakeAppServerEnv:    "1",
+		fakeAppServerLogEnv: logPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	connector.appMu.Lock()
+	connector.app = app
+	connector.appMu.Unlock()
+	return app
+}
+
 func testUserLogin(id networkid.UserLoginID) *bridgev2.UserLogin {
 	return &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: id}}
 }
@@ -2816,4 +3244,14 @@ type fakeMessageEvent struct {
 	Type    event.Type
 	Content *event.Content
 	Extra   *bridgev2.MatrixSendExtra
+}
+
+func countRedactions(events []fakeMessageEvent) int {
+	count := 0
+	for _, evt := range events {
+		if evt.Type == event.EventRedaction {
+			count++
+		}
+	}
+	return count
 }

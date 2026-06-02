@@ -3,6 +3,7 @@ package bridge
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"os"
 	"strconv"
 	"strings"
@@ -104,11 +105,11 @@ func fakeAppServerResult(method string, params json.RawMessage) any {
 				{"id": "claude-sonnet-4.5", "model": "anthropic/claude-sonnet-4.5"},
 			},
 		}
-	case "thread/read", "thread/resume", "thread/start":
+	case "thread/read", "thread/resume", "thread/start", "thread/rollback":
 		if cwd == "" {
 			cwd = os.TempDir()
 		}
-		return map[string]any{
+		thread := map[string]any{
 			"thread": map[string]any{
 				"id":            threadID,
 				"sessionId":     threadID,
@@ -120,6 +121,13 @@ func fakeAppServerResult(method string, params json.RawMessage) any {
 			"modelProvider":   "openai",
 			"reasoningEffort": "high",
 		}
+		if method == "thread/read" && payload["includeTurns"] == true {
+			thread["thread"].(map[string]any)["turns"] = []map[string]any{
+				{"id": "turn-1", "status": "completed"},
+				{"id": "turn-2", "status": "completed"},
+			}
+		}
+		return thread
 	case "turn/start":
 		return map[string]any{
 			"turn": map[string]any{
@@ -166,6 +174,14 @@ func readFakeAppServerRequests(t *testing.T, path string) []fakeAppServerRequest
 		out = append(out, req)
 	}
 	return out
+}
+
+func readFakeAppServerRequestsIfExists(t *testing.T, path string) []fakeAppServerRequest {
+	t.Helper()
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return readFakeAppServerRequests(t, path)
 }
 
 func findFakeAppServerRequest(requests []fakeAppServerRequest, method string) (fakeAppServerRequest, bool) {

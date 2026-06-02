@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"maunium.net/go/mautrix/bridgev2"
@@ -89,6 +90,34 @@ func codexCommandFromMSC4391(input *event.MSC4391BotCommandInput) (codexCommand,
 			return codexCommand{}, false
 		}
 	}
+	return codexCommandFromArgsMap(name, args)
+}
+
+func codexCommandFromRawContent(raw map[string]any) (codexCommand, bool) {
+	if len(raw) == 0 {
+		return codexCommand{}, false
+	}
+	if nested, _ := raw["org.matrix.msc4391.command"].(map[string]any); len(nested) > 0 {
+		if command, ok := codexCommandFromRawContent(nested); ok {
+			return command, true
+		}
+	}
+	name := canonicalCodexCommandName(stringsFromCommandArgs(raw, "command"))
+	if name == "" {
+		return codexCommand{}, false
+	}
+	for _, key := range []string{"arguments", "args", "parameters"} {
+		switch args := raw[key].(type) {
+		case map[string]any:
+			return codexCommandFromArgsMap(name, args)
+		case string:
+			return codexCommand{name: name, arg: strings.TrimSpace(args)}, true
+		}
+	}
+	return codexCommandFromArgsMap(name, raw)
+}
+
+func codexCommandFromArgsMap(name string, args map[string]any) (codexCommand, bool) {
 	switch name {
 	case "approve":
 		id := stringsFromCommandArgs(args, "id", "approval_id")

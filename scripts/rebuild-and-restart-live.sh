@@ -11,9 +11,14 @@ QA_SESSION=${CODEX_BRIDGE_QA_SESSION:-sh-codex-qa}
 QA_CONFIG=${CODEX_BRIDGE_QA_CONFIG:-/tmp/codex-bridge-qa-config.yaml}
 
 cd "$ROOT"
+mkdir -p logs
 
 test -f "$PROD_CONFIG"
 test -f "$QA_CONFIG"
+
+if [[ "$QA_CONFIG" != "$PROD_CONFIG" ]]; then
+	perl -0pi -e 's/filename:\s*\.\/logs\/bridge\.log/filename: .\/logs\/bridge-qa.log/' "$QA_CONFIG"
+fi
 
 go build -o "$BIN" ./cmd/codex
 

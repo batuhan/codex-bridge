@@ -31,11 +31,12 @@ import (
 )
 
 const appServerStartupTimeout = 15 * time.Second
+const bridgeStartupSyncTimeout = 2 * time.Minute
 const contactGhostSyncLimit = 20
 const messageMetadataSyncLimit = 500
 const bridgeInfoVersion = 2
-const roomCapabilitiesVersion = 11
-const roomFeaturesID = "com.beeper.codex.capabilities.2026_06_02.room_features_user_ai_model_only"
+const roomCapabilitiesVersion = 12
+const roomFeaturesID = "com.beeper.codex.capabilities.2026_06_03.room_features_user_ai_model_and_edits"
 const defaultCodexAvatarMXC = "mxc://beeper.com/51a668657dd9e0132cc823ad9402c6c2d0fc3321"
 
 type Connector struct {
@@ -177,10 +178,18 @@ func (c *Connector) Start(ctx context.Context) error {
 	c.appMu.Lock()
 	c.app = app
 	c.appMu.Unlock()
-	c.seedConfiguredLogins(startupCtx)
-	c.hydrateThreadRooms(startupCtx)
-	c.normalizeStoredMessageMetadata(startupCtx)
-	c.syncBaseContactGhosts(startupCtx)
+	syncCtx, syncCancel := context.WithTimeout(ctx, bridgeStartupSyncTimeout)
+	c.seedConfiguredLogins(syncCtx)
+	syncCancel()
+	syncCtx, syncCancel = context.WithTimeout(ctx, bridgeStartupSyncTimeout)
+	c.hydrateThreadRooms(syncCtx)
+	syncCancel()
+	syncCtx, syncCancel = context.WithTimeout(ctx, bridgeStartupSyncTimeout)
+	c.normalizeStoredMessageMetadata(syncCtx)
+	syncCancel()
+	syncCtx, syncCancel = context.WithTimeout(ctx, bridgeStartupSyncTimeout)
+	c.syncBaseContactGhosts(syncCtx)
+	syncCancel()
 	go c.syncRecentContactGhosts(ctx)
 	go c.dispatchAppServer()
 	return nil
@@ -642,11 +651,6 @@ func canStartActiveRunFromNotification(method string) bool {
 }
 
 func isActiveRunNotification(method string) bool {
-	if strings.HasPrefix(method, "item/") ||
-		strings.HasPrefix(method, "hook/") ||
-		strings.HasPrefix(method, "thread/realtime/") {
-		return true
-	}
 	switch method {
 	case "thread/started",
 		"thread/status/changed",
@@ -663,6 +667,22 @@ func isActiveRunNotification(method string) bool {
 		"turn/completed",
 		"turn/diff/updated",
 		"turn/plan/updated",
+		"hook/started",
+		"hook/completed",
+		"item/started",
+		"item/completed",
+		"item/agentMessage/delta",
+		"item/reasoning/summaryTextDelta",
+		"item/reasoning/textDelta",
+		"item/reasoning/summaryPartAdded",
+		"item/commandExecution/outputDelta",
+		"item/fileChange/outputDelta",
+		"item/commandExecution/terminalInteraction",
+		"item/plan/delta",
+		"item/mcpToolCall/progress",
+		"item/fileChange/patchUpdated",
+		"item/autoApprovalReview/started",
+		"item/autoApprovalReview/completed",
 		"command/exec/outputDelta",
 		"process/outputDelta",
 		"process/exited",
@@ -674,7 +694,15 @@ func isActiveRunNotification(method string) bool {
 		"guardianWarning",
 		"deprecationNotice",
 		"configWarning",
-		"error":
+		"error",
+		"thread/realtime/started",
+		"thread/realtime/itemAdded",
+		"thread/realtime/transcript/delta",
+		"thread/realtime/transcript/done",
+		"thread/realtime/outputAudio/delta",
+		"thread/realtime/sdp",
+		"thread/realtime/error",
+		"thread/realtime/closed":
 		return true
 	default:
 		return false
@@ -1018,42 +1046,45 @@ func (c *Connector) setModelStateForPortalKey(portalKey networkid.PortalKey, sta
 		room     threadRoom
 	}
 	c.threadMu.Lock()
-		for threadID, room := range c.threadRooms {
-			if room.portalKey != portalKey {
-				continue
+	for threadID, room := range c.threadRooms {
+		if room.portalKey != portalKey {
+			continue
+		}
+		if len(state) == 0 {
+			room.model = ""
+			room.modelProvider = ""
+			room.modelName = ""
+			room.reasoningEffort = ""
+			room.reasoningMode = ""
+		} else {
+			if model != "" {
+				room.model = model
 			}
-			if len(state) == 0 {
-				room.model = ""
-				room.modelProvider = ""
-				room.modelName = ""
-				room.reasoningEffort = ""
-				room.reasoningMode = ""
-			} else {
-				if model != "" {
-					room.model = model
-				}
-				if provider != "" {
-					room.modelProvider = provider
-				}
-				if name != "" {
-					room.modelName = name
-				}
-				if effort != "" {
-					room.reasoningEffort = effort
-				}
-				if reasoningMode != "" {
-					room.reasoningMode = reasoningMode
-				}
+			if provider != "" {
+				room.modelProvider = provider
 			}
-			c.threadRooms[threadID] = room
-			activeUpdates = append(activeUpdates, struct {
-				threadID string
+			if name != "" {
+				room.modelName = name
+			}
+			if effort != "" {
+				room.reasoningEffort = effort
+			}
+			if reasoningMode != "" {
+				room.reasoningMode = reasoningMode
+			}
+		}
+		c.threadRooms[threadID] = room
+		activeUpdates = append(activeUpdates, struct {
+			threadID string
 			room     threadRoom
 		}{threadID: threadID, room: room})
 	}
 	c.threadMu.Unlock()
 	for _, update := range activeUpdates {
 		c.updateActiveRunRoom(update.threadID, update.room)
+		if active := c.activeRun(update.threadID); active != nil {
+			active.writeCodexRoomState(beeperAIModelStateType, copyStateMap(state))
+		}
 	}
 }
 
@@ -1386,6 +1417,9 @@ func (c *Connector) handleThreadMetadataNotification(method, threadID string, pa
 	c.threadRooms[threadID] = room
 	c.threadMu.Unlock()
 	c.updateActiveRunRoom(threadID, room)
+	if active := c.activeRun(threadID); active != nil {
+		active.writeCodexRoomState(codexThreadStateType, copyStateMap(state))
+	}
 	if room.login == nil || room.login.Bridge == nil {
 		return
 	}
@@ -2169,7 +2203,7 @@ func applyStoredPortalInfo(info *bridgev2.ChatInfo, portal *bridgev2.Portal) {
 	if portal.NameSet {
 		info.Name = &portal.Name
 	}
-	if strings.TrimSpace(portal.Topic) != "" {
+	if portal.TopicSet {
 		info.Topic = &portal.Topic
 	}
 }

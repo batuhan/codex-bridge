@@ -231,7 +231,7 @@ func mapBackfillItem(writer *aistream.Writer, messageID string, item appserver.T
 		}
 	case "hookPrompt":
 		if text := hookPromptText(item); text != "" {
-			writer.StateDelta(map[string]any{"codex": map[string]any{"hookPromptText": text}})
+			writer.StateDelta(hookPromptStateDelta(item.ID, text))
 		}
 	case "enteredReviewMode", "exitedReviewMode":
 		writer.Text(reviewModeText(item))
@@ -275,7 +275,7 @@ func mapBackfillRawResponseItem(writer *aistream.Writer, item appserver.TurnItem
 		name := rawToolName(data)
 		input := rawToolInput(data)
 		if !backfillHasToolEvent(writer, callID, agui.EventToolCallStart) {
-			writer.ToolStart(callID, name, 0, nil)
+			writer.ToolStartWithMetadata(callID, name, 0, nil, codexToolStartMetadata(data))
 		}
 		if text := rawToolInputText(input); text != "" {
 			writer.ToolArgs(callID, text, input)
@@ -290,7 +290,7 @@ func mapBackfillRawResponseItem(writer *aistream.Writer, item appserver.TurnItem
 		}
 		name := rawToolName(data)
 		if !backfillHasToolEvent(writer, callID, agui.EventToolCallStart) {
-			writer.ToolStart(callID, name, 0, nil)
+			writer.ToolStartWithMetadata(callID, name, 0, nil, codexToolStartMetadata(data))
 		}
 		if output := rawToolResultText(data); output != "" {
 			writer.ToolResult(callID, output, agui.ToolResultStateComplete)
@@ -304,16 +304,22 @@ func mapBackfillRawResponseItem(writer *aistream.Writer, item appserver.TurnItem
 		input := rawToolInput(data)
 		state := toolStateFromStatus(firstString(data, "status"))
 		if !backfillHasToolEvent(writer, callID, agui.EventToolCallStart) {
-			writer.ToolStart(callID, name, 0, nil)
+			writer.ToolStartWithMetadata(callID, name, 0, nil, codexToolStartMetadata(data))
 		}
+		hasResult := false
 		if output := rawToolResultText(data); output != "" {
 			writer.ToolResult(callID, output, state)
+			hasResult = true
 		}
 		if text := rawToolInputText(input); text != "" {
 			writer.ToolArgs(callID, text, input)
 		}
 		if state != agui.ToolResultStateStreaming && !backfillHasToolEvent(writer, callID, agui.EventToolCallEnd) {
-			writer.ToolEnd(callID, name, input, map[string]any{"state": state, "status": firstString(data, "status")})
+			if hasResult {
+				writer.ToolInputComplete(callID, name, input)
+			} else {
+				writer.ToolEnd(callID, name, input, map[string]any{"state": state, "status": firstString(data, "status")})
+			}
 		}
 	case "context_compaction", "compaction", "compaction_trigger":
 		writer.Text(codexCompactionNotice)
@@ -339,21 +345,31 @@ func writeBackfillToolItem(writer *aistream.Writer, item appserver.TurnItem) {
 	data := backfillItemData(item)
 	name := backfillToolName(item, data)
 	state := codexItemToolState(data)
-	writer.ToolStart(item.ID, name, 0, nil)
+	writer.ToolStartWithMetadata(item.ID, name, 0, nil, codexToolStartMetadata(data))
 	input, hasInput := codexItemToolInput(data)
 	if hasInput {
 		if text := rawToolInputText(input); text != "" {
 			writer.ToolArgs(item.ID, text, input)
 		}
 	}
+	hasResult := false
 	if result := backfillToolResultText(data); result != "" {
 		writer.ToolResult(item.ID, result, state)
+		hasResult = true
 	}
 	if state != agui.ToolResultStateStreaming {
+		if result := codexToolCompletionMetadataText(data, state, hasResult); result != "" {
+			writer.ToolResult(item.ID, result, state)
+			hasResult = true
+		}
 		if !hasInput {
 			input = nil
 		}
-		writer.ToolEnd(item.ID, name, input, map[string]any{"state": state, "status": codexItemStatusText(data, state)})
+		if hasResult {
+			writer.ToolInputComplete(item.ID, name, input)
+		} else {
+			writer.ToolEnd(item.ID, name, input, map[string]any{"state": state, "status": codexItemStatusText(data, state)})
+		}
 	}
 }
 
@@ -402,7 +418,14 @@ func codexToolResultValueText(value any) string {
 		}
 		return ""
 	}
-	if text := strings.TrimSpace(rawContentText(value)); text != "" {
+	if typed, ok := value.(map[string]any); ok {
+		if text := strings.TrimSpace(rawContentText(typed)); text != "" && !hasAdditionalToolResultFields(typed, "content", "contentItems", "text", "type", "_meta") {
+			return text
+		}
+		if message, _ := typed["message"].(string); strings.TrimSpace(message) != "" && !hasAdditionalToolResultFields(typed, "message") {
+			return strings.TrimSpace(message)
+		}
+	} else if text := strings.TrimSpace(rawContentText(value)); text != "" {
 		return text
 	}
 	raw, err := json.Marshal(value)
@@ -410,6 +433,46 @@ func codexToolResultValueText(value any) string {
 		return string(raw)
 	}
 	return ""
+}
+
+func codexToolCompletionMetadataText(data map[string]any, state string, hasVisibleResult bool) string {
+	if !hasVisibleResult || state == agui.ToolResultStateStreaming {
+		return ""
+	}
+	status := codexItemStatusText(data, state)
+	meta := map[string]any{
+		"state":  state,
+		"status": status,
+	}
+	extra := false
+	for _, key := range []string{"exitCode", "durationMs", "success"} {
+		if value, ok := data[key]; ok && hasNonEmptyValue(value) {
+			meta[key] = value
+			extra = true
+		}
+	}
+	if !extra {
+		return ""
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil || len(raw) == 0 {
+		return ""
+	}
+	return string(raw)
+}
+
+func hasAdditionalToolResultFields(value map[string]any, ignored ...string) bool {
+	ignore := map[string]bool{}
+	for _, key := range ignored {
+		ignore[key] = true
+	}
+	for key, field := range value {
+		if ignore[key] || !hasNonEmptyValue(field) {
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func isBackfilledThreadItemType(itemType string) bool {

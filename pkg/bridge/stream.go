@@ -33,6 +33,7 @@ const interruptedStreamMessage = "Codex stream was interrupted before completion
 
 var activeStreamIdleTimeout = 5 * time.Minute
 var activeStreamUnregisterDelay = 30 * time.Second
+var activeStreamRecoveryTimeout = 30 * time.Second
 
 type activeRun struct {
 	mu                sync.Mutex
@@ -50,7 +51,7 @@ type activeRun struct {
 	processes         map[string]string
 	toolAliases       map[string]string
 	toolStarted       map[string]bool
-	toolArgsSent      map[string]bool
+	toolArgsText      map[string]string
 	toolEnded         map[string]bool
 	toolResult        map[string]bool
 	agentText         map[string]string
@@ -81,7 +82,7 @@ func newActiveRun(cl *Client, portalKey networkid.PortalKey, threadID, turnID st
 		processes:    map[string]string{},
 		toolAliases:  map[string]string{},
 		toolStarted:  map[string]bool{},
-		toolArgsSent: map[string]bool{},
+		toolArgsText: map[string]string{},
 		toolEnded:    map[string]bool{},
 		toolResult:   map[string]bool{},
 		agentText:    map[string]string{},
@@ -316,19 +317,23 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		r.writer.StateDelta(map[string]any{"codexThread": state})
 		r.writeCustom(method, rawPayload(params))
 	case "turn/started":
-		r.writeCustom(method, rawPayload(params))
+		payload := rawPayload(params)
+		r.writeCodexRunStateLocked(method, payload)
+		r.writeCustom(method, payload)
 	case "hook/started":
 		payload := rawPayload(params)
 		id, name := hookRunIdentity(payload)
 		if id != "" {
-			r.writer.ToolStart(id, name, 0, nil)
+			r.writer.ToolStartWithMetadata(id, name, 0, nil, codexToolStartMetadata(payload))
+			r.writeToolArgs(id, payload)
 		}
 		r.writeCustom(method, payload)
 	case "hook/completed":
 		payload := rawPayload(params)
 		id, name := hookRunIdentity(payload)
 		if id != "" {
-			r.ensureToolStarted(id, name)
+			r.ensureToolStartedWithMetadata(id, name, codexNotificationToolStartMetadata(method, payload))
+			r.writeToolArgs(id, payload)
 			state := toolStateFromStatus(hookRunStatus(payload))
 			if state != agui.ToolResultStateStreaming {
 				r.endToolCall(id, name, payload["run"], map[string]any{"state": state, "status": hookRunStatus(payload)})
@@ -375,13 +380,14 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		r.writer.ReasoningMessageStart(r.reasoningSection(key))
 		r.writeCustom(method, rawPayload(params))
 	case "item/commandExecution/outputDelta", "item/fileChange/outputDelta", "command/exec/outputDelta", "process/outputDelta":
-		if itemID, delta := outputDelta(params); itemID != "" && delta != "" {
+		payload := rawPayload(params)
+		if itemID, delta := outputDeltaFromPayload(payload); itemID != "" && delta != "" {
 			itemID = r.toolIDForProcess(itemID)
-			r.ensureToolStarted(itemID, inferredToolName(method, itemID))
+			r.ensureToolStartedWithMetadata(itemID, inferredToolName(method, itemID), codexNotificationToolStartMetadata(method, payload))
 			r.writer.ToolResult(itemID, delta, agui.ToolResultStateStreaming)
 			r.toolResult[itemID] = true
 		}
-		r.writeCustom(method, rawPayload(params))
+		r.writeCustom(method, payload)
 	case "item/commandExecution/terminalInteraction":
 		payload := rawPayload(params)
 		itemID, _ := payload["itemId"].(string)
@@ -389,7 +395,7 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		r.rememberProcessTool(processID, itemID)
 		stdin, _ := payload["stdin"].(string)
 		if itemID != "" && stdin != "" {
-			r.ensureToolStarted(itemID, inferredToolName(method, itemID))
+			r.ensureToolStartedWithMetadata(itemID, inferredToolName(method, itemID), codexNotificationToolStartMetadata(method, payload))
 			r.writer.ToolResult(itemID, stdin, agui.ToolResultStateStreaming)
 			r.toolResult[itemID] = true
 		}
@@ -414,7 +420,7 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		payload := rawPayload(params)
 		if itemID, result, state := processExitResult(payload); itemID != "" && result != "" {
 			itemID = r.toolIDForProcess(itemID)
-			r.ensureToolStarted(itemID, inferredToolName(method, itemID))
+			r.ensureToolStartedWithMetadata(itemID, inferredToolName(method, itemID), codexNotificationToolStartMetadata(method, payload))
 			r.writer.ToolResult(itemID, result, state)
 			r.toolResult[itemID] = true
 		}
@@ -424,7 +430,7 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		itemID, _ := payload["itemId"].(string)
 		message, _ := payload["message"].(string)
 		if itemID != "" && strings.TrimSpace(message) != "" {
-			r.ensureToolStarted(itemID, inferredToolName(method, itemID))
+			r.ensureToolStartedWithMetadata(itemID, inferredToolName(method, itemID), codexNotificationToolStartMetadata(method, payload))
 			r.writer.ToolResult(itemID, strings.TrimSpace(message), agui.ToolResultStateStreaming)
 			r.toolResult[itemID] = true
 		}
@@ -434,14 +440,16 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		itemID, _ := payload["itemId"].(string)
 		if itemID != "" {
 			if text := patchUpdateText(payload); text != "" {
-				r.ensureToolStarted(itemID, inferredToolName(method, itemID))
+				r.ensureToolStartedWithMetadata(itemID, inferredToolName(method, itemID), codexNotificationToolStartMetadata(method, payload))
 				r.writer.ToolResult(itemID, text, agui.ToolResultStateStreaming)
 				r.toolResult[itemID] = true
 			}
 		}
 		r.writeCustom(method, payload)
 	case "serverRequest/resolved":
-		r.writeCustom(method, rawPayload(params))
+		payload := rawPayload(params)
+		r.writeCodexRunStateLocked(method, payload)
+		r.writeCustom(method, payload)
 	case "rawResponseItem/completed":
 		payload := rawPayload(params)
 		r.mapRawResponseItem(payload)
@@ -453,7 +461,8 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 			if method == "item/autoApprovalReview/completed" {
 				state = agui.ToolResultStateComplete
 			}
-			r.ensureToolStarted(targetID, "approval review")
+			r.ensureToolStartedWithMetadata(targetID, "approval review", codexNotificationToolStartMetadata(method, payload))
+			r.writeToolArgs(targetID, payload)
 			r.writer.ToolResult(targetID, approvalReviewText(payload), state)
 			r.toolResult[targetID] = true
 		}
@@ -465,10 +474,13 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		r.writer.StateDelta(map[string]any{"codexThread": state})
 		r.writeCustom(method, rawPayload(params))
 	case "warning", "guardianWarning", "deprecationNotice", "configWarning":
+		payload := rawPayload(params)
+		r.writeCodexRunStateLocked(method, payload)
 		r.writeActiveNoticeLocked(method, params)
-		r.writeCustom(method, rawPayload(params))
+		r.writeCustom(method, payload)
 	case "error":
 		payload := rawPayload(params)
+		r.writeCodexRunStateLocked(method, payload)
 		r.writer.Error(errorNoticeText(payload))
 		r.writeCustom(method, payload)
 	case "thread/realtime/transcript/delta":
@@ -496,10 +508,13 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		}
 		r.writeCustom(method, payload)
 	case "thread/realtime/started", "thread/realtime/itemAdded", "thread/realtime/outputAudio/delta", "thread/realtime/sdp", "thread/realtime/closed":
+		payload := rawPayload(params)
 		r.writeActiveNoticeLocked(method, params)
-		r.writeCustom(method, rawPayload(params))
+		r.writeCodexRealtimeStateLocked(method, payload)
+		r.writeCustom(method, payload)
 	case "thread/realtime/error":
 		payload := rawPayload(params)
+		r.writeCodexRealtimeStateLocked(method, payload)
 		r.writer.Error(threadNoticeText(method, params))
 		r.writeCustom(method, payload)
 	case "item/started":
@@ -528,7 +543,7 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 			}
 		} else if item.Type == "hookPrompt" {
 			if text := liveHookPromptText(item.Raw); text != "" {
-				r.writer.StateDelta(map[string]any{"codex": map[string]any{"hookPromptText": text}})
+				r.writer.StateDelta(hookPromptStateDelta(item.ID, text))
 			}
 		} else if item.ID != "" && item.IsToolLike() {
 			toolID := r.toolIDForItem(item.ID)
@@ -539,6 +554,10 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 				r.toolResult[toolID] = true
 			}
 			if state != agui.ToolResultStateStreaming {
+				if result := codexToolCompletionMetadataText(item.Raw, state, r.toolResult[toolID]); result != "" {
+					r.writer.ToolResult(toolID, result, state)
+					r.toolResult[toolID] = true
+				}
 				input, _ := codexItemToolInput(item.Raw)
 				r.endToolCall(toolID, item.Name(), input, map[string]any{"state": state, "status": codexItemStatusText(item.Raw, state)})
 			}
@@ -572,6 +591,7 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		if payload.Turn.Error != nil {
 			message = payload.Turn.Error.Message
 		}
+		r.writeCodexRunStateLocked(method, rawPayload(params))
 		r.finishTurnLocked(payload.Turn.Status, message)
 		r.writeCustom(method, rawPayload(params))
 		r.publishLocked()
@@ -644,6 +664,73 @@ func (r *activeRun) writeActiveNoticeLocked(method string, params json.RawMessag
 		return
 	}
 	r.writer.Text(text)
+}
+
+func (r *activeRun) writeCodexRunStateLocked(method string, payload map[string]any) {
+	r.writeCodexStateLocked("codexRun", method, payload)
+}
+
+func (r *activeRun) writeCodexRealtimeStateLocked(method string, payload map[string]any) {
+	r.writeCodexStateLocked("codexRealtime", method, payload)
+}
+
+func (r *activeRun) writeCodexStateLocked(namespace, method string, payload map[string]any) {
+	if r == nil || r.writer == nil || namespace == "" || method == "" {
+		return
+	}
+	state := map[string]any{
+		"lastNotification": method,
+		method:             payload,
+	}
+	r.writer.StateDelta(map[string]any{namespace: state})
+}
+
+func (r *activeRun) writeCodexClientRequestState(method string, payload map[string]any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.writeCodexClientRequestStateLocked(method, payload)
+	r.publishLocked()
+}
+
+func (r *activeRun) writeCodexClientRequestStateLocked(method string, payload map[string]any) {
+	if r == nil || r.writer == nil || method == "" {
+		return
+	}
+	r.writer.StateDelta(map[string]any{"codexRun": map[string]any{
+		"lastClientRequest": method,
+		method:              payload,
+	}})
+}
+
+func (r *activeRun) writeCodexRoomState(eventType string, content map[string]any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.writeCodexRoomStateLocked(eventType, content)
+	r.publishLocked()
+}
+
+func (r *activeRun) writeCodexRoomStateLocked(eventType string, content map[string]any) {
+	if r == nil || r.writer == nil || eventType == "" {
+		return
+	}
+	if content == nil {
+		content = map[string]any{}
+	}
+	r.writer.StateDelta(map[string]any{"codexRoomState": map[string]any{
+		"lastEventType": eventType,
+		eventType:       content,
+	}})
+}
+
+func hookPromptStateDelta(itemID, text string) map[string]any {
+	payload := map[string]any{"text": text}
+	if itemID != "" {
+		payload["itemId"] = itemID
+	}
+	return map[string]any{"codexRun": map[string]any{
+		"lastNotification": "item/hookPrompt",
+		"item/hookPrompt":  payload,
+	}}
 }
 
 func activeRunInitialModel(cl *Client, threadID string) string {
@@ -737,11 +824,15 @@ func (r *activeRun) startToolLikeItem(item codexItem) {
 		r.writeToolArgs(toolID, item.Raw)
 		return
 	}
-	r.ensureToolStarted(toolID, item.Name())
+	r.ensureToolStartedWithMetadata(toolID, item.Name(), codexToolStartMetadata(item.Raw))
 	r.writeToolArgs(toolID, item.Raw)
 }
 
 func (r *activeRun) ensureToolStarted(toolID, name string) {
+	r.ensureToolStartedWithMetadata(toolID, name, nil)
+}
+
+func (r *activeRun) ensureToolStartedWithMetadata(toolID, name string, metadata map[string]any) {
 	if r == nil || toolID == "" {
 		return
 	}
@@ -754,7 +845,7 @@ func (r *activeRun) ensureToolStarted(toolID, name string) {
 	if strings.TrimSpace(name) == "" {
 		name = toolID
 	}
-	r.writer.ToolStart(toolID, name, 0, nil)
+	r.writer.ToolStartWithMetadata(toolID, name, 0, nil, metadata)
 	r.toolStarted[toolID] = true
 }
 
@@ -762,20 +853,33 @@ func (r *activeRun) writeToolArgs(toolID string, data map[string]any) {
 	if r == nil || toolID == "" {
 		return
 	}
-	if r.toolArgsSent == nil {
-		r.toolArgsSent = map[string]bool{}
-	}
-	if r.toolArgsSent[toolID] {
-		return
-	}
 	input, ok := codexItemToolInput(data)
 	if !ok {
 		return
 	}
-	if text := rawToolInputText(input); text != "" {
-		r.writer.ToolArgs(toolID, text, input)
-		r.toolArgsSent[toolID] = true
+	r.writeToolArgsText(toolID, rawToolInputText(input), input)
+}
+
+func (r *activeRun) writeToolArgsText(toolID, text string, input any) {
+	if r == nil || r.writer == nil || toolID == "" || text == "" {
+		return
 	}
+	if r.toolArgsText == nil {
+		r.toolArgsText = map[string]string{}
+	}
+	prev := r.toolArgsText[toolID]
+	if prev == text {
+		return
+	}
+	delta := text
+	if prev != "" && strings.HasPrefix(text, prev) {
+		delta = strings.TrimPrefix(text, prev)
+	}
+	if delta == "" {
+		return
+	}
+	r.writer.ToolArgs(toolID, delta, input)
+	r.toolArgsText[toolID] = text
 }
 
 func (r *activeRun) endToolCall(toolID, name string, input, result any) {
@@ -791,9 +895,13 @@ func (r *activeRun) endToolCall(toolID, name string, input, result any) {
 	if strings.TrimSpace(name) == "" {
 		name = toolID
 	}
-	r.writer.ToolEnd(toolID, name, input, result)
+	if r.toolResult[toolID] {
+		r.writer.ToolInputComplete(toolID, name, input)
+	} else {
+		r.writer.ToolEnd(toolID, name, input, result)
+		r.toolResult[toolID] = true
+	}
 	r.toolEnded[toolID] = true
-	r.toolResult[toolID] = true
 }
 
 func (r *activeRun) completeToolInput(toolID, name string, input any) {
@@ -1022,7 +1130,7 @@ func (cl *Client) failPersistedActiveStreams(ctx context.Context) {
 	}
 }
 
-func (cl *Client) startActiveStreamJanitor(ctx context.Context) {
+func (cl *Client) startActiveStreamJanitor() {
 	if cl == nil || cl.Main == nil || cl.Main.Store == nil || cl.UserLogin == nil {
 		return
 	}
@@ -1031,7 +1139,7 @@ func (cl *Client) startActiveStreamJanitor(ctx context.Context) {
 	if cl.activeStreamJanitorStop != nil {
 		return
 	}
-	janitorCtx, stop := context.WithCancel(ctx)
+	janitorCtx, stop := context.WithCancel(context.Background())
 	cl.activeStreamJanitorStop = stop
 	go cl.runActiveStreamJanitor(janitorCtx)
 }
@@ -1260,15 +1368,105 @@ func (i codexItem) Name() string {
 }
 
 func codexItemToolInput(data map[string]any) (any, bool) {
-	for _, key := range []string{"arguments", "input", "action", "tools", "prompt", "revisedPrompt", "query", "path"} {
-		if value, ok := data[key]; ok && hasNonEmptyValue(value) {
+	input := map[string]any{}
+	for key, value := range data {
+		if isCodexItemToolOutputField(key) || !hasNonEmptyValue(value) {
+			continue
+		}
+		input[key] = value
+	}
+	if len(input) == 0 {
+		return nil, false
+	}
+	if len(input) == 1 {
+		for _, value := range input {
+			if text, ok := value.(string); ok {
+				return strings.TrimSpace(text), true
+			}
 			return value, true
 		}
 	}
-	if command, _ := data["command"].(string); strings.TrimSpace(command) != "" {
-		return strings.TrimSpace(command), true
+	return input, true
+}
+
+func codexToolStartMetadata(data map[string]any) map[string]any {
+	if data == nil {
+		return nil
 	}
-	return nil, false
+	codex := map[string]any{}
+	for _, key := range []string{
+		"id",
+		"threadId",
+		"turnId",
+		"itemId",
+		"callId",
+		"call_id",
+		"targetItemId",
+		"approvalId",
+		"requestId",
+		"type",
+		"status",
+		"name",
+		"tool",
+		"namespace",
+		"server",
+		"eventName",
+		"execution",
+		"source",
+		"processId",
+		"processHandle",
+		"mcpAppResourceUri",
+		"pluginId",
+		"senderThreadId",
+		"receiverThreadIds",
+		"model",
+		"reasoningEffort",
+	} {
+		if value, ok := data[key]; ok && hasNonEmptyValue(value) {
+			codex[key] = value
+		}
+	}
+	if len(codex) == 0 {
+		return nil
+	}
+	return map[string]any{"codex": codex}
+}
+
+func codexNotificationToolStartMetadata(method string, data map[string]any) map[string]any {
+	metadata := codexToolStartMetadata(data)
+	method = strings.TrimSpace(method)
+	if method == "" {
+		return metadata
+	}
+	if metadata == nil {
+		return map[string]any{"codex": map[string]any{"notification": method}}
+	}
+	codex, _ := metadata["codex"].(map[string]any)
+	if codex == nil {
+		codex = map[string]any{}
+		metadata["codex"] = codex
+	}
+	codex["notification"] = method
+	return metadata
+}
+
+func isCodexItemToolOutputField(key string) bool {
+	switch key {
+	case "id",
+		"type",
+		"status",
+		"result",
+		"error",
+		"contentItems",
+		"aggregatedOutput",
+		"exitCode",
+		"durationMs",
+		"success",
+		"savedPath":
+		return true
+	default:
+		return false
+	}
 }
 
 func notificationItem(params json.RawMessage) codexItem {
@@ -1387,15 +1585,9 @@ func (r *activeRun) mapRawToolCall(item map[string]any) {
 		return
 	}
 	name := rawToolName(item)
-		r.ensureToolStarted(callID, name)
+	r.ensureToolStartedWithMetadata(callID, name, codexToolStartMetadata(item))
 	args := rawToolInput(item)
-	if argsText := rawToolInputText(args); argsText != "" {
-		r.writer.ToolArgs(callID, argsText, args)
-		if r.toolArgsSent == nil {
-			r.toolArgsSent = map[string]bool{}
-		}
-		r.toolArgsSent[callID] = true
-	}
+	r.writeToolArgsText(callID, rawToolInputText(args), args)
 	r.completeToolInput(callID, name, args)
 }
 
@@ -1404,7 +1596,7 @@ func (r *activeRun) mapRawToolResult(item map[string]any) {
 	if callID == "" {
 		return
 	}
-		r.ensureToolStarted(callID, rawToolName(item))
+	r.ensureToolStartedWithMetadata(callID, rawToolName(item), codexToolStartMetadata(item))
 	if output := rawToolResultText(item); output != "" {
 		r.writer.ToolResult(callID, output, agui.ToolResultStateComplete)
 		r.toolResult[callID] = true
@@ -1418,19 +1610,13 @@ func (r *activeRun) mapRawToolEnd(item map[string]any) {
 	}
 	name := rawToolName(item)
 	state := toolStateFromStatus(firstString(item, "status"))
-	r.ensureToolStarted(callID, name)
+	r.ensureToolStartedWithMetadata(callID, name, codexToolStartMetadata(item))
 	if output := rawToolResultText(item); output != "" {
 		r.writer.ToolResult(callID, output, state)
 		r.toolResult[callID] = true
 	}
 	input := rawToolInput(item)
-	if argsText := rawToolInputText(input); argsText != "" {
-		r.writer.ToolArgs(callID, argsText, input)
-		if r.toolArgsSent == nil {
-			r.toolArgsSent = map[string]bool{}
-		}
-		r.toolArgsSent[callID] = true
-	}
+	r.writeToolArgsText(callID, rawToolInputText(input), input)
 	if state == agui.ToolResultStateStreaming {
 		return
 	}
@@ -1478,7 +1664,10 @@ func rawPayload(params json.RawMessage) map[string]any {
 }
 
 func outputDelta(params json.RawMessage) (string, string) {
-	payload := rawPayload(params)
+	return outputDeltaFromPayload(rawPayload(params))
+}
+
+func outputDeltaFromPayload(payload map[string]any) (string, string) {
 	itemID := ""
 	for _, key := range []string{"itemId", "callId", "processId", "processHandle", "id"} {
 		if value, _ := payload[key].(string); value != "" {
@@ -1677,19 +1866,40 @@ func rawToolCallID(item map[string]any) string {
 }
 
 func rawToolInput(item map[string]any) any {
-	if value, ok := item["arguments"]; ok {
-		return value
+	input := map[string]any{}
+	for key, value := range item {
+		if isRawToolOutputField(key) || !hasNonEmptyValue(value) {
+			continue
+		}
+		input[key] = value
 	}
-	if value, ok := item["input"]; ok {
-		return value
+	if len(input) == 0 {
+		return nil
 	}
-	if value, ok := item["action"]; ok {
-		return value
+	if len(input) == 1 {
+		for _, value := range input {
+			if text, ok := value.(string); ok {
+				return strings.TrimSpace(text)
+			}
+			return value
+		}
 	}
-	if value, ok := item["tools"]; ok {
-		return value
+	return input
+}
+
+func isRawToolOutputField(key string) bool {
+	switch key {
+	case "status",
+		"output",
+		"tools",
+		"result",
+		"content",
+		"contentItems",
+		"encrypted_content":
+		return true
+	default:
+		return false
 	}
-	return item
 }
 
 func rawToolInputText(value any) string {
@@ -1703,16 +1913,7 @@ func rawToolInputText(value any) string {
 }
 
 func rawToolOutputText(value any) string {
-	if value == nil {
-		return ""
-	}
-	if text, ok := value.(string); ok {
-		return text
-	}
-	if text := rawContentText(value); text != "" {
-		return text
-	}
-	return compactJSONString(value)
+	return codexToolResultValueText(value)
 }
 
 func rawToolResultText(item map[string]any) string {
