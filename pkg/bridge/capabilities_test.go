@@ -42,8 +42,11 @@ func TestRoomCapabilitiesMatchImplementedHandlers(t *testing.T) {
 	if caps.Delete != event.CapLevelUnsupported || caps.DeleteForMe || caps.DeleteMaxAge != nil {
 		t.Fatalf("message deletes should not be advertised, got level=%v for_me=%v age=%v", caps.Delete, caps.DeleteForMe, caps.DeleteMaxAge)
 	}
-	if caps.ReadReceipts || caps.TypingNotifications || caps.Archive || caps.MarkAsUnread || caps.DeleteChat || caps.DeleteChatForEveryone {
+	if caps.ReadReceipts || caps.Archive || caps.MarkAsUnread || caps.DeleteChat || caps.DeleteChatForEveryone {
 		t.Fatalf("unsupported room booleans should stay disabled: %#v", caps)
+	}
+	if !caps.TypingNotifications {
+		t.Fatalf("Codex typing notifications are emitted during live runs and should be advertised: %#v", caps)
 	}
 	if len(caps.Formatting) != 0 || len(caps.File) != 0 || len(caps.MemberActions) != 0 || caps.MessageRequest != nil {
 		t.Fatalf("unsupported rich room capabilities should stay empty: %#v", caps)
@@ -63,11 +66,11 @@ func TestRoomCapabilitiesMatchImplementedHandlers(t *testing.T) {
 	if caps.DisappearingTimer != nil {
 		t.Fatalf("disappearing timer capability should not be advertised: %#v", caps.DisappearingTimer)
 	}
-	if caps.State[event.StateMSC4391BotCommand.Type].Level != event.CapLevelFullySupported {
-		t.Fatalf("command state not advertised: %#v", caps.State)
+	if _, ok := caps.State[event.StateMSC4391BotCommand.Type]; ok {
+		t.Fatalf("command description state is bridge-owned and should not be advertised as user-editable: %#v", caps.State)
 	}
-	if caps.State[codexThreadStateType].Level != event.CapLevelFullySupported {
-		t.Fatalf("Codex thread state not advertised: %#v", caps.State)
+	if _, ok := caps.State[codexThreadStateType]; ok {
+		t.Fatalf("Codex thread state is bridge-owned and should not be advertised as user-editable: %#v", caps.State)
 	}
 	if caps.State[beeperAIModelStateType].Level != event.CapLevelFullySupported {
 		t.Fatalf("Beeper AI model state not advertised: %#v", caps.State)
@@ -103,6 +106,7 @@ func TestCodexMembersRemoveStaleBridgeOwnedPowerLevels(t *testing.T) {
 	content := &event.PowerLevelsEventContent{
 		Events: map[string]int{
 			event.StateBeeperDisappearingTimer.Type:       0,
+			event.StateMSC4391BotCommand.Type:             0,
 			roomStateEventType(codexThreadStateType).Type: 0,
 			event.StateRoomName.Type:                      0,
 		},
@@ -112,6 +116,9 @@ func TestCodexMembersRemoveStaleBridgeOwnedPowerLevels(t *testing.T) {
 	}
 	if _, ok := content.Events[event.StateBeeperDisappearingTimer.Type]; ok {
 		t.Fatalf("disappearing timer power level was not removed: %#v", content.Events)
+	}
+	if _, ok := content.Events[event.StateMSC4391BotCommand.Type]; ok {
+		t.Fatalf("command state power level was not removed: %#v", content.Events)
 	}
 	if _, ok := content.Events[roomStateEventType(codexThreadStateType).Type]; ok {
 		t.Fatalf("Codex thread state power level was not removed: %#v", content.Events)
@@ -189,7 +196,7 @@ func TestBridgeInfoVersionTracksRoomCapabilities(t *testing.T) {
 	if capabilities != roomCapabilitiesVersion {
 		t.Fatalf("room capabilities version = %d, want %d", capabilities, roomCapabilitiesVersion)
 	}
-	if capabilities < 8 {
+	if capabilities < 11 {
 		t.Fatal("room capabilities version must stay bumped for explicit room feature removals")
 	}
 }

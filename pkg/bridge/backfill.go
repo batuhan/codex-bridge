@@ -13,6 +13,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 
+	agui "github.com/beeper/ai-bridge/pkg/ag-ui"
 	aistream "github.com/beeper/ai-bridge/pkg/ai-stream"
 	"github.com/beeper/ai-bridge/pkg/msgconv"
 	"github.com/beeper/codex-bridge/pkg/appserver"
@@ -77,7 +78,7 @@ func paginateBackfillMessages(messages []*bridgev2.BackfillMessage, params bridg
 		Messages:             messages[start:end],
 		Cursor:               cursor,
 		HasMore:              start > 0,
-		MarkRead:             true,
+		MarkRead:             params.AnchorMessage == nil && params.Cursor == "",
 		ApproxTotalCount:     len(messages),
 		ApproxRemainingCount: start,
 	}
@@ -154,11 +155,12 @@ func (cl *Client) backfillAssistantMessage(ctx context.Context, portal *bridgev2
 	writer.Start()
 
 	hasContent := false
+	var reasoningSections reasoningSectionState
 	for _, item := range turn.Items {
 		if item.Type == "userMessage" {
 			continue
 		}
-		hasContent = mapBackfillItem(writer, run.MessageID, item) || hasContent
+		hasContent = mapBackfillItem(writer, run.MessageID, item, &reasoningSections) || hasContent
 	}
 	statusKind := codexTurnStatusKind(turn.Status)
 	if statusKind == "in_progress" && turn.Error == nil {
@@ -202,7 +204,10 @@ func (cl *Client) backfillFinalContent(ctx context.Context, portal *bridgev2.Por
 	return content, extra, nil
 }
 
-func mapBackfillItem(writer *aistream.Writer, messageID string, item appserver.TurnItem) bool {
+func mapBackfillItem(writer *aistream.Writer, messageID string, item appserver.TurnItem, reasoningSections *reasoningSectionState) bool {
+	if reasoningSections == nil {
+		reasoningSections = &reasoningSectionState{}
+	}
 	switch item.Type {
 	case "agentMessage":
 		if strings.TrimSpace(item.Text) == "" {
@@ -214,15 +219,19 @@ func mapBackfillItem(writer *aistream.Writer, messageID string, item appserver.T
 	case "reasoning":
 		reasoning := backfillReasoningTexts(item)
 		if len(reasoning) == 0 {
+			reasoning = backfillRawReasoningTexts(item.Raw)
+		}
+		if len(reasoning) == 0 {
 			return false
 		}
 		for index, text := range reasoning {
 			i := index
-			writer.ReasoningDelta(reasoningSectionIndex(item.ID, &i), text)
+			key := reasoningContentKey(item.ID, "content", &i)
+			writer.ReasoningDelta(reasoningSections.index(key), text)
 		}
 	case "hookPrompt":
 		if text := hookPromptText(item); text != "" {
-			writer.StateDelta(map[string]any{"codex": map[string]any{"hookPrompt": backfillItemData(item), "hookPromptText": text}})
+			writer.StateDelta(map[string]any{"codex": map[string]any{"hookPromptText": text}})
 		}
 	case "enteredReviewMode", "exitedReviewMode":
 		writer.Text(reviewModeText(item))
@@ -232,26 +241,107 @@ func mapBackfillItem(writer *aistream.Writer, messageID string, item appserver.T
 			"explanation": data["text"],
 			"plan":        []any{data},
 		}))
-		writer.StateDelta(map[string]any{"codex": map[string]any{"turn/plan/updated": data}})
 	case "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "collabAgentToolCall", "webSearch", "imageView", "imageGeneration":
 		writeBackfillToolItem(writer, item)
 	default:
-		if strings.TrimSpace(item.Text) == "" {
-			writer.Custom("codex/item", backfillItemData(item))
+		if mapBackfillRawResponseItem(writer, item) {
 			return true
+		}
+		if strings.TrimSpace(item.Text) == "" {
+			return false
 		}
 		writer.Text(item.Text)
 	}
-	writer.Custom("codex/item", backfillItemData(item))
 	return true
+}
+
+func mapBackfillRawResponseItem(writer *aistream.Writer, item appserver.TurnItem) bool {
+	data := backfillItemData(item)
+	switch item.Type {
+	case "message":
+		if role, _ := data["role"].(string); role != agui.RoleAssistant {
+			return false
+		}
+		text := strings.TrimSpace(rawContentText(data["content"]))
+		if text == "" {
+			return false
+		}
+		writer.Text(text)
+	case "function_call", "custom_tool_call", "tool_search_call":
+		callID := rawToolCallID(data)
+		if callID == "" {
+			return false
+		}
+		name := rawToolName(data)
+		input := rawToolInput(data)
+		if !backfillHasToolEvent(writer, callID, agui.EventToolCallStart) {
+			writer.ToolStart(callID, name, 0, nil)
+		}
+		if text := rawToolInputText(input); text != "" {
+			writer.ToolArgs(callID, text, input)
+		}
+		if !backfillHasToolEvent(writer, callID, agui.EventToolCallEnd) {
+			writer.ToolInputComplete(callID, name, input)
+		}
+	case "function_call_output", "custom_tool_call_output", "tool_search_output":
+		callID := rawToolCallID(data)
+		if callID == "" {
+			return false
+		}
+		name := rawToolName(data)
+		if !backfillHasToolEvent(writer, callID, agui.EventToolCallStart) {
+			writer.ToolStart(callID, name, 0, nil)
+		}
+		if output := rawToolResultText(data); output != "" {
+			writer.ToolResult(callID, output, agui.ToolResultStateComplete)
+		}
+	case "local_shell_call", "web_search_call", "image_generation_call":
+		callID := rawToolCallID(data)
+		if callID == "" {
+			return false
+		}
+		name := rawToolName(data)
+		input := rawToolInput(data)
+		state := toolStateFromStatus(firstString(data, "status"))
+		if !backfillHasToolEvent(writer, callID, agui.EventToolCallStart) {
+			writer.ToolStart(callID, name, 0, nil)
+		}
+		if output := rawToolResultText(data); output != "" {
+			writer.ToolResult(callID, output, state)
+		}
+		if text := rawToolInputText(input); text != "" {
+			writer.ToolArgs(callID, text, input)
+		}
+		if state != agui.ToolResultStateStreaming && !backfillHasToolEvent(writer, callID, agui.EventToolCallEnd) {
+			writer.ToolEnd(callID, name, input, map[string]any{"state": state, "status": firstString(data, "status")})
+		}
+	case "context_compaction", "compaction", "compaction_trigger":
+		writer.Text(codexCompactionNotice)
+	default:
+		return false
+	}
+	return true
+}
+
+func backfillHasToolEvent(writer *aistream.Writer, toolCallID string, eventType string) bool {
+	if writer == nil || writer.Run == nil || toolCallID == "" {
+		return false
+	}
+	for _, event := range writer.Run.Events {
+		if event.Type() == eventType && event.String("toolCallId") == toolCallID {
+			return true
+		}
+	}
+	return false
 }
 
 func writeBackfillToolItem(writer *aistream.Writer, item appserver.TurnItem) {
 	data := backfillItemData(item)
 	name := backfillToolName(item, data)
 	state := codexItemToolState(data)
-	writer.ToolStartWithMetadata(item.ID, name, 0, nil, map[string]any{"codexItem": data})
-	if input, ok := codexItemToolInput(data); ok {
+	writer.ToolStart(item.ID, name, 0, nil)
+	input, hasInput := codexItemToolInput(data)
+	if hasInput {
 		if text := rawToolInputText(input); text != "" {
 			writer.ToolArgs(item.ID, text, input)
 		}
@@ -259,7 +349,12 @@ func writeBackfillToolItem(writer *aistream.Writer, item appserver.TurnItem) {
 	if result := backfillToolResultText(data); result != "" {
 		writer.ToolResult(item.ID, result, state)
 	}
-	writer.ToolEnd(item.ID, name, data, map[string]any{"state": state, "status": codexItemStatusText(data, state)})
+	if state != agui.ToolResultStateStreaming {
+		if !hasInput {
+			input = nil
+		}
+		writer.ToolEnd(item.ID, name, input, map[string]any{"state": state, "status": codexItemStatusText(data, state)})
+	}
 }
 
 func backfillToolName(item appserver.TurnItem, data map[string]any) string {
@@ -306,6 +401,9 @@ func codexToolResultValueText(value any) string {
 			return text
 		}
 		return ""
+	}
+	if text := strings.TrimSpace(rawContentText(value)); text != "" {
+		return text
 	}
 	raw, err := json.Marshal(value)
 	if err == nil && len(raw) > 0 && string(raw) != "null" {
@@ -426,6 +524,13 @@ func backfillReasoningTexts(item appserver.TurnItem) []string {
 	if strings.TrimSpace(item.Text) != "" {
 		texts = append(texts, item.Text)
 	}
+	return texts
+}
+
+func backfillRawReasoningTexts(data map[string]any) []string {
+	var texts []string
+	texts = append(texts, rawTextItems(data["summary"])...)
+	texts = append(texts, rawTextItems(data["content"])...)
 	return texts
 }
 

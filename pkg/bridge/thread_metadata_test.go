@@ -55,8 +55,8 @@ func TestCodexThreadState(t *testing.T) {
 		t.Fatalf("unexpected closed state: %#v", state)
 	}
 
-	state = codexThreadState("thread/started", "thread-2", "", []byte(`{"thread":{"id":"thread-2","sessionId":"session-1","cwd":"/tmp/project","name":"Bridge","status":"running","model":"gpt-5","modelProvider":"openai","serviceTier":"priority","effort":"high"}}`))
-	if state["threadId"] != "thread-2" || state["sessionId"] != "session-1" || state["cwd"] != "/tmp/project" || state["name"] != "Bridge" || state["status"] != "running" || state["model"] != "gpt-5" || state["modelProvider"] != "openai" || state["serviceTier"] != "priority" || state["effort"] != "high" {
+	state = codexThreadState("thread/started", "thread-2", "", []byte(`{"thread":{"id":"thread-2","sessionId":"session-1","cwd":"/tmp/project","name":"Bridge","status":"running","model":"gpt-5","modelName":"GPT-5","modelProvider":"openai","serviceTier":"priority","effort":"high"}}`))
+	if state["threadId"] != "thread-2" || state["sessionId"] != "session-1" || state["cwd"] != "/tmp/project" || state["name"] != "Bridge" || state["status"] != "running" || state["model"] != "gpt-5" || state["modelName"] != "GPT-5" || state["modelProvider"] != "openai" || state["serviceTier"] != "priority" || state["effort"] != "high" {
 		t.Fatalf("thread fields were not normalized: %#v", state)
 	}
 
@@ -117,13 +117,47 @@ func TestCodexAIModelStateContent(t *testing.T) {
 		t.Fatalf("reroute should use known provider: %#v", content)
 	}
 
-	content = codexAIModelStateContent(map[string]any{"model": "gpt-b", "modelProvider": "openai", "reasoningEffort": "medium"})
-	if content["model"] != "openai/gpt-b" || content["reasoning"] != "medium" {
+	content = codexAIModelStateContent(map[string]any{"model": "gpt-b", "modelProvider": "openai", "reasoningEffort": "medium", "reasoning_mode": "adaptive"})
+	if content["model"] != "openai/gpt-b" || content["reasoning"] != "medium" || content["reasoning_mode"] != "adaptive" {
 		t.Fatalf("reasoning effort alias should write AI model state: %#v", content)
+	}
+
+	content = codexAIModelStateContent(map[string]any{"model": "gpt-b", "modelProvider": "openai", "modelName": "GPT-B"})
+	if content["model"] != "openai/gpt-b" || content["name"] != "GPT-B" {
+		t.Fatalf("model display name should write AI model state: %#v", content)
+	}
+
+	content = codexAIModelStateContent(map[string]any{"model": "gpt-b", "modelProvider": "openai", "name": "GPT-B"})
+	if content["model"] != "openai/gpt-b" || content["name"] != "GPT-B" {
+		t.Fatalf("AI model state name alias should be preserved: %#v", content)
+	}
+
+	state = codexThreadState("thread/started", "thread-1", "", []byte(`{"thread":{"id":"thread-1","model":"gpt-5","modelName":"GPT-5","modelProvider":"openai"}}`))
+	content = codexAIModelStateContent(state)
+	if content["model"] != "openai/gpt-5" || content["name"] != "GPT-5" {
+		t.Fatalf("thread start model display name should write AI model state: %#v", content)
 	}
 
 	if content = codexAIModelStateContent(map[string]any{"modelProvider": "openai"}); len(content) != 0 {
 		t.Fatalf("blank model should not write AI model state: %#v", content)
+	}
+}
+
+func TestEnrichThreadStateWithModelStatePreservesMissingRoomModelFields(t *testing.T) {
+	state := enrichThreadStateWithModelState(
+		map[string]any{"threadId": "thread-1", "model": "gpt-5", "modelProvider": "openai"},
+		map[string]any{"model": "openai/gpt-5", "name": "GPT-5", "reasoning": "high", "reasoning_mode": "adaptive"},
+	)
+	if state["model"] != "gpt-5" || state["modelName"] != "GPT-5" || state["reasoningEffort"] != "high" || state["reasoning_mode"] != "adaptive" {
+		t.Fatalf("thread state did not preserve missing room model fields: %#v", state)
+	}
+
+	state = enrichThreadStateWithModelState(
+		map[string]any{"threadId": "thread-1", "model": "gpt-5", "modelProvider": "openai", "effort": "medium", "reasoning_mode": "default"},
+		map[string]any{"model": "openai/gpt-5.1", "reasoning": "high", "reasoning_mode": "adaptive"},
+	)
+	if state["model"] != "gpt-5" || state["effort"] != "medium" || state["reasoning_mode"] != "default" {
+		t.Fatalf("thread state should not overwrite present model fields: %#v", state)
 	}
 }
 
@@ -243,7 +277,7 @@ func TestThreadMetadataUpdaterPersistsPortalMetadata(t *testing.T) {
 
 func TestCodexThreadChatInfoExtraUpdatesSyncRoomState(t *testing.T) {
 	ctx := context.Background()
-	matrix := &fakeMatrixConnector{}
+	matrix := &fakeMatrixConnector{api: &fakeMatrixAPI{}}
 	_, br := testBridgeWithDB(t, matrix)
 	key := projectPortalKey("/tmp/project", "sh-codex")
 	if err := br.DB.Portal.Insert(ctx, &database.Portal{
@@ -264,8 +298,10 @@ func TestCodexThreadChatInfoExtraUpdatesSyncRoomState(t *testing.T) {
 		"threadSettings": {
 			"cwd": "/tmp/project",
 			"model": "gpt-5",
+			"modelName": "GPT-5",
 			"modelProvider": "openai",
-			"effort": "high"
+			"effort": "high",
+			"reasoning_mode": "adaptive"
 		}
 	}`))
 	info := codexThreadChatInfo("/tmp/project", "thread-1", state)
@@ -284,7 +320,7 @@ func TestCodexThreadChatInfoExtraUpdatesSyncRoomState(t *testing.T) {
 	if modelState == nil || modelState.RoomID != portal.MXID {
 		t.Fatalf("Beeper AI model state was not synced to the portal room: %#v", matrix.api.states)
 	}
-	if modelState.Content == nil || modelState.Content.Raw["model"] != "openai/gpt-5" || modelState.Content.Raw["reasoning"] != "high" {
+	if modelState.Content == nil || modelState.Content.Raw["model"] != "openai/gpt-5" || modelState.Content.Raw["reasoning"] != "high" || modelState.Content.Raw["reasoning_mode"] != "adaptive" {
 		t.Fatalf("Beeper AI model state content was wrong: %#v", modelState.Content)
 	}
 	if findFakeState(matrix.api.states, event.StateMSC4391BotCommand.Type) == nil {
@@ -332,7 +368,7 @@ func TestCodexThreadChatInfoExtraUpdatesClearsMissingAIModelState(t *testing.T) 
 func TestSyncThreadPortalKeepsExistingAIModelWhenThreadOmitsModel(t *testing.T) {
 	ctx := context.Background()
 	matrix := &modelStateMatrix{modelEvt: &event.Event{Content: event.Content{
-		Raw: map[string]any{"model": "openai/gpt-5.5", "reasoning": "high"},
+		Raw: map[string]any{"model": "openai/gpt-5.5", "name": "GPT-5.5", "reasoning": "high"},
 	}}}
 	connector, br := testBridgeWithDB(t, matrix)
 	user, err := br.GetUserByMXID(ctx, id.UserID("@user:example.com"))
@@ -373,11 +409,11 @@ func TestSyncThreadPortalKeepsExistingAIModelWhenThreadOmitsModel(t *testing.T) 
 	})
 
 	modelState := findFakeState(matrix.api.states, beeperAIModelStateType)
-	if modelState == nil || modelState.Content.Raw["model"] != "openai/gpt-5.5" || modelState.Content.Raw["reasoning"] != "high" {
+	if modelState == nil || modelState.Content.Raw["model"] != "openai/gpt-5.5" || modelState.Content.Raw["name"] != "GPT-5.5" || modelState.Content.Raw["reasoning"] != "high" {
 		t.Fatalf("syncThreadPortal cleared existing AI model state: %#v", matrix.api.states)
 	}
 	room, ok := connector.threadRoom("thread-1")
-	if !ok || room.model != "openai/gpt-5.5" || room.reasoningEffort != "high" {
+	if !ok || room.model != "openai/gpt-5.5" || room.modelName != "GPT-5.5" || room.reasoningEffort != "high" {
 		t.Fatalf("syncThreadPortal did not cache existing AI model state: %#v", room)
 	}
 }
@@ -385,7 +421,7 @@ func TestSyncThreadPortalKeepsExistingAIModelWhenThreadOmitsModel(t *testing.T) 
 func TestSyncThreadPortalRepairsAIModelFromSessionFile(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "session.jsonl")
-	if err := os.WriteFile(path, []byte(`{"type":"turn_context","payload":{"cwd":"/tmp/project","model":"openai/gpt-5.5","effort":"high"}}`+"\n"), 0600); err != nil {
+	if err := os.WriteFile(path, []byte(`{"type":"turn_context","payload":{"cwd":"/tmp/project","model":"openai/gpt-5.5","modelName":"GPT-5.5","effort":"high"}}`+"\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	matrix := &modelStateMatrix{modelEvt: &event.Event{Content: event.Content{Raw: map[string]any{}}}}
@@ -429,12 +465,67 @@ func TestSyncThreadPortalRepairsAIModelFromSessionFile(t *testing.T) {
 	})
 
 	modelState := findFakeState(matrix.api.states, beeperAIModelStateType)
-	if modelState == nil || modelState.Content.Raw["model"] != "openai/gpt-5.5" || modelState.Content.Raw["reasoning"] != "high" {
+	if modelState == nil || modelState.Content.Raw["model"] != "openai/gpt-5.5" || modelState.Content.Raw["name"] != "GPT-5.5" || modelState.Content.Raw["reasoning"] != "high" {
 		t.Fatalf("syncThreadPortal did not repair AI model state from session file: %#v", matrix.api.states)
 	}
 	room, ok := connector.threadRoom("thread-1")
-	if !ok || room.model != "openai/gpt-5.5" || room.reasoningEffort != "high" {
+	if !ok || room.model != "openai/gpt-5.5" || room.modelName != "GPT-5.5" || room.reasoningEffort != "high" {
 		t.Fatalf("syncThreadPortal did not cache session model state: %#v", room)
+	}
+}
+
+func TestSyncThreadPortalPreservesCustomRoomNameAndTopic(t *testing.T) {
+	ctx := context.Background()
+	_, br := testBridgeWithDB(t, &fakeMatrixConnector{})
+	user, err := br.GetUserByMXID(ctx, id.UserID("@user:example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := user.NewLogin(ctx, &database.UserLogin{
+		ID:            "sh-codex",
+		RemoteName:    "Codex",
+		RemoteProfile: status.RemoteProfile{Name: "Codex"},
+		Metadata:      map[string]any{},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := login.Client.(*Client)
+	key := projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "Custom room",
+		NameSet:   true,
+		Topic:     "Pinned operator notes",
+		TopicSet:  true,
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.syncThreadPortal(ctx, portal, appserver.Thread{
+		ID:        "thread-1",
+		SessionID: "thread-1",
+		Cwd:       "/tmp/project",
+		Preview:   "Codex preview should not replace custom room name",
+		Raw: map[string]any{
+			"threadId": "thread-1",
+			"preview":  "Codex preview should not replace custom room name",
+		},
+	})
+
+	portal, err = br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if portal.Name != "Custom room" || !portal.NameSet || portal.Topic != "Pinned operator notes" {
+		t.Fatalf("syncThreadPortal overwrote custom room metadata: %#v", portal.Portal)
 	}
 }
 
@@ -461,6 +552,7 @@ func TestPortalInfoWithThreadStateSyncsAllRoomState(t *testing.T) {
 		"threadSettings": {
 			"cwd": "/tmp/project",
 			"model": "gpt-5",
+			"modelName": "GPT-5",
 			"modelProvider": "openai",
 			"effort": "high"
 		}
@@ -733,6 +825,55 @@ func TestCanStartActiveRunFromNotification(t *testing.T) {
 	}
 }
 
+func TestMetadataNotificationWithoutTurnDoesNotStartStream(t *testing.T) {
+	ctx := context.Background()
+	oldPortalEventBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	t.Cleanup(func() { bridgev2.PortalEventBuffer = oldPortalEventBuffer })
+
+	matrix := &fakeMatrixConnector{}
+	connector, br := testBridgeWithDB(t, matrix)
+	user, err := br.GetUserByMXID(ctx, id.UserID("@user:example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := user.NewLogin(ctx, &database.UserLogin{
+		ID:            "sh-codex",
+		RemoteName:    "Codex",
+		RemoteProfile: status.RemoteProfile{Name: "Codex"},
+		Metadata:      map[string]any{},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", "openai", "gpt-5", "high")
+
+	connector.handleNotification("thread/status/changed", []byte(`{
+		"threadId": "thread-1",
+		"status": {"type": "active", "activeFlags": ["agent"]}
+	}`))
+
+	if run := connector.activeRun("thread-1"); run != nil {
+		t.Fatalf("metadata-only notification should not create an active stream: %#v", run)
+	}
+	if len(matrix.api.messages) != 0 {
+		t.Fatalf("non-notice metadata-only notification should not queue a message: %#v", matrix.api.messages)
+	}
+	if findFakeState(matrix.api.states, codexThreadStateType) == nil {
+		t.Fatalf("metadata-only notification should still sync thread state: %#v", matrix.api.states)
+	}
+}
+
 func TestThreadMetadataNotificationUpdatesCachedRoomState(t *testing.T) {
 	connector := &Connector{threadRooms: map[string]threadRoom{}}
 	client := &Client{Main: connector, UserLogin: testUserLogin("sh-codex")}
@@ -858,6 +999,7 @@ func TestThreadMetadataNotificationQueuesBridgeV2StateSync(t *testing.T) {
 		"threadSettings": {
 			"cwd": "/tmp/project",
 			"model": "gpt-5",
+			"modelName": "GPT-5",
 			"modelProvider": "openai",
 			"effort": "high"
 		}
@@ -868,11 +1010,125 @@ func TestThreadMetadataNotificationQueuesBridgeV2StateSync(t *testing.T) {
 		t.Fatalf("thread metadata notification did not sync Codex state: %#v", matrix.api.states)
 	}
 	modelState := findFakeState(matrix.api.states, beeperAIModelStateType)
-	if modelState == nil || modelState.Content.Raw["model"] != "openai/gpt-5" || modelState.Content.Raw["reasoning"] != "high" {
+	if modelState == nil || modelState.Content.Raw["model"] != "openai/gpt-5" || modelState.Content.Raw["name"] != "GPT-5" || modelState.Content.Raw["reasoning"] != "high" {
 		t.Fatalf("thread metadata notification did not sync AI model state: %#v", matrix.api.states)
 	}
 	if findFakeState(matrix.api.states, event.StateMSC4391BotCommand.Type) == nil {
 		t.Fatalf("thread metadata notification did not sync command state: %#v", matrix.api.states)
+	}
+}
+
+func TestThreadMetadataNotificationPreservesCustomRoomNameAndTopic(t *testing.T) {
+	ctx := context.Background()
+	oldPortalEventBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	t.Cleanup(func() { bridgev2.PortalEventBuffer = oldPortalEventBuffer })
+
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
+	user, err := br.GetUserByMXID(ctx, id.UserID("@user:example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := user.NewLogin(ctx, &database.UserLogin{
+		ID:            "sh-codex",
+		RemoteName:    "Codex",
+		RemoteProfile: status.RemoteProfile{Name: "Codex"},
+		Metadata:      map[string]any{},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "Custom room",
+		NameSet:   true,
+		Topic:     "Pinned operator notes",
+		TopicSet:  true,
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", "openai", "gpt-4")
+
+	connector.handleThreadMetadataNotification("thread/name/updated", "thread-1", []byte(`{
+		"threadId": "thread-1",
+		"threadName": "Codex generated name"
+	}`))
+
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if portal.Name != "Custom room" || !portal.NameSet || portal.Topic != "Pinned operator notes" {
+		t.Fatalf("thread metadata notification overwrote custom room metadata: %#v", portal.Portal)
+	}
+}
+
+func TestThreadMetadataNotificationPreservesClearedRoomNameAndTopic(t *testing.T) {
+	ctx := context.Background()
+	oldPortalEventBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	t.Cleanup(func() { bridgev2.PortalEventBuffer = oldPortalEventBuffer })
+
+	matrix := &fakeMatrixConnector{}
+	connector, br := testBridgeWithDB(t, matrix)
+	user, err := br.GetUserByMXID(ctx, id.UserID("@user:example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := user.NewLogin(ctx, &database.UserLogin{
+		ID:            "sh-codex",
+		RemoteName:    "Codex",
+		RemoteProfile: status.RemoteProfile{Name: "Codex"},
+		Metadata:      map[string]any{},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "",
+		NameSet:   true,
+		Topic:     "",
+		TopicSet:  true,
+		AvatarSet: true,
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", "openai", "gpt-4")
+
+	connector.handleThreadMetadataNotification("thread/name/updated", "thread-1", []byte(`{
+		"threadId": "thread-1",
+		"threadName": "Codex generated name"
+	}`))
+
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if portal.Name != "" || !portal.NameSet || portal.Topic != "" || !portal.TopicSet {
+		t.Fatalf("thread metadata notification overwrote cleared room metadata: %#v", portal.Portal)
+	}
+	for _, state := range matrix.api.states {
+		if state.Type != event.StateRoomName || state.Content == nil {
+			continue
+		}
+		name := ""
+		if content, _ := state.Content.Parsed.(*event.RoomNameEventContent); content != nil {
+			name = content.Name
+		} else {
+			name, _ = state.Content.Raw["name"].(string)
+		}
+		if name != "" {
+			t.Fatalf("chat info sync did not preserve cleared room name: %#v", state.Content.Raw)
+		}
 	}
 }
 

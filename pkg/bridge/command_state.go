@@ -34,7 +34,7 @@ func codexCommandDescriptions() []*cmdschema.EventContent {
 	return []*cmdschema.EventContent{
 		{
 			Command:     "approvals",
-			Description: event.MakeExtensibleText("List pending Codex approvals."),
+			Description: event.MakeExtensibleText("List pending Codex approvals and input requests."),
 		},
 		{
 			Command:     "approve",
@@ -44,6 +44,7 @@ func codexCommandDescriptions() []*cmdschema.EventContent {
 				{
 					Key:         "choice",
 					Schema:      cmdschema.Enum("approve", "always", "deny"),
+					Optional:    true,
 					Description: event.MakeExtensibleText("Approval choice."),
 				},
 			},
@@ -90,7 +91,12 @@ func codexCommandFromMSC4391(input *event.MSC4391BotCommandInput) (codexCommand,
 	}
 	switch name {
 	case "approve":
-		return codexCommand{name: name, arg: stringsFromCommandArgs(args, "id", "approval_id") + " " + stringsFromCommandArgs(args, "choice")}, true
+		id := stringsFromCommandArgs(args, "id", "approval_id")
+		choice := stringsFromCommandArgs(args, "choice")
+		if choice == "" {
+			return codexCommand{name: name, arg: id}, true
+		}
+		return codexCommand{name: name, arg: id + " " + choice}, true
 	case "answer":
 		return codexCommand{name: name, arg: stringsFromCommandArgs(args, "id", "request_id") + " " + stringsFromCommandArgs(args, "answer")}, true
 	default:

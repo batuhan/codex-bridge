@@ -33,6 +33,10 @@ func newProjectPortalKey(loginID networkid.UserLoginID) networkid.PortalKey {
 	return networkid.PortalKey{ID: networkid.PortalID("new:" + base64.RawURLEncoding.EncodeToString(data[:])), Receiver: loginID}
 }
 
+func isNewProjectPortalID(portalID networkid.PortalID) bool {
+	return strings.HasPrefix(string(portalID), "new:")
+}
+
 func projectUserID(cwd string) networkid.UserID {
 	return networkid.UserID("project:" + encode(strings.TrimSpace(cwd)))
 }

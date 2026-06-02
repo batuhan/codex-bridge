@@ -36,6 +36,35 @@ func TestApprovalResponseFromCommand(t *testing.T) {
 	}
 }
 
+func TestResolveApprovalCommandDefaultsToApprove(t *testing.T) {
+	run := newActiveRun(&Client{}, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.pending = map[string]*pendingServerRequest{
+		"approval-1": {
+			ID:         "approval-1",
+			Method:     "item/commandExecution/requestApproval",
+			ToolCallID: "cmd-1",
+			ToolName:   "command_execution",
+			Input:      map[string]any{"command": "git status"},
+			Response:   make(chan any, 1),
+		},
+	}
+	responseCh := run.pending["approval-1"].Response
+
+	if !run.resolveApprovalCommand("approval-1") {
+		t.Fatal("approval command without explicit choice did not resolve")
+	}
+
+	select {
+	case got := <-responseCh:
+		response, ok := got.(aistream.ToolApprovalResponse)
+		if !ok || response.ID != "approval-1" || !response.Approved || response.Always {
+			t.Fatalf("unexpected approval response: %#v", got)
+		}
+	default:
+		t.Fatal("resolved approval was not delivered to Codex waiter")
+	}
+}
+
 func TestParseCodexCommand(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -61,15 +90,24 @@ func TestParseCodexCommand(t *testing.T) {
 			want:    codexCommand{name: "approve", arg: "approval-1 deny"},
 			ok:      true,
 		},
-		{
-			name: "structured approve",
-			content: &event.MessageEventContent{MSC4391BotCommand: &event.MSC4391BotCommandInput{
-				Command:   "approve",
-				Arguments: json.RawMessage(`{"id":"approval-1","choice":"always"}`),
+			{
+				name: "structured approve",
+				content: &event.MessageEventContent{MSC4391BotCommand: &event.MSC4391BotCommandInput{
+					Command:   "approve",
+					Arguments: json.RawMessage(`{"id":"approval-1","choice":"always"}`),
 			}},
-			want: codexCommand{name: "approve", arg: "approval-1 always"},
-			ok:   true,
-		},
+				want: codexCommand{name: "approve", arg: "approval-1 always"},
+				ok:   true,
+			},
+			{
+				name: "structured approve default",
+				content: &event.MessageEventContent{MSC4391BotCommand: &event.MSC4391BotCommandInput{
+					Command:   "approve",
+					Arguments: json.RawMessage(`{"id":"approval-1"}`),
+				}},
+				want: codexCommand{name: "approve", arg: "approval-1"},
+				ok:   true,
+			},
 		{
 			name: "structured answer",
 			content: &event.MessageEventContent{MSC4391BotCommand: &event.MSC4391BotCommandInput{
@@ -140,6 +178,9 @@ func TestCodexCommandDescriptionsAreValid(t *testing.T) {
 	if keys := commandParamKeys(seen["approve"]); !reflect.DeepEqual(keys, []string{"id", "choice"}) {
 		t.Fatalf("approve command parameters changed: %#v", keys)
 	}
+	if !seen["approve"].Parameters[1].Optional {
+		t.Fatal("approve choice should stay optional so clients can send a one-tap approval")
+	}
 	if keys := commandParamKeys(seen["answer"]); !reflect.DeepEqual(keys, []string{"id", "answer"}) || seen["answer"].TailParam != "answer" {
 		t.Fatalf("answer command parameters changed: keys=%#v tail=%q", keys, seen["answer"].TailParam)
 	}
@@ -168,6 +209,15 @@ func TestDirectServerRequestErrors(t *testing.T) {
 	code, message, ok = directServerRequestError("attestation/generate")
 	if !ok || code == 0 || !strings.Contains(message, "attestation tokens") {
 		t.Fatalf("unexpected attestation direct error: code=%d message=%q ok=%v", code, message, ok)
+	}
+}
+
+func TestServerRequestIDNormalizesJSONRPCID(t *testing.T) {
+	if got := serverRequestID(float64(42)); got != "42" {
+		t.Fatalf("unexpected numeric request ID: %q", got)
+	}
+	if got := serverRequestID(" request-1 "); got != "request-1" {
+		t.Fatalf("unexpected string request ID: %q", got)
 	}
 }
 
@@ -202,6 +252,14 @@ func TestHandleMatrixMessageShortCircuitsNoSessionCommands(t *testing.T) {
 			name:    "structured",
 			content: &event.MessageEventContent{MSC4391BotCommand: &event.MSC4391BotCommandInput{Command: "approvals"}},
 		},
+		{
+			name:    "approve",
+			content: &event.MessageEventContent{Body: "/approve approval-1 approve"},
+		},
+		{
+			name:    "answer",
+			content: &event.MessageEventContent{MsgType: matrixCommandMsgType, Body: "answer input-1 hello"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -219,7 +277,126 @@ func TestHandleMatrixMessageShortCircuitsNoSessionCommands(t *testing.T) {
 	}
 }
 
-func TestPendingApprovalsText(t *testing.T) {
+func TestHandleMatrixMessageAcksCommandFailures(t *testing.T) {
+	client := &Client{Main: &Connector{}, UserLogin: testUserLogin("codex")}
+	tests := []struct {
+		name   string
+		body   string
+		status string
+	}{
+		{name: "approve without active turn", body: "/approve approval-1 approve", status: "no_pending_approval"},
+		{name: "answer without active turn", body: "/answer input-1 hello", status: "no_pending_input"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := testMatrixMessage("thread-1", tc.body)
+			resp, err := client.HandleMatrixMessage(context.Background(), msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			meta, ok := resp.DB.Metadata.(*MessageMetadata)
+			if !ok || meta.Role != "command" || meta.ThreadID != "thread-1" || meta.StreamStatus != tc.status {
+				t.Fatalf("command failure did not ack with metadata: %#v", resp.DB.Metadata)
+			}
+		})
+	}
+
+	run := &activeRun{pending: map[string]*pendingServerRequest{}}
+	client.Main.active = map[string]*activeRun{"thread-1": run}
+	for _, tc := range []struct {
+		name   string
+		body   string
+		status string
+	}{
+		{name: "invalid approval", body: "/approve approval-1 approve", status: "invalid_approval"},
+		{name: "invalid answer", body: "/answer input-1 hello", status: "invalid_answer"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := testMatrixMessage("thread-1", tc.body)
+			resp, err := client.HandleMatrixMessage(context.Background(), msg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			meta, ok := resp.DB.Metadata.(*MessageMetadata)
+			if !ok || meta.Role != "command" || meta.ThreadID != "thread-1" || meta.StreamStatus != tc.status {
+				t.Fatalf("invalid command did not ack with metadata: %#v", resp.DB.Metadata)
+			}
+		})
+	}
+}
+
+func TestHandleMatrixMessageResolvesStructuredPendingCommands(t *testing.T) {
+	client := &Client{Main: &Connector{active: map[string]*activeRun{}}, UserLogin: testUserLogin("codex")}
+	run := newActiveRun(client, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.pending = map[string]*pendingServerRequest{
+		"approval-1": {
+			ID:         "approval-1",
+			Method:     "item/commandExecution/requestApproval",
+			ToolCallID: "cmd-1",
+			ToolName:   "command_execution",
+			Input:      map[string]any{"command": "git status"},
+			Response:   make(chan any, 1),
+		},
+		"input-1": {
+			ID:          "input-1",
+			Method:      "item/tool/requestUserInput",
+			ToolCallID:  "input-1",
+			ToolName:    "request_user_input",
+			Input:       map[string]any{"prompt": "Project directory?"},
+			QuestionIDs: []string{"path"},
+			Response:    make(chan any, 1),
+		},
+	}
+	approvalCh := run.pending["approval-1"].Response
+	inputCh := run.pending["input-1"].Response
+	client.Main.active["thread-1"] = run
+
+	approvalMsg := testMatrixMessage("thread-1", "")
+	approvalMsg.Content = &event.MessageEventContent{MSC4391BotCommand: &event.MSC4391BotCommandInput{
+		Command:   "approve",
+		Arguments: json.RawMessage(`{"id":"approval-1"}`),
+	}}
+	resp, err := client.HandleMatrixMessage(context.Background(), approvalMsg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta, ok := resp.DB.Metadata.(*MessageMetadata); !ok || meta.StreamStatus != "approve" {
+		t.Fatalf("structured approval was not acked as approve: %#v", resp.DB.Metadata)
+	}
+	select {
+	case got := <-approvalCh:
+		response, ok := got.(aistream.ToolApprovalResponse)
+		if !ok || !response.Approved || response.ID != "approval-1" {
+			t.Fatalf("structured approval did not resolve with approval response: %#v", got)
+		}
+	default:
+		t.Fatal("structured approval did not reach pending request")
+	}
+
+	answerMsg := testMatrixMessage("thread-1", "")
+	answerMsg.Content = &event.MessageEventContent{MSC4391BotCommand: &event.MSC4391BotCommandInput{
+		Command:   "answer",
+		Arguments: json.RawMessage(`{"id":"input-1","answer":"/tmp/project"}`),
+	}}
+	resp, err = client.HandleMatrixMessage(context.Background(), answerMsg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta, ok := resp.DB.Metadata.(*MessageMetadata); !ok || meta.StreamStatus != "answer" {
+		t.Fatalf("structured answer was not acked as answer: %#v", resp.DB.Metadata)
+	}
+	select {
+	case got := <-inputCh:
+		want := map[string]any{"path": map[string]any{"answers": []string{"/tmp/project"}}}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("structured answer did not resolve input:\n got: %#v\nwant: %#v", got, want)
+		}
+	default:
+		t.Fatal("structured answer did not reach pending request")
+	}
+}
+
+func TestPendingRequestsText(t *testing.T) {
 	run := &activeRun{pending: map[string]*pendingServerRequest{
 		"approval-1": {
 			ID:     "approval-1",
@@ -227,24 +404,53 @@ func TestPendingApprovalsText(t *testing.T) {
 			Input:  map[string]any{"command": "git status", "cwd": "/tmp/project"},
 		},
 		"input-1": {
-			ID:     "input-1",
-			Method: "item/tool/requestUserInput",
+			ID:          "input-1",
+			Method:      "item/tool/requestUserInput",
+			ToolName:    "ask_user",
+			Input:       map[string]any{"message": "Pick a branch"},
+			QuestionIDs: []string{"branch"},
 		},
 	}}
-	got := run.pendingApprovalsText()
+	got := run.pendingRequestsText()
 	for _, want := range []string{
-		"Pending approvals:",
+		"Pending Codex requests:",
 		"Approve command: git status",
 		"/approve approval-1 approve",
 		"/approve approval-1 always",
 		"/approve approval-1 deny",
+		"Pick a branch",
+		"Reply with `/answer input-1 <answer>`.",
+		"/answer input-1 <answer>",
 	} {
 		if !strings.Contains(got, want) {
-			t.Fatalf("pending approvals text missing %q:\n%s", want, got)
+			t.Fatalf("pending requests text missing %q:\n%s", want, got)
 		}
 	}
-	if strings.Contains(got, "input-1") {
-		t.Fatalf("non-approval request leaked into approvals text:\n%s", got)
+}
+
+func TestPendingRequestsTextIncludesMCPElicitationURL(t *testing.T) {
+	run := &activeRun{pending: map[string]*pendingServerRequest{
+		"elicit-1": {
+			ID:       "elicit-1",
+			Method:   "mcpServer/elicitation/request",
+			ToolName: "mcp:github",
+			Input: map[string]any{
+				"mode":       "url",
+				"message":    "Authorize GitHub",
+				"url":        "https://github.com/login/device",
+				"serverName": "github",
+			},
+		},
+	}}
+	got := run.pendingRequestsText()
+	for _, want := range []string{
+		"Authorize GitHub",
+		"URL: https://github.com/login/device",
+		"Reply with `/answer elicit-1 <answer>`.",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("pending requests text missing %q:\n%s", want, got)
+		}
 	}
 }
 
@@ -452,7 +658,7 @@ func hasToolCallResult(events []agui.Event, toolCallID string) bool {
 
 func TestNewApprovalRequestUsesCodexIDs(t *testing.T) {
 	run := &activeRun{turnID: "turn-1"}
-	pending, request, err := run.newApprovalRequest("item/commandExecution/requestApproval", []byte(`{
+	pending, request, err := run.newApprovalRequest("item/commandExecution/requestApproval", "rpc-approval", []byte(`{
 		"threadId": "thread-1",
 		"turnId": "turn-1",
 		"itemId": "item-1",
@@ -472,5 +678,143 @@ func TestNewApprovalRequestUsesCodexIDs(t *testing.T) {
 	}
 	if request.Title != "Approve command: git status" {
 		t.Fatalf("unexpected title: %q", request.Title)
+	}
+}
+
+func TestNewApprovalRequestFallsBackToRPCRequestID(t *testing.T) {
+	run := &activeRun{turnID: "turn-1"}
+	pending, request, err := run.newApprovalRequest("execCommandApproval", "rpc-approval", []byte(`{
+		"threadId": "thread-1",
+		"turnId": "turn-1",
+		"command": "git status"
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.ID != "rpc-approval" || request.ID != "rpc-approval" {
+		t.Fatalf("approval did not use RPC fallback ID: pending=%#v request=%#v", pending, request)
+	}
+}
+
+func TestNewInputRequestUsesRPCIDForMCPFormElicitation(t *testing.T) {
+	run := &activeRun{turnID: "turn-1"}
+	pending, request, err := run.newInputRequest("mcpServer/elicitation/request", "rpc-elicit-1", []byte(`{
+		"threadId": "thread-1",
+		"turnId": "turn-1",
+		"serverName": "github",
+		"mode": "form",
+		"message": "GitHub login",
+		"requestedSchema": {
+			"type":"object",
+			"properties":{
+				"repo":{"type":"string","title":"Repository"},
+				"branch":{"type":"string","description":"Branch name"}
+			},
+			"required":["repo"]
+		}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.ID != "rpc-elicit-1" || request.ID != "rpc-elicit-1" || request.ToolCallID != "rpc-elicit-1" {
+		t.Fatalf("MCP form elicitation did not use RPC request ID: pending=%#v request=%#v", pending, request)
+	}
+	if request.ToolName != "mcp:github" || request.Title != "GitHub login" {
+		t.Fatalf("MCP form elicitation lost context: %#v", request)
+	}
+	if !reflect.DeepEqual(pending.QuestionIDs, []string{"branch", "repo"}) {
+		t.Fatalf("MCP form elicitation did not expose schema fields: %#v", pending.QuestionIDs)
+	}
+	for _, want := range []string{"GitHub login", "branch - Branch name", "repo (required) - Repository", "/answer rpc-elicit-1 question_id=answer"} {
+		if !strings.Contains(request.PlanText, want) {
+			t.Fatalf("MCP form elicitation prompt missing %q: %#v", want, request)
+		}
+	}
+}
+
+func TestMCPFormAnswerUsesSchemaFields(t *testing.T) {
+	pending := &pendingServerRequest{
+		Method:      "mcpServer/elicitation/request",
+		QuestionIDs: []string{"branch", "repo"},
+	}
+	got, err := answerResponse(pending, `repo=codex-bridge branch="metadata sync"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{"repo": "codex-bridge", "branch": "metadata sync"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected MCP form answer:\n got: %#v\nwant: %#v", got, want)
+	}
+
+	pending.QuestionIDs = []string{"repo"}
+	got, err = answerResponse(pending, "codex-bridge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = map[string]string{"repo": "codex-bridge"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected single-field MCP form answer:\n got: %#v\nwant: %#v", got, want)
+	}
+
+	pending.QuestionIDs = nil
+	got, err = answerResponse(pending, "plain answer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, map[string]any{"answer": "plain answer"}) {
+		t.Fatalf("unexpected schema-less MCP answer: %#v", got)
+	}
+
+	pending.QuestionIDs = []string{"branch", "repo"}
+	if _, err = answerResponse(pending, "codex-bridge"); err == nil {
+		t.Fatal("multiple MCP form fields should require assignment syntax")
+	}
+}
+
+func TestMCPFormCodexInputResponseWrapsContent(t *testing.T) {
+	pending := &pendingServerRequest{Method: "mcpServer/elicitation/request"}
+	content := map[string]string{"repo": "codex-bridge"}
+	got := codexInputResponse(pending, content).(map[string]any)
+	if got["action"] != "accept" || !reflect.DeepEqual(got["content"], content) {
+		t.Fatalf("unexpected MCP elicitation response: %#v", got)
+	}
+}
+func TestNewInputRequestIncludesMCPURLElicitationContext(t *testing.T) {
+	run := &activeRun{turnID: "turn-1"}
+	pending, request, err := run.newInputRequest("mcpServer/elicitation/request", "rpc-elicit-1", []byte(`{
+		"threadId": "thread-1",
+		"turnId": "turn-1",
+		"serverName": "github",
+		"mode": "url",
+		"message": "Authorize GitHub",
+		"url": "https://github.com/login/device",
+		"elicitationId": "github-device"
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.ID != "github-device" || request.ID != "github-device" {
+		t.Fatalf("MCP URL elicitation should prefer elicitation ID: pending=%#v request=%#v", pending, request)
+	}
+	for _, want := range []string{"Authorize GitHub", "URL: https://github.com/login/device", "/answer github-device <answer>"} {
+		if !strings.Contains(request.PlanText, want) {
+			t.Fatalf("MCP URL elicitation prompt missing %q: %#v", want, request)
+		}
+	}
+}
+
+func TestNewInputRequestPrefersCodexItemID(t *testing.T) {
+	run := &activeRun{turnID: "turn-1"}
+	pending, request, err := run.newInputRequest("item/tool/requestUserInput", "rpc-input", []byte(`{
+		"threadId": "thread-1",
+		"turnId": "turn-1",
+		"itemId": "input-item",
+		"questions": [{"id":"path","question":"Path?"}]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.ID != "input-item" || request.ID != "input-item" {
+		t.Fatalf("tool input request should prefer Codex item ID: pending=%#v request=%#v", pending, request)
 	}
 }

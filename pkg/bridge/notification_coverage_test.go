@@ -18,6 +18,8 @@ const codexTypeScriptNotificationPath = "/Users/batuhan/projects/codex/codex-rs/
 const codexTypeScriptServerRequestPath = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/typescript/ServerRequest.ts"
 const codexJSONNotificationPath = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/json/ServerNotification.json"
 const codexJSONServerRequestPath = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/json/ServerRequest.json"
+const codexTypeScriptResponseItemPath = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/typescript/ResponseItem.ts"
+const codexTypeScriptV2NotificationDir = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/typescript/v2"
 const codexTypeScriptV2ThreadItemPath = "/Users/batuhan/projects/codex/codex-rs/app-server-protocol/schema/typescript/v2/ThreadItem.ts"
 
 func TestClientFillsBridgeStateWithCodexGlobalState(t *testing.T) {
@@ -49,6 +51,30 @@ func TestGlobalCodexNotificationsBroadcastBridgeState(t *testing.T) {
 			method:    "account/rateLimits/updated",
 			params:    `{"marker":"rate-limits","rateLimits":{"planType":"plus"}}`,
 			wantState: status.StateConnected,
+		},
+		{
+			method:    "mcpServer/startupStatus/updated",
+			params:    `{"marker":"mcp-startup","name":"github","status":"failed","error":"not logged in"}`,
+			wantState: status.StateConnected,
+			wantMsg:   "github failed to start: not logged in",
+		},
+		{
+			method:    "mcpServer/oauthLogin/completed",
+			params:    `{"marker":"mcp-oauth","name":"github","success":false,"error":"browser closed"}`,
+			wantState: status.StateConnected,
+			wantMsg:   "github OAuth login failed: browser closed",
+		},
+		{
+			method:    "windows/worldWritableWarning",
+			params:    `{"marker":"windows-world-writable","samplePaths":["C:\\tmp","D:\\work"],"extraCount":2,"failedScan":true}`,
+			wantState: status.StateConnected,
+			wantMsg:   "C:\\tmp",
+		},
+		{
+			method:    "windowsSandbox/setupCompleted",
+			params:    `{"marker":"windows-sandbox","mode":"wsl","success":false,"error":"missing kernel"}`,
+			wantState: status.StateConnected,
+			wantMsg:   "Windows sandbox wsl setup failed: missing kernel",
 		},
 		{
 			method:    "configWarning",
@@ -212,6 +238,17 @@ func TestCurrentCodexServerNotificationsMatchGeneratedSchemas(t *testing.T) {
 	assertStringSetEqual(t, currentCodexServerNotifications, generatedTypeScriptMethods(t, codexTypeScriptNotificationPath), "TypeScript")
 }
 
+func TestTypeScriptV2NotificationFilesAreInServerNotificationUnion(t *testing.T) {
+	files := generatedTypeScriptV2NotificationTypes(t)
+	imports := generatedTypeScriptV2NotificationImports(t)
+	params := generatedTypeScriptNotificationParamTypes(t)
+	if len(files) == 0 {
+		t.Fatal("TypeScript v2 schema did not contain notification files")
+	}
+	assertStringSetEqual(t, imports, files, "TypeScript v2 notification files")
+	assertStringSetContains(t, params, imports, "TypeScript server notification union")
+}
+
 func TestTypeScriptCodexThreadNotificationsHaveDispatchLane(t *testing.T) {
 	methods := generatedTypeScriptMethods(t, codexTypeScriptNotificationPath)
 	if len(methods) == 0 {
@@ -250,6 +287,15 @@ func TestJSONCodexThreadNotificationsHaveDispatchLane(t *testing.T) {
 		}
 		if !isThreadMetadataNotification(method) && !isThreadNoticeNotification(method) && !isActiveRunNotification(method) {
 			t.Fatalf("JSON Codex thread notification %q has no metadata, notice, or active-run dispatch lane", method)
+		}
+	}
+}
+
+func TestTypeScriptRawResponseCompactionItemsAreMapped(t *testing.T) {
+	itemTypes := generatedTypeScriptResponseItemTypes(t)
+	for _, itemType := range itemTypes {
+		if strings.Contains(itemType, "compaction") && !isRawResponseCompactionItem(itemType) {
+			t.Fatalf("raw response compaction item %q is not mapped to a user-visible notice", itemType)
 		}
 	}
 }
@@ -331,6 +377,34 @@ func generatedJSONMethods(t *testing.T, path string) []string {
 	return methods
 }
 
+func generatedTypeScriptResponseItemTypes(t *testing.T) []string {
+	t.Helper()
+	raw, err := os.ReadFile(codexTypeScriptResponseItemPath)
+	if err != nil {
+		t.Fatalf("read generated Codex TypeScript response item schema: %v", err)
+	}
+	re := regexp.MustCompile(`"type":\s*"([^"]+)"`)
+	seen := map[string]bool{}
+	for _, match := range re.FindAllSubmatch(raw, -1) {
+		seen[string(match[1])] = true
+	}
+	types := make([]string, 0, len(seen))
+	for itemType := range seen {
+		types = append(types, itemType)
+	}
+	sort.Strings(types)
+	return types
+}
+
+func isRawResponseCompactionItem(itemType string) bool {
+	switch itemType {
+	case "compaction", "compaction_trigger", "context_compaction":
+		return true
+	default:
+		return false
+	}
+}
+
 func generatedTypeScriptMethods(t *testing.T, path string) []string {
 	t.Helper()
 	raw, err := os.ReadFile(path)
@@ -348,6 +422,57 @@ func generatedTypeScriptMethods(t *testing.T, path string) []string {
 	}
 	sort.Strings(methods)
 	return methods
+}
+
+func generatedTypeScriptV2NotificationTypes(t *testing.T) []string {
+	t.Helper()
+	entries, err := os.ReadDir(codexTypeScriptV2NotificationDir)
+	if err != nil {
+		t.Fatalf("read generated Codex TypeScript v2 schema dir: %v", err)
+	}
+	types := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, "Notification.ts") {
+			continue
+		}
+		types = append(types, strings.TrimSuffix(name, ".ts"))
+	}
+	sort.Strings(types)
+	return types
+}
+
+func generatedTypeScriptV2NotificationImports(t *testing.T) []string {
+	t.Helper()
+	raw, err := os.ReadFile(codexTypeScriptNotificationPath)
+	if err != nil {
+		t.Fatalf("read generated Codex TypeScript schema: %v", err)
+	}
+	re := regexp.MustCompile(`import type \{ ([A-Za-z0-9_]+Notification) \} from "\./v2/[A-Za-z0-9_]+Notification";`)
+	return sortedUniqueMatches(re, raw)
+}
+
+func generatedTypeScriptNotificationParamTypes(t *testing.T) []string {
+	t.Helper()
+	raw, err := os.ReadFile(codexTypeScriptNotificationPath)
+	if err != nil {
+		t.Fatalf("read generated Codex TypeScript schema: %v", err)
+	}
+	re := regexp.MustCompile(`"params":\s*([A-Za-z0-9_]+Notification)`)
+	return sortedUniqueMatches(re, raw)
+}
+
+func sortedUniqueMatches(re *regexp.Regexp, raw []byte) []string {
+	seen := map[string]bool{}
+	for _, match := range re.FindAllSubmatch(raw, -1) {
+		seen[string(match[1])] = true
+	}
+	values := make([]string, 0, len(seen))
+	for value := range seen {
+		values = append(values, value)
+	}
+	sort.Strings(values)
+	return values
 }
 
 func assertStringSetEqual(t *testing.T, got, want []string, label string) {
@@ -374,7 +499,25 @@ func assertStringSetEqual(t *testing.T, got, want []string, label string) {
 	sort.Strings(missing)
 	sort.Strings(extra)
 	if len(missing) > 0 || len(extra) > 0 {
-		t.Fatalf("current Codex notification list differs from %s schema: missing=%v extra=%v", label, missing, extra)
+		t.Fatalf("string set differs from %s: missing=%v extra=%v", label, missing, extra)
+	}
+}
+
+func assertStringSetContains(t *testing.T, got, want []string, label string) {
+	t.Helper()
+	gotSet := map[string]bool{}
+	for _, value := range got {
+		gotSet[value] = true
+	}
+	var missing []string
+	for _, value := range want {
+		if !gotSet[value] {
+			missing = append(missing, value)
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Fatalf("%s is missing values: %v", label, missing)
 	}
 }
 

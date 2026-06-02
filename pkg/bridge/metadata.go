@@ -17,9 +17,10 @@ const (
 )
 
 type PortalMetadata struct {
-	ThreadID        string `json:"thread_id,omitempty"`
-	Cwd             string `json:"cwd,omitempty"`
-	BackfillVersion int    `json:"backfill_version,omitempty"`
+	ThreadID               string `json:"thread_id,omitempty"`
+	Cwd                    string `json:"cwd,omitempty"`
+	BackfillVersion        int    `json:"backfill_version,omitempty"`
+	NewProjectIntroMessage bool   `json:"new_project_intro_message,omitempty"`
 }
 
 type MessageMetadata struct {

@@ -15,6 +15,12 @@ func matrixMessageStatusForCodexError(err error) bridgev2.MessageStatus {
 	if status.InternalError == nil {
 		status.InternalError = err
 	}
+	if status.Status != "" && status.IsCertain && !status.SendNotice {
+		if status.Message == "" {
+			status.Message = err.Error()
+		}
+		return status
+	}
 	if status.Status != "" && status.ErrorReason != event.MessageStatusGenericError {
 		return status
 	}

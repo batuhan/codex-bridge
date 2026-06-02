@@ -4,12 +4,15 @@ import (
 	"bufio"
 	"encoding/json"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 const fakeAppServerEnv = "CODEX_BRIDGE_FAKE_APPSERVER"
 const fakeAppServerLogEnv = "CODEX_BRIDGE_FAKE_APPSERVER_LOG"
+const fakeAppServerDelayEnv = "CODEX_BRIDGE_FAKE_APPSERVER_DELAY_MS"
 
 func TestMain(m *testing.M) {
 	if os.Getenv(fakeAppServerEnv) == "1" {
@@ -43,10 +46,19 @@ func runFakeAppServer() {
 		} else {
 			resp.Result = fakeAppServerResult(msg.Method, msg.Params)
 		}
+		delayFakeAppServerResponse()
 		raw, _ := json.Marshal(resp)
 		_, _ = writer.Write(append(raw, '\n'))
 		_ = writer.Flush()
 	}
+}
+
+func delayFakeAppServerResponse() {
+	delay, err := strconv.Atoi(os.Getenv(fakeAppServerDelayEnv))
+	if err != nil || delay <= 0 {
+		return
+	}
+	time.Sleep(time.Duration(delay) * time.Millisecond)
 }
 
 func appendFakeAppServerRequest(method string, params json.RawMessage) {
@@ -163,6 +175,16 @@ func findFakeAppServerRequest(requests []fakeAppServerRequest, method string) (f
 		}
 	}
 	return fakeAppServerRequest{}, false
+}
+
+func countFakeAppServerRequests(requests []fakeAppServerRequest, method string) int {
+	count := 0
+	for _, req := range requests {
+		if req.Method == method {
+			count++
+		}
+	}
+	return count
 }
 
 func fakeAppServerInputText(params map[string]any) string {

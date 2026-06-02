@@ -38,7 +38,7 @@ type pendingServerRequest struct {
 func (r *activeRun) handleServerRequest(ctx context.Context, msg appserver.Message) (any, error) {
 	switch msg.Method {
 	case "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval", "applyPatchApproval", "execCommandApproval":
-		pending, request, err := r.newApprovalRequest(msg.Method, msg.Params)
+		pending, request, err := r.newApprovalRequest(msg.Method, serverRequestID(msg.ID), msg.Params)
 		if err != nil {
 			return nil, err
 		}
@@ -52,7 +52,7 @@ func (r *activeRun) handleServerRequest(ctx context.Context, msg appserver.Messa
 		}
 		return codexApprovalResponse(pending, approval), nil
 	case "item/tool/requestUserInput", "mcpServer/elicitation/request":
-		pending, request, err := r.newInputRequest(msg.Method, msg.Params)
+		pending, request, err := r.newInputRequest(msg.Method, serverRequestID(msg.ID), msg.Params)
 		if err != nil {
 			return nil, err
 		}
@@ -64,7 +64,7 @@ func (r *activeRun) handleServerRequest(ctx context.Context, msg appserver.Messa
 	case "item/tool/call":
 		payload := rawPayload(msg.Params)
 		r.mu.Lock()
-		r.writer.Custom(msg.Method, payload)
+		r.writeCustom(msg.Method, payload)
 		r.publishLocked()
 		r.mu.Unlock()
 		return map[string]any{
@@ -76,6 +76,29 @@ func (r *activeRun) handleServerRequest(ctx context.Context, msg appserver.Messa
 		}, nil
 	default:
 		return nil, fmt.Errorf("unsupported Codex server request %s", msg.Method)
+	}
+}
+
+func serverRequestID(id any) string {
+	switch value := id.(type) {
+	case string:
+		return strings.TrimSpace(value)
+	case json.Number:
+		return value.String()
+	case float64:
+		if value == float64(int64(value)) {
+			return fmt.Sprintf("%d", int64(value))
+		}
+		return fmt.Sprintf("%v", value)
+	case int:
+		return fmt.Sprintf("%d", value)
+	case int64:
+		return fmt.Sprintf("%d", value)
+	default:
+		if id == nil {
+			return ""
+		}
+		return strings.TrimSpace(fmt.Sprint(id))
 	}
 }
 
@@ -126,7 +149,7 @@ func (r *activeRun) waitForServerRequest(ctx context.Context, pending *pendingSe
 	r.pending[pending.ID] = pending
 	r.writer.ToolApprovalRequestedWithRequest(request)
 	r.writer.InterruptWithUsage(nil)
-	r.writer.Custom("codex/serverRequest", map[string]any{
+	r.writeCustom("codex/serverRequest", map[string]any{
 		"method": msgMethod(request),
 		"id":     pending.ID,
 		"input":  pending.Input,
@@ -216,9 +239,12 @@ func (r *activeRun) approvalPromptMessage(ctxMeta aistream.ApprovalContext, ts t
 	}
 }
 
-func (r *activeRun) newApprovalRequest(method string, raw json.RawMessage) (*pendingServerRequest, aistream.ApprovalRequest, error) {
+func (r *activeRun) newApprovalRequest(method, fallbackID string, raw json.RawMessage) (*pendingServerRequest, aistream.ApprovalRequest, error) {
 	input := rawPayload(raw)
 	approvalID := firstString(input, "approvalId", "itemId", "callId")
+	if approvalID == "" {
+		approvalID = strings.TrimSpace(fallbackID)
+	}
 	if approvalID == "" {
 		approvalID = method + ":" + r.turnID
 	}
@@ -257,13 +283,19 @@ func (r *activeRun) newApprovalRequest(method string, raw json.RawMessage) (*pen
 	return pending, request, nil
 }
 
-func (r *activeRun) newInputRequest(method string, raw json.RawMessage) (*pendingServerRequest, aistream.ApprovalRequest, error) {
+func (r *activeRun) newInputRequest(method, fallbackID string, raw json.RawMessage) (*pendingServerRequest, aistream.ApprovalRequest, error) {
 	input := rawPayload(raw)
 	requestID := firstString(input, "itemId", "elicitationId", "requestId")
+	if requestID == "" {
+		requestID = strings.TrimSpace(fallbackID)
+	}
 	if requestID == "" {
 		requestID = method + ":" + r.turnID
 	}
 	questions := questionIDs(input)
+	if method == "mcpServer/elicitation/request" && len(questions) == 0 {
+		questions = mcpElicitationFieldIDs(input)
+	}
 	title := "Input requested"
 	if method == "mcpServer/elicitation/request" {
 		title = "MCP input requested"
@@ -280,16 +312,14 @@ func (r *activeRun) newInputRequest(method string, raw json.RawMessage) (*pendin
 		QuestionIDs: questions,
 		Response:    make(chan any, 1),
 	}
-	plan := "Reply with /answer " + requestID + " <answer>."
-	if len(questions) > 1 {
-		plan = "Reply with /answer " + requestID + " question_id=answer ..."
-	}
+	description := inputDescription(input)
+	plan := inputPlan(requestID, questions, description)
 	request := aistream.ApprovalRequest{
 		ID:          requestID,
 		ToolCallID:  requestID,
 		ToolName:    pending.ToolName,
 		Title:       title,
-		Description: inputDescription(input),
+		Description: description,
 		PlanText:    plan,
 		Input:       input,
 		Approval:    aistream.ToolApproval{ID: requestID, NeedsApproval: true},
@@ -378,35 +408,39 @@ func (cl *Client) handleBridgeCommand(ctx context.Context, msg *bridgev2.MatrixM
 	}
 	meta := portalMetadata(msg.Portal.Metadata)
 	if meta.ThreadID == "" {
-		if command.name == "approvals" || command.name == "stop" {
-			cl.queueCommandNotice(msg.Portal, "", "No Codex session is active in this room.")
-			return cl.commandHandledResponse(msg, "no_session"), true, nil
-		}
-		return nil, true, fmt.Errorf("no Codex session is active in this room")
+		cl.queueCommandNotice(msg.Portal, "", "No Codex session is active in this room.")
+		return cl.commandHandledResponse(msg, "no_session"), true, nil
 	}
-	active := cl.Main.activeRun(meta.ThreadID)
+	var active *activeRun
+	if cl != nil && cl.Main != nil {
+		active = cl.Main.activeRun(meta.ThreadID)
+	}
 	switch command.name {
 	case "approvals":
-		text := "No pending approvals."
+		text := "No pending Codex requests."
 		if active != nil {
-			text = active.pendingApprovalsText()
+			text = active.pendingRequestsText()
 		}
 		cl.queueCommandNotice(msg.Portal, meta.ThreadID, text)
 		return cl.commandHandledResponse(msg, "approvals"), true, nil
 	case "approve":
 		if active == nil {
-			return nil, true, fmt.Errorf("no Codex turn is waiting for a response")
+			cl.queueCommandNotice(msg.Portal, meta.ThreadID, "No Codex turn is waiting for an approval.")
+			return cl.commandHandledResponse(msg, "no_pending_approval"), true, nil
 		}
 		if !active.resolveApprovalCommand(command.arg) {
-			return nil, true, fmt.Errorf("approval was not pending or the response was invalid")
+			cl.queueCommandNotice(msg.Portal, meta.ThreadID, "That approval was not pending, or the response was invalid.\n\nUse `/approvals` to list pending Codex requests.")
+			return cl.commandHandledResponse(msg, "invalid_approval"), true, nil
 		}
 		return cl.commandHandledResponse(msg, "approve"), true, nil
 	case "answer":
 		if active == nil {
-			return nil, true, fmt.Errorf("no Codex turn is waiting for a response")
+			cl.queueCommandNotice(msg.Portal, meta.ThreadID, "No Codex turn is waiting for input.")
+			return cl.commandHandledResponse(msg, "no_pending_input"), true, nil
 		}
 		if !active.resolveAnswerCommand(command.arg) {
-			return nil, true, fmt.Errorf("request was not pending or the response was invalid")
+			cl.queueCommandNotice(msg.Portal, meta.ThreadID, "That input request was not pending, or the response was invalid.\n\nUse `/approvals` to list pending Codex requests.")
+			return cl.commandHandledResponse(msg, "invalid_answer"), true, nil
 		}
 		return cl.commandHandledResponse(msg, "answer"), true, nil
 	case "stop":
@@ -422,11 +456,16 @@ func (cl *Client) handleBridgeCommand(ctx context.Context, msg *bridgev2.MatrixM
 }
 
 func (r *activeRun) resolveApprovalCommand(args string) bool {
-	approvalID, rawChoice, ok := strings.Cut(args, " ")
-	if !ok {
+	approvalID, rawChoice, _ := strings.Cut(strings.TrimSpace(args), " ")
+	approvalID = strings.TrimSpace(approvalID)
+	if approvalID == "" {
 		return false
 	}
-	response, ok := approvalResponseFromCommand(strings.TrimSpace(approvalID), strings.TrimSpace(rawChoice))
+	rawChoice = strings.TrimSpace(rawChoice)
+	if rawChoice == "" {
+		rawChoice = "approve"
+	}
+	response, ok := approvalResponseFromCommand(approvalID, rawChoice)
 	if !ok {
 		return false
 	}
@@ -492,35 +531,59 @@ func canonicalCodexCommandName(name string) string {
 	}
 }
 
-func (r *activeRun) pendingApprovalsText() string {
+func (r *activeRun) pendingRequestsText() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	ids := make([]string, 0, len(r.pending))
 	for id, pending := range r.pending {
-		if isApprovalRequestMethod(pending.Method) {
+		if pending != nil {
 			ids = append(ids, id)
 		}
 	}
 	sort.Strings(ids)
 	if len(ids) == 0 {
-		return "No pending approvals."
+		return "No pending Codex requests."
 	}
-	out := []string{"Pending approvals:"}
+	out := []string{"Pending Codex requests:"}
 	for _, id := range ids {
 		pending := r.pending[id]
-		out = append(out, "", "### "+id, approvalTitle(pending.Method, pending.Input))
-		if plan := approvalPlan(pending.Method, pending.Input); plan != "" {
-			out = append(out, "", plan)
+		if isApprovalRequestMethod(pending.Method) {
+			out = append(out, "", "### "+id, approvalTitle(pending.Method, pending.Input))
+			if plan := approvalPlan(pending.Method, pending.Input); plan != "" {
+				out = append(out, "", plan)
+			}
+			out = append(out,
+				"",
+				"Respond with one of:",
+				"- `/approve "+id+" approve`",
+				"- `/approve "+id+" always`",
+				"- `/approve "+id+" deny`",
+			)
+			continue
 		}
-		out = append(out,
-			"",
-			"Respond with one of:",
-			"- `/approve "+id+" approve`",
-			"- `/approve "+id+" always`",
-			"- `/approve "+id+" deny`",
-		)
+		out = append(out, "", "### "+id, pendingRequestTitle(pending), pendingRequestPlan(pending))
 	}
 	return strings.Join(out, "\n")
+}
+
+func pendingRequestTitle(pending *pendingServerRequest) string {
+	if pending == nil {
+		return "Input requested"
+	}
+	if message := firstString(pending.Input, "message"); message != "" {
+		return message
+	}
+	if pending.ToolName != "" {
+		return "Input requested by " + pending.ToolName
+	}
+	return "Input requested"
+}
+
+func pendingRequestPlan(pending *pendingServerRequest) string {
+	if pending == nil || pending.ID == "" {
+		return "Respond with `/answer <id> <answer>`."
+	}
+	return inputPlan(pending.ID, pending.QuestionIDs, inputDescription(pending.Input))
 }
 
 func isApprovalRequestMethod(method string) bool {
@@ -654,13 +717,27 @@ func answerResponse(pending *pendingServerRequest, raw string) (any, error) {
 		if json.Unmarshal([]byte(raw), &decoded) == nil {
 			return decoded, nil
 		}
+		if len(pending.QuestionIDs) > 0 {
+			return namedAnswerValues(pending.QuestionIDs, raw)
+		}
 		return map[string]any{"answer": raw}, nil
 	}
 	ids := pending.QuestionIDs
 	if len(ids) == 0 {
 		ids = []string{"answer"}
 	}
+	values, err := namedAnswerValues(ids, raw)
+	if err != nil {
+		return nil, err
+	}
 	answers := map[string]any{}
+	for key, value := range values {
+		answers[key] = map[string]any{"answers": []string{value}}
+	}
+	return answers, nil
+}
+
+func namedAnswerValues(ids []string, raw string) (map[string]string, error) {
 	fields := strings.Fields(raw)
 	hasAssignments := false
 	for _, field := range fields {
@@ -673,17 +750,9 @@ func answerResponse(pending *pendingServerRequest, raw string) (any, error) {
 		if len(ids) > 1 {
 			return nil, fmt.Errorf("multiple answers require question_id=value syntax")
 		}
-		answers[ids[0]] = map[string]any{"answers": []string{raw}}
-		return answers, nil
+		return map[string]string{ids[0]: raw}, nil
 	}
-	assignments, err := parseAnswerAssignments(raw)
-	if err != nil {
-		return nil, err
-	}
-	for key, value := range assignments {
-		answers[key] = map[string]any{"answers": []string{value}}
-	}
-	return answers, nil
+	return parseAnswerAssignments(raw)
 }
 
 func parseAnswerAssignments(raw string) (map[string]string, error) {
@@ -852,8 +921,17 @@ func approvalPlan(method string, input map[string]any) string {
 }
 
 func inputDescription(input map[string]any) string {
+	var lines []string
+	if message := firstString(input, "message"); message != "" {
+		lines = append(lines, message)
+	}
+	if url := firstString(input, "url"); url != "" {
+		lines = append(lines, "URL: "+url)
+	}
+	if fields := mcpElicitationFields(input); len(fields) > 0 {
+		lines = append(lines, "Fields: "+strings.Join(fields, ", "))
+	}
 	if qs, ok := input["questions"].([]any); ok && len(qs) > 0 {
-		var lines []string
 		for _, raw := range qs {
 			q, _ := raw.(map[string]any)
 			header := firstString(q, "header")
@@ -863,9 +941,72 @@ func inputDescription(input map[string]any) string {
 				lines = append(lines, line)
 			}
 		}
-		return strings.Join(lines, "\n")
 	}
-	return firstString(input, "message")
+	return strings.Join(lines, "\n")
+}
+
+func mcpElicitationFieldIDs(input map[string]any) []string {
+	fields := mcpElicitationFields(input)
+	out := make([]string, 0, len(fields))
+	for _, field := range fields {
+		name, _, _ := strings.Cut(field, " ")
+		if name != "" {
+			out = append(out, name)
+		}
+	}
+	return out
+}
+
+func mcpElicitationFields(input map[string]any) []string {
+	schema, _ := input["requestedSchema"].(map[string]any)
+	properties, _ := schema["properties"].(map[string]any)
+	if len(properties) == 0 {
+		return nil
+	}
+	required := map[string]bool{}
+	for _, raw := range anySlice(schema["required"]) {
+		if name, _ := raw.(string); strings.TrimSpace(name) != "" {
+			required[strings.TrimSpace(name)] = true
+		}
+	}
+	fields := make([]string, 0, len(properties))
+	for name, raw := range properties {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		descriptor := name
+		prop, _ := raw.(map[string]any)
+		if required[name] {
+			descriptor += " (required)"
+		}
+		if title := firstString(prop, "title"); title != "" {
+			descriptor += " - " + title
+		} else if description := firstString(prop, "description"); description != "" {
+			descriptor += " - " + description
+		}
+		fields = append(fields, descriptor)
+	}
+	sort.Strings(fields)
+	return fields
+}
+
+func anySlice(value any) []any {
+	items, _ := value.([]any)
+	return items
+}
+
+func inputPlan(requestID string, questionIDs []string, description string) string {
+	var lines []string
+	if description = strings.TrimSpace(description); description != "" {
+		lines = append(lines, description, "")
+	}
+	if len(questionIDs) > 1 {
+		lines = append(lines, "Reply with `/answer "+requestID+" question_id=answer ...`.")
+	} else {
+		lines = append(lines, "Reply with `/answer "+requestID+" <answer>`.")
+	}
+	return strings.Join(lines, "\n")
 }
 
 func firstString(values map[string]any, keys ...string) string {

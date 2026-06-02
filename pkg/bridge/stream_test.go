@@ -3,6 +3,10 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -13,6 +17,8 @@ import (
 	"github.com/beeper/ai-bridge/pkg/aidb"
 	"github.com/beeper/ai-bridge/pkg/aiid"
 	"github.com/rs/zerolog"
+	"maunium.net/go/mautrix"
+	"maunium.net/go/mautrix/beeperstream"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
 	"maunium.net/go/mautrix/bridgev2/database"
@@ -232,6 +238,60 @@ func TestCodexFinalStreamEditClearsBeeperStream(t *testing.T) {
 	}
 }
 
+func TestCodexFinalStreamEditUploadsOversizedPartsAndClearsStream(t *testing.T) {
+	run := aistream.NewRun("run-1", "thread-1", aistream.DefaultModel, "codex", "Codex", time.Unix(10, 0))
+	run.MessageID = "msg-run-1"
+	writer := aistream.NewWriter(run, func() time.Time { return time.Unix(10, 0) })
+	writer.Start()
+	writer.ToolStart("tool-1", "read", 0, nil)
+	writer.ToolEnd("tool-1", "read", nil, map[string]any{"content": strings.Repeat("x", aistream.FinalMessageBudgetBytes)})
+	writer.Text("done")
+	writer.Finish(agui.FinishReasonStop)
+	intent := &recordingMediaIntent{}
+	existing := &database.Message{Metadata: &MessageMetadata{Role: "assistant", ThreadID: "thread-1", TurnID: "turn-1", StreamStatus: "streaming"}}
+	edit := codexFinalStreamEdit(
+		networkid.PortalKey{ID: "portal-1"},
+		networkid.MessageID(run.MessageID),
+		*run,
+		run.ThreadID,
+		run.RunID,
+		time.Unix(11, 0),
+	)
+
+	converted, err := edit.ConvertEditFunc(
+		context.Background(),
+		&bridgev2.Portal{Portal: &database.Portal{MXID: "!room:example.com"}},
+		intent,
+		[]*database.Message{existing},
+		edit.Data,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	part := converted.ModifiedParts[0]
+	assertCodexProfile(t, part.Content)
+	if stream, ok := part.Extra["com.beeper.stream"]; !ok || stream != nil {
+		t.Fatalf("final edit must clear stream in m.new_content: %#v", part.Extra)
+	}
+	if stream, ok := part.TopLevelExtra["com.beeper.stream"]; !ok || stream != nil {
+		t.Fatalf("final edit must clear stream at top level: %#v", part.TopLevelExtra)
+	}
+	if intent.roomID != "!room:example.com" || intent.mimeType != aistream.FinalPartsMediaType || len(intent.data) == 0 {
+		t.Fatalf("final edit did not upload oversized parts correctly: room=%q mime=%q bytes=%d", intent.roomID, intent.mimeType, len(intent.data))
+	}
+	ai, ok := part.Extra[aistream.BeeperAIKey].(aistream.BeeperAI)
+	if !ok || ai.Final == nil || ai.Final.Delivery != "attachment" || ai.Final.PartsComplete || ai.Final.PartsRef == nil || ai.Final.PartsRef.URL != string(intent.url) {
+		t.Fatalf("final edit did not advertise uploaded final parts: %#v", part.Extra[aistream.BeeperAIKey])
+	}
+	if ai.Message == nil || len(ai.Message.Parts) != 0 {
+		t.Fatalf("final edit should remove oversized inline parts: %#v", ai.Message)
+	}
+	meta, ok := existing.Metadata.(*MessageMetadata)
+	if !ok || meta.StreamStatus != "complete" || meta.ThreadID != run.ThreadID || meta.TurnID != run.RunID {
+		t.Fatalf("final edit did not update DB metadata: %#v", existing.Metadata)
+	}
+}
+
 func TestOutputDelta(t *testing.T) {
 	itemID, delta := outputDelta([]byte(`{"itemId":"item-1","delta":"hello"}`))
 	if itemID != "item-1" || delta != "hello" {
@@ -254,14 +314,20 @@ func TestReasoningTextDeltaUsesContentIndex(t *testing.T) {
 	run.handle("item/reasoning/textDelta", []byte(`{"threadId":"thread-1","turnId":"turn-1","itemId":"reason-1","contentIndex":0,"delta":"first"}`))
 	run.handle("item/reasoning/textDelta", []byte(`{"threadId":"thread-1","turnId":"turn-1","itemId":"reason-1","contentIndex":1,"delta":"second"}`))
 
-	ids := map[string]bool{}
-	for _, event := range run.run.Events {
-		if event.Type() == agui.EventReasoningMsgStart {
-			ids[event.String("messageId")] = true
-		}
-	}
+	ids := distinctReasoningMessageIDs(run.run.Events)
 	if len(ids) != 2 {
 		t.Fatalf("expected two reasoning messages for two content indexes, got %#v", ids)
+	}
+}
+
+func TestReasoningTextDeltaDoesNotHashCollidingItemIDsTogether(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.handle("item/reasoning/textDelta", []byte(`{"threadId":"thread-1","turnId":"turn-1","itemId":"a","contentIndex":0,"delta":"first"}`))
+	run.handle("item/reasoning/textDelta", []byte(`{"threadId":"thread-1","turnId":"turn-1","itemId":"A","contentIndex":0,"delta":"second"}`))
+
+	ids := distinctReasoningMessageIDs(run.run.Events)
+	if len(ids) != 2 {
+		t.Fatalf("distinct reasoning item IDs should create distinct thinking parts, got %#v events=%#v", ids, run.run.Events)
 	}
 }
 
@@ -296,7 +362,7 @@ func TestStreamMapsRichCodexNotifications(t *testing.T) {
 	}
 }
 
-func TestSemanticDeltasPreserveRawCodexCustomEvents(t *testing.T) {
+func TestSemanticDeltasMapToChatWithoutRawCodexCustomEvents(t *testing.T) {
 	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
 	run.handle("item/agentMessage/delta", []byte(`{"threadId":"thread-1","turnId":"turn-1","itemId":"msg-1","delta":"hello"}`))
 	run.handle("item/reasoning/textDelta", []byte(`{"threadId":"thread-1","turnId":"turn-1","itemId":"reason-1","contentIndex":0,"delta":"thinking"}`))
@@ -311,14 +377,14 @@ func TestSemanticDeltasPreserveRawCodexCustomEvents(t *testing.T) {
 	if countReasoningDelta(run.run.Events, "thinking") != 1 {
 		t.Fatalf("reasoning delta did not map to AG-UI reasoning: %#v", run.run.Events)
 	}
-	if !hasCustomPayloadText(run.run.Events, "item/agentMessage/delta", "delta", "hello") {
-		t.Fatalf("agent message raw delta was not preserved as custom event: %#v", run.run.Events)
+	if hasCustomPayloadText(run.run.Events, "item/agentMessage/delta", "delta", "hello") {
+		t.Fatalf("agent message raw delta should not be bridged as custom event: %#v", run.run.Events)
 	}
-	if !hasCustomPayloadText(run.run.Events, "item/reasoning/textDelta", "delta", "thinking") {
-		t.Fatalf("reasoning raw delta was not preserved as custom event: %#v", run.run.Events)
+	if hasCustomPayloadText(run.run.Events, "item/reasoning/textDelta", "delta", "thinking") {
+		t.Fatalf("reasoning raw delta should not be bridged as custom event: %#v", run.run.Events)
 	}
-	if !hasCustomPayloadText(run.run.Events, "thread/realtime/transcript/delta", "delta", "live") {
-		t.Fatalf("realtime raw delta was not preserved as custom event: %#v", run.run.Events)
+	if hasCustomPayloadText(run.run.Events, "thread/realtime/transcript/delta", "delta", "live") {
+		t.Fatalf("realtime raw delta should not be bridged as custom event: %#v", run.run.Events)
 	}
 }
 
@@ -336,7 +402,7 @@ func TestTurnStartedDoesNotCreateVisibleThinkingPart(t *testing.T) {
 	}
 }
 
-func TestActiveRunNotificationsPreserveRawCodexCustomEvents(t *testing.T) {
+func TestActiveRunNotificationsDoNotBridgeRawCodexCustomEvents(t *testing.T) {
 	for _, method := range generatedTypeScriptMethods(t, codexTypeScriptNotificationPath) {
 		if !isActiveRunNotification(method) || method == "turn/completed" {
 			continue
@@ -354,14 +420,14 @@ func TestActiveRunNotificationsPreserveRawCodexCustomEvents(t *testing.T) {
 			}
 
 			run.handle(method, raw)
-			if !hasCustomPayloadText(run.run.Events, method, "marker", "raw-"+method) {
-				t.Fatalf("%s did not preserve raw Codex payload as AG-UI custom event: %#v", method, run.run.Events)
+			if hasCustomPayloadText(run.run.Events, method, "marker", "raw-"+method) {
+				t.Fatalf("%s should not bridge raw Codex payload as AG-UI custom event: %#v", method, run.run.Events)
 			}
 		})
 	}
 }
 
-func TestTurnCompletedPreservesRawCodexCustomEvent(t *testing.T) {
+func TestTurnCompletedDoesNotBridgeRawCodexCustomEvent(t *testing.T) {
 	ctx := context.Background()
 	publisher := &recordingBeeperStreamPublisher{}
 	connector, br := testBridgeWithDB(t, &streamStartMatrix{publisher: publisher, eventID: "$anchor:example.com"})
@@ -406,8 +472,8 @@ func TestTurnCompletedPreservesRawCodexCustomEvent(t *testing.T) {
 
 	run.handle("turn/completed", []byte(`{"threadId":"thread-1","turnId":"turn-1","marker":"raw-turn/completed","turn":{"id":"turn-1","status":"completed"}}`))
 
-	if !hasCustomPayloadText(run.run.Events, "turn/completed", "marker", "raw-turn/completed") {
-		t.Fatalf("turn/completed did not preserve raw Codex payload as AG-UI custom event: %#v", run.run.Events)
+	if hasCustomPayloadText(run.run.Events, "turn/completed", "marker", "raw-turn/completed") {
+		t.Fatalf("turn/completed should not bridge raw Codex payload as AG-UI custom event: %#v", run.run.Events)
 	}
 	message := run.run.FinalBeeperAIMessage(0, true)
 	for _, part := range message.Parts {
@@ -426,8 +492,8 @@ func TestRealtimeTranscriptDoneRecoversAssistantText(t *testing.T) {
 	if got := run.run.Text(); got != "final transcript" {
 		t.Fatalf("transcript done did not recover assistant text: %q", got)
 	}
-	if !hasRealtimeStateDeltaText(run.run.Events, "thread/realtime/transcript/done", "text", "final transcript") {
-		t.Fatalf("transcript done raw payload was not preserved in state: %#v", run.run.Events)
+	if hasRealtimeStateDeltaText(run.run.Events, "thread/realtime/transcript/done", "text", "final transcript") {
+		t.Fatalf("transcript done raw payload should not be bridged as state: %#v", run.run.Events)
 	}
 
 	run = newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
@@ -466,6 +532,9 @@ func TestStreamRunModelTracksThreadSettingsAndReroutes(t *testing.T) {
 	if run.run.Model != "openai/gpt-5-mini" {
 		t.Fatalf("reroute did not update run model: %q", run.run.Model)
 	}
+	if !hasCodexThreadStateDelta(run.run.Events, "model", "gpt-5-mini") || !hasCodexThreadStateDelta(run.run.Events, "lastNotification", "model/rerouted") {
+		t.Fatalf("reroute did not emit normalized codexThread state delta: %#v", run.run.Events)
+	}
 	run.writer.Text("after reroute")
 	if got := run.run.Events[len(run.run.Events)-1].Get("model"); got != "openai/gpt-5-mini" {
 		t.Fatalf("future event kept stale reroute model: %#v", got)
@@ -493,6 +562,15 @@ func TestThreadStartedMapsToCodexThreadStateDelta(t *testing.T) {
 	}
 }
 
+func TestModelVerificationMapsToCodexThreadStateDelta(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.handle("model/verification", []byte(`{"threadId":"thread-1","turnId":"turn-1","verifications":[{"type":"trustedAccessForCyber"}]}`))
+
+	if !hasCodexThreadStateDelta(run.run.Events, "lastNotification", "model/verification") {
+		t.Fatalf("model verification did not emit codexThread state delta: %#v", run.run.Events)
+	}
+}
+
 func TestActiveRunNoticeNotificationsAreUserVisible(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -511,6 +589,18 @@ func TestActiveRunNoticeNotificationsAreUserVisible(t *testing.T) {
 			method: "model/rerouted",
 			params: `{"threadId":"thread-1","turnId":"turn-1","fromModel":"gpt-5","toModel":"gpt-5-mini","reason":"policy"}`,
 			want:   "Codex switched models from gpt-5 to gpt-5-mini.",
+		},
+		{
+			name:   "model verification",
+			method: "model/verification",
+			params: `{"threadId":"thread-1","turnId":"turn-1","verifications":["trustedAccessForCyber"]}`,
+			want:   "Codex is running extra safety checks for possible cybersecurity risk.",
+		},
+		{
+			name:   "legacy model verification object",
+			method: "model/verification",
+			params: `{"threadId":"thread-1","turnId":"turn-1","verifications":[{"type":"trustedAccessForCyber"}]}`,
+			want:   "Trusted Access for Cyber: https://chatgpt.com/cyber",
 		},
 		{
 			name:   "config warning",
@@ -623,6 +713,20 @@ func TestActiveRunStartUsesBridgeV2QueueAndRegistersBeeperStream(t *testing.T) {
 	if ai.Events[0].Seq != 1 {
 		t.Fatalf("initial stream sequence should start at 1, got %#v", ai.Events)
 	}
+	var lastTyping fakeTypingEvent
+	requireEventually(t, time.Second, func() bool {
+		typings := matrix.intent().typings
+		if len(typings) == 0 {
+			return false
+		}
+		lastTyping = typings[len(typings)-1]
+		return lastTyping.RoomID == "!room:example.com" &&
+			lastTyping.Type == bridgev2.TypingTypeText &&
+			lastTyping.Timeout == 30*time.Second
+	})
+	if lastTyping.RoomID != "!room:example.com" || lastTyping.Type != bridgev2.TypingTypeText || lastTyping.Timeout != 30*time.Second {
+		t.Fatalf("last typing state should keep Codex typing after stream anchor, got %#v", lastTyping)
+	}
 }
 
 func TestActiveRunPreservesEncryptedBeeperStreamDescriptor(t *testing.T) {
@@ -668,6 +772,92 @@ func TestActiveRunPreservesEncryptedBeeperStreamDescriptor(t *testing.T) {
 	}
 	if publisher.descriptor.Encryption == nil || publisher.descriptor.Encryption.Algorithm != id.AlgorithmBeeperStreamV1 || string(publisher.descriptor.Encryption.Key) != string(keyBytes) {
 		t.Fatalf("stream descriptor encryption was not preserved: %#v", publisher.descriptor.Encryption)
+	}
+}
+
+func TestActiveRunReplaysPendingEncryptedBeeperStreamSubscribe(t *testing.T) {
+	ctx := context.Background()
+	roomID := id.RoomID("!room:example.com")
+	anchorEventID := id.EventID("$message")
+	publisherClient, publisherStreams, publisherRecorder := newCodexStreamHelper(t, "@sh-codexbot:example.com", "PUBDEVICE")
+	subscriberClient, subscriberStreams, subscriberRecorder := newCodexStreamHelper(t, "@alice:example.com", "SUBDEVICE")
+	if err := publisherClient.StateStore.SetEncryptionEvent(ctx, roomID, &event.EncryptionEventContent{Algorithm: id.AlgorithmMegolmV1}); err != nil {
+		t.Fatal(err)
+	}
+	if err := subscriberClient.StateStore.SetEncryptionEvent(ctx, roomID, &event.EncryptionEventContent{Algorithm: id.AlgorithmMegolmV1}); err != nil {
+		t.Fatal(err)
+	}
+	descriptor, err := publisherStreams.NewDescriptor(ctx, roomID, aiid.StreamType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if descriptor.Encryption == nil {
+		t.Fatal("expected encrypted beeper stream descriptor")
+	}
+	if err = subscriberStreams.Subscribe(ctx, roomID, anchorEventID, descriptor); err != nil {
+		t.Fatal(err)
+	}
+	subscribeReq := subscriberRecorder.next(t)
+	if !strings.Contains(subscribeReq.path, "/sendToDevice/m.room.encrypted/") {
+		t.Fatalf("expected encrypted subscribe request, got %s", subscribeReq.path)
+	}
+	publisherStreams.HandleSyncResponse(ctx, &mautrix.RespSync{
+		ToDevice: mautrix.SyncEventsList{Events: []*event.Event{
+			codexStreamToDeviceEvent(t, event.ToDeviceEncrypted, subscriberClient.UserID, descriptor.UserID, descriptor.DeviceID, subscriberRecorder.rawContent(t, subscribeReq, descriptor.UserID, descriptor.DeviceID)),
+		}},
+	})
+
+	matrix := &streamStartMatrix{
+		fakeMatrixConnector: fakeMatrixConnector{api: &fakeMatrixAPI{}},
+		publisher:           &fixedBeeperStreamPublisher{helper: publisherStreams, descriptor: descriptor},
+		eventID:             "$deterministic:example.com",
+	}
+	connector, br := testBridgeWithDB(t, matrix)
+	br.Config.OutgoingMessageReID = true
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      roomID,
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{Main: connector, UserLogin: login, loggedIn: true}
+	login.Client = client
+	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project", "openai", "gpt-5")
+	run := newActiveRun(client, key, "thread-1", "turn-1")
+	if err = run.start(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	updateReq := publisherRecorder.next(t)
+	if !strings.Contains(updateReq.path, "/sendToDevice/m.room.encrypted/") {
+		t.Fatalf("expected encrypted stream update request, got %s", updateReq.path)
+	}
+	normalized := subscriberStreams.HandleSyncResponse(ctx, &mautrix.RespSync{
+		ToDevice: mautrix.SyncEventsList{Events: []*event.Event{
+			codexStreamToDeviceEvent(t, event.ToDeviceEncrypted, descriptor.UserID, subscriberClient.UserID, subscriberClient.DeviceID, publisherRecorder.rawContent(t, updateReq, subscriberClient.UserID, subscriberClient.DeviceID)),
+		}},
+	})
+	if len(normalized) != 1 {
+		t.Fatalf("expected one normalized stream update, got %#v", normalized)
+	}
+	ai, ok := normalized[0].Content.Raw[aistream.BeeperAIKey].(map[string]any)
+	if !ok || ai["kind"] != string(aistream.AIKindStream) {
+		t.Fatalf("normalized update did not contain Codex Beeper AI stream payload: %#v", normalized[0].Content.Raw)
+	}
+	if normalized[0].RoomID != roomID || normalized[0].Content.AsBeeperStreamUpdate().EventID != anchorEventID {
+		t.Fatalf("normalized update targeted wrong stream: room=%s event=%s", normalized[0].RoomID, normalized[0].Content.AsBeeperStreamUpdate().EventID)
 	}
 }
 
@@ -1070,6 +1260,38 @@ func TestStreamPublisherSeparatesPublishedIndexFromStreamSequence(t *testing.T) 
 	}
 }
 
+func TestStreamPublisherRetriesFailedPublishWithoutAdvancingCursor(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.anchorMXID = "$anchor:example.com"
+	run.roomID = "!room:example.com"
+	publisher := &recordingBeeperStreamPublisher{failOnPublish: 1, failErr: errors.New("send failed")}
+	run.publisher = publisher
+	run.started = true
+	run.writer.Text("retry me")
+
+	run.publishLocked()
+
+	if len(publisher.updates) != 0 {
+		t.Fatalf("failed publish should not record an update: %#v", publisher.updates)
+	}
+	if run.published != 0 || run.nextSeq != 1 {
+		t.Fatalf("failed publish advanced cursor: published=%d nextSeq=%d", run.published, run.nextSeq)
+	}
+
+	run.publishLocked()
+
+	if len(publisher.updates) != 1 {
+		t.Fatalf("retry should publish one update, got %#v", publisher.updates)
+	}
+	ai := publisher.updates[0][aistream.BeeperAIKey].(aistream.BeeperAI)
+	if len(ai.Events) == 0 || ai.Events[0].Seq != 1 {
+		t.Fatalf("retry should start at original seq 1, got %#v", ai.Events)
+	}
+	if run.published != len(run.run.Events) || run.nextSeq != aistream.NextSeq([]aistream.Carrier{{Envelopes: ai.Events}}) {
+		t.Fatalf("retry cursor not advanced correctly: published=%d nextSeq=%d events=%d", run.published, run.nextSeq, len(run.run.Events))
+	}
+}
+
 func TestTurnCompletedBeforeStreamStartDoesNotFinalizeWithoutAnchor(t *testing.T) {
 	run := newActiveRun(&Client{}, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
 
@@ -1155,6 +1377,27 @@ func TestProcessOutputUsesRegisteredCommandItem(t *testing.T) {
 	if !hasToolResult(run.run.Events, "cmd-1", "ok\n") {
 		t.Fatalf("expected process output to map to command item, got %#v", run.run.Events)
 	}
+}
+
+func TestProcessOutputBeforeCommandItemKeepsOneToolIdentity(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.handle("command/exec/outputDelta", []byte(`{"processId":"proc-1","deltaBase64":"b2sK","stream":"stdout"}`))
+	run.handle("item/started", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"commandExecution","id":"cmd-1","command":"go test ./...","processId":"proc-1"}}`))
+	run.handle("item/completed", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"commandExecution","id":"cmd-1","command":"go test ./...","processId":"proc-1","status":"completed","aggregatedOutput":"ok\n"}}`))
+
+	if !hasToolResult(run.run.Events, "proc-1", "ok\n") {
+		t.Fatalf("expected early process output to stay on process tool, got %#v", run.run.Events)
+	}
+	if hasToolCallStart(run.run.Events, "cmd-1") || hasToolResult(run.run.Events, "cmd-1", "ok\n") {
+		t.Fatalf("command item should reuse existing process tool instead of fragmenting: %#v", run.run.Events)
+	}
+	if !hasToolArgsContaining(run.run.Events, "proc-1", "go test ./...") || !hasToolCallEnd(run.run.Events, "proc-1") {
+		t.Fatalf("command args/end should be attached to existing process tool: %#v", run.run.Events)
+	}
+	if got := countToolResult(run.run.Events, "proc-1", "ok\n"); got != 1 {
+		t.Fatalf("streamed process output should not replay aggregate output, got %d events=%#v", got, run.run.Events)
+	}
+	assertAGUISequenceValid(t, run.run)
 }
 
 func TestProcessExitUsesRegisteredCommandItem(t *testing.T) {
@@ -1276,12 +1519,131 @@ func TestRawResponseItemCompletedMapsAssistantReasoningAndTools(t *testing.T) {
 	assertAGUISequenceValid(t, run.run)
 }
 
+func TestRawResponseReasoningCompletionFillsMissingSectionsOnly(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.handle("item/reasoning/textDelta", []byte(`{"threadId":"thread-1","turnId":"turn-1","itemId":"reason-1","contentIndex":0,"delta":"streamed thought"}`))
+	run.handle("rawResponseItem/completed", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"reasoning","id":"reason-1","summary":[{"type":"summary_text","text":"completed summary"}],"content":[{"type":"reasoning_text","text":"streamed thought"}]}}`))
+
+	if countReasoningDelta(run.run.Events, "completed summary") != 1 {
+		t.Fatalf("expected raw reasoning completion to fill missing summary, got %#v", run.run.Events)
+	}
+	if countReasoningDelta(run.run.Events, "streamed thought") != 1 {
+		t.Fatalf("expected raw reasoning completion not to duplicate streamed content, got %#v", run.run.Events)
+	}
+	assertAGUISequenceValid(t, run.run)
+}
+
 func TestRawToolResultSynthesizesMissingStart(t *testing.T) {
 	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
 	run.handle("rawResponseItem/completed", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"function_call_output","call_id":"call-1","output":"found"}}`))
 
 	if !toolEventsInOrder(run.run.Events, "call-1", agui.EventToolCallStart, agui.EventToolCallResult) {
 		t.Fatalf("expected raw tool result to synthesize a start first, got %#v", run.run.Events)
+	}
+	assertAGUISequenceValid(t, run.run)
+}
+
+func TestRawToolResultWithoutOutputOnlySynthesizesStart(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.handle("rawResponseItem/completed", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"function_call_output","call_id":"call-1"}}`))
+
+	if !hasToolCallStart(run.run.Events, "call-1") {
+		t.Fatalf("expected raw tool output without content to synthesize start, got %#v", run.run.Events)
+	}
+	if hasEventType(run.run.Events, agui.EventToolCallResult) || hasToolResult(run.run.Events, "call-1", "null") {
+		t.Fatalf("missing raw tool output should not create a result, got %#v", run.run.Events)
+	}
+	assertAGUISequenceValid(t, run.run)
+}
+
+func TestRawToolSearchOutputMapsToolsResult(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.handle("rawResponseItem/completed", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"tool_search_output","call_id":"search-1","status":"completed","execution":"tool_search","tools":[{"name":"github","description":"GitHub connector"}]}}`))
+
+	if !hasToolResultStateContaining(run.run.Events, "search-1", "GitHub connector", agui.ToolResultStateComplete) {
+		t.Fatalf("expected tool_search_output tools to map to a tool result, got %#v", run.run.Events)
+	}
+	assertAGUISequenceValid(t, run.run)
+}
+
+func TestRawToolEndMapsOutputBeforeEnd(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.handle("rawResponseItem/completed", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"local_shell_call","call_id":"shell-1","status":"completed","output":"ok\n"}}`))
+
+	if !toolEventsInOrder(run.run.Events, "shell-1", agui.EventToolCallStart, agui.EventToolCallResult, agui.EventToolCallEnd) {
+		t.Fatalf("expected raw shell output before tool end, got %#v", run.run.Events)
+	}
+	if !hasToolResultStateContaining(run.run.Events, "shell-1", "ok", agui.ToolResultStateComplete) {
+		t.Fatalf("expected raw shell output to map to tool result, got %#v", run.run.Events)
+	}
+	assertAGUISequenceValid(t, run.run)
+}
+
+func TestRawToolEndMapsResultBeforeEnd(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.handle("rawResponseItem/completed", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"image_generation_call","id":"image-1","status":"completed","revised_prompt":"a clean bridge diagram","result":"mxc://example.com/image"}}`))
+
+	if !toolEventsInOrder(run.run.Events, "image-1", agui.EventToolCallStart, agui.EventToolCallResult, agui.EventToolCallEnd) {
+		t.Fatalf("expected raw image result before tool end, got %#v", run.run.Events)
+	}
+	if !hasToolResultStateContaining(run.run.Events, "image-1", "mxc://example.com/image", agui.ToolResultStateComplete) {
+		t.Fatalf("expected raw image result to map to tool result, got %#v", run.run.Events)
+	}
+	assertAGUISequenceValid(t, run.run)
+}
+
+func TestRawToolEndPreservesStreamingStatus(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.handle("rawResponseItem/completed", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"web_search_call","id":"search-1","status":"in_progress","action":{"query":"codex bridge"},"result":"searching"}}`))
+
+	if !hasToolResultState(run.run.Events, "search-1", "searching", agui.ToolResultStateStreaming) {
+		t.Fatalf("expected raw in-progress tool status to stay streaming, got %#v", run.run.Events)
+	}
+	if hasToolCallEnd(run.run.Events, "search-1") {
+		t.Fatalf("streaming raw tool should not be closed, got %#v", run.run.Events)
+	}
+	assertAGUISequenceValid(t, run.run)
+}
+
+func TestRawToolEndSynthesizesIDWhenCodexOmitsCallID(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	item := map[string]any{
+		"type":   "web_search_call",
+		"status": "completed",
+		"action": map[string]any{"query": "codex bridge streaming"},
+	}
+	callID := rawToolCallID(item)
+	payload, err := json.Marshal(map[string]any{
+		"threadId": "thread-1",
+		"turnId":   "turn-1",
+		"item":     item,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run.handle("rawResponseItem/completed", payload)
+
+	if !strings.HasPrefix(callID, "raw_web_search_call_") {
+		t.Fatalf("unexpected synthetic raw tool ID: %q", callID)
+	}
+	if !toolEventsInOrder(run.run.Events, callID, agui.EventToolCallStart, agui.EventToolCallEnd) {
+		t.Fatalf("expected raw web search to synthesize a stable tool ID, got %#v", run.run.Events)
+	}
+	if !hasToolArgsContaining(run.run.Events, callID, "codex bridge streaming") {
+		t.Fatalf("expected raw web search action to be preserved as tool input, got %#v", run.run.Events)
+	}
+	if hasToolResult(run.run.Events, callID, "null") {
+		t.Fatalf("missing raw web search output should not be bridged as a null tool result: %#v", run.run.Events)
+	}
+	assertAGUISequenceValid(t, run.run)
+}
+
+func TestRawResponseItemCompletedMapsCompactionTriggerNotice(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.handle("rawResponseItem/completed", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"compaction_trigger"}}`))
+
+	if countTextDelta(run.run.Events, codexCompactionNotice) != 1 {
+		t.Fatalf("expected compaction trigger notice, got %#v", run.run.Events)
 	}
 	assertAGUISequenceValid(t, run.run)
 }
@@ -1316,6 +1678,16 @@ func TestCompletedToolItemMapsRichResult(t *testing.T) {
 	}
 }
 
+func TestCompletedMCPToolItemMapsContentText(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.handle("item/started", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"mcpToolCall","id":"mcp-1","server":"github","tool":"list_issues","status":"inProgress"}}`))
+	run.handle("item/completed", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"mcpToolCall","id":"mcp-1","server":"github","tool":"list_issues","status":"completed","result":{"content":[{"type":"text","text":"found two issues"}],"structuredContent":{"count":2},"_meta":null}}}`))
+
+	if !hasToolResultState(run.run.Events, "mcp-1", "found two issues", agui.ToolResultStateComplete) {
+		t.Fatalf("expected MCP content text to map to AG-UI tool result, got %#v", run.run.Events)
+	}
+}
+
 func TestCompletedToolItemSynthesizesMissingStart(t *testing.T) {
 	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
 	run.handle("item/completed", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"mcpToolCall","id":"mcp-1","server":"github","tool":"list_issues","status":"completed","result":{"count":2}}}`))
@@ -1344,6 +1716,72 @@ func TestToolItemStartMapsInputArgs(t *testing.T) {
 	}
 }
 
+func TestToolItemStartMapsRichGeneratedItemInputs(t *testing.T) {
+	tests := []struct {
+		name     string
+		payload  string
+		toolID   string
+		toolName string
+		argText  string
+	}{
+		{
+			name:     "web search",
+			payload:  `{"threadId":"thread-1","turnId":"turn-1","item":{"type":"webSearch","id":"search-1","query":"codex bridge streaming"}}`,
+			toolID:   "search-1",
+			toolName: "web search: codex bridge streaming",
+			argText:  "codex bridge streaming",
+		},
+		{
+			name:     "image view",
+			payload:  `{"threadId":"thread-1","turnId":"turn-1","item":{"type":"imageView","id":"image-1","path":"/tmp/screenshots/current.png"}}`,
+			toolID:   "image-1",
+			toolName: "image view: current.png",
+			argText:  "/tmp/screenshots/current.png",
+		},
+		{
+			name:     "collab agent",
+			payload:  `{"threadId":"thread-1","turnId":"turn-1","item":{"type":"collabAgentToolCall","id":"collab-1","tool":"spawn","prompt":"check the stream mapping"}}`,
+			toolID:   "collab-1",
+			toolName: "collab: spawn",
+			argText:  "check the stream mapping",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+			run.handle("item/started", []byte(tt.payload))
+			if !hasToolCallStartName(run.run.Events, tt.toolID, tt.toolName) {
+				t.Fatalf("expected rich tool start name %q for %s, got %#v", tt.toolName, tt.toolID, run.run.Events)
+			}
+			if !hasToolArgsContaining(run.run.Events, tt.toolID, tt.argText) {
+				t.Fatalf("expected rich tool args %q for %s, got %#v", tt.argText, tt.toolID, run.run.Events)
+			}
+		})
+	}
+}
+
+func TestCompletedToolItemsMapDynamicAndImageGenerationResults(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.handle("item/completed", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"dynamicToolCall","id":"dynamic-1","tool":"custom_tool","arguments":{"query":"codex"},"status":"completed","contentItems":[{"type":"inputText","text":"dynamic result"}]}}`))
+	run.handle("item/completed", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"imageGeneration","id":"image-1","status":"completed","revisedPrompt":"small bridge diagram","result":"generated image","savedPath":"/tmp/codex/image.png"}}`))
+
+	if !hasToolResultStateContaining(run.run.Events, "dynamic-1", "dynamic result", agui.ToolResultStateComplete) {
+		t.Fatalf("expected dynamic content item text as result, got %#v", run.run.Events)
+	}
+	if !hasToolArgsContaining(run.run.Events, "image-1", "small bridge diagram") || !hasToolResultStateContaining(run.run.Events, "image-1", "generated image", agui.ToolResultStateComplete) {
+		t.Fatalf("expected image generation prompt/result in live stream, got %#v", run.run.Events)
+	}
+	assertAGUISequenceValid(t, run.run)
+}
+
+func TestTypeScriptV2CodexThreadItemsHaveLiveMapping(t *testing.T) {
+	for _, itemType := range generatedTypeScriptThreadItemTypes(t) {
+		if !isLiveMappedThreadItemType(itemType) {
+			t.Fatalf("TypeScript v2 Codex thread item %q is not covered by live stream mapping", itemType)
+		}
+	}
+}
+
 func TestCompletedCommandDoesNotReplayStreamedAggregateOutput(t *testing.T) {
 	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
 	run.handle("item/started", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"commandExecution","id":"cmd-1","command":"go test ./...","status":"inProgress"}}`))
@@ -1353,6 +1791,19 @@ func TestCompletedCommandDoesNotReplayStreamedAggregateOutput(t *testing.T) {
 	if countToolResult(run.run.Events, "cmd-1", "ok\n") != 1 {
 		t.Fatalf("expected streamed aggregate output not to be replayed, got %#v", run.run.Events)
 	}
+}
+
+func TestCompletedStreamingToolItemDoesNotCloseAsComplete(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.handle("item/completed", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"commandExecution","id":"cmd-1","command":"go test ./...","status":"inProgress","aggregatedOutput":"still running"}}`))
+
+	if !hasToolResultState(run.run.Events, "cmd-1", "still running", agui.ToolResultStateStreaming) {
+		t.Fatalf("expected completed in-progress item to remain streaming, got %#v", run.run.Events)
+	}
+	if hasToolCallEnd(run.run.Events, "cmd-1") {
+		t.Fatalf("completed in-progress item should not close the tool, got %#v", run.run.Events)
+	}
+	assertAGUISequenceValid(t, run.run)
 }
 
 func TestMCPToolProgressMapsToStreamingToolResult(t *testing.T) {
@@ -1504,6 +1955,16 @@ func countReasoningDelta(events []agui.Event, delta string) int {
 	return count
 }
 
+func distinctReasoningMessageIDs(events []agui.Event) map[string]bool {
+	ids := map[string]bool{}
+	for _, event := range events {
+		if event.Type() == agui.EventReasoningMsgStart {
+			ids[event.String("messageId")] = true
+		}
+	}
+	return ids
+}
+
 func hasToolResult(events []agui.Event, toolCallID, delta string) bool {
 	for _, event := range events {
 		if event.Type() == agui.EventToolCallResult && event.String("toolCallId") == toolCallID && event.String("content") == delta {
@@ -1520,6 +1981,31 @@ func hasToolCallStart(events []agui.Event, toolCallID string) bool {
 		}
 	}
 	return false
+}
+
+func hasToolCallStartName(events []agui.Event, toolCallID, name string) bool {
+	for _, event := range events {
+		if event.Type() == agui.EventToolCallStart && event.String("toolCallId") == toolCallID && event.String("toolCallName") == name {
+			return true
+		}
+	}
+	return false
+}
+
+func isLiveMappedThreadItemType(itemType string) bool {
+	switch itemType {
+	case "userMessage",
+		"agentMessage",
+		"contextCompaction",
+		"reasoning",
+		"hookPrompt",
+		"enteredReviewMode",
+		"exitedReviewMode",
+		"plan":
+		return true
+	default:
+		return (codexItem{Type: itemType}).IsToolLike()
+	}
 }
 
 func hasToolCallEnd(events []agui.Event, toolCallID string) bool {
@@ -1683,12 +2169,15 @@ func requireEventually(t *testing.T, timeout time.Duration, ok func() bool) {
 }
 
 type recordingBeeperStreamPublisher struct {
-	mu          sync.Mutex
-	roomID      id.RoomID
-	eventID     id.EventID
-	descriptor  *event.BeeperStreamInfo
-	updates     []map[string]any
-	unregisters int
+	mu            sync.Mutex
+	roomID        id.RoomID
+	eventID       id.EventID
+	descriptor    *event.BeeperStreamInfo
+	updates       []map[string]any
+	unregisters   int
+	publishes     int
+	failOnPublish int
+	failErr       error
 
 	deviceID      id.DeviceID
 	encryptionKey []byte
@@ -1735,6 +2224,105 @@ func (i *recordingMediaIntent) UploadMedia(ctx context.Context, roomID id.RoomID
 	return i.url, nil, nil
 }
 
+type codexSendToDeviceRequest struct {
+	path string
+	body []byte
+}
+
+type codexSendToDeviceRecorder struct {
+	requests chan codexSendToDeviceRequest
+}
+
+func newCodexStreamHelper(t *testing.T, userID id.UserID, deviceID id.DeviceID) (*mautrix.Client, *beeperstream.Helper, *codexSendToDeviceRecorder) {
+	t.Helper()
+	recorder := &codexSendToDeviceRecorder{requests: make(chan codexSendToDeviceRequest, 8)}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("unexpected sendToDevice method %s", r.Method)
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("failed to read sendToDevice body: %v", err)
+		}
+		recorder.requests <- codexSendToDeviceRequest{path: r.URL.Path, body: body}
+		_ = json.NewEncoder(w).Encode(map[string]any{})
+	}))
+	t.Cleanup(server.Close)
+	client, err := mautrix.NewClient(server.URL, userID, "access-token")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.DeviceID = deviceID
+	client.StateStore = mautrix.NewMemoryStateStore()
+	streams, err := beeperstream.New(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client, streams, recorder
+}
+
+func (r *codexSendToDeviceRecorder) next(t *testing.T) codexSendToDeviceRequest {
+	t.Helper()
+	select {
+	case req := <-r.requests:
+		return req
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for sendToDevice request")
+		return codexSendToDeviceRequest{}
+	}
+}
+
+func (r *codexSendToDeviceRecorder) rawContent(t *testing.T, req codexSendToDeviceRequest, userID id.UserID, deviceID id.DeviceID) json.RawMessage {
+	t.Helper()
+	var payload struct {
+		Messages map[string]map[string]json.RawMessage `json:"messages"`
+	}
+	if err := json.Unmarshal(req.body, &payload); err != nil {
+		t.Fatal(err)
+	}
+	userMessages := payload.Messages[string(userID)]
+	if userMessages == nil {
+		t.Fatalf("sendToDevice request did not target %s: %#v", userID, payload.Messages)
+	}
+	raw := userMessages[string(deviceID)]
+	if raw == nil {
+		t.Fatalf("sendToDevice request did not target %s/%s: %#v", userID, deviceID, userMessages)
+	}
+	return raw
+}
+
+func codexStreamToDeviceEvent(t *testing.T, evtType event.Type, sender id.UserID, toUser id.UserID, toDevice id.DeviceID, raw json.RawMessage) *event.Event {
+	t.Helper()
+	return &event.Event{
+		Sender:     sender,
+		ToUserID:   toUser,
+		ToDeviceID: toDevice,
+		Type:       evtType,
+		Content:    event.Content{VeryRaw: raw},
+	}
+}
+
+type fixedBeeperStreamPublisher struct {
+	helper     *beeperstream.Helper
+	descriptor *event.BeeperStreamInfo
+}
+
+func (p *fixedBeeperStreamPublisher) NewDescriptor(ctx context.Context, roomID id.RoomID, streamType string) (*event.BeeperStreamInfo, error) {
+	return p.descriptor.Clone(), nil
+}
+
+func (p *fixedBeeperStreamPublisher) Register(ctx context.Context, roomID id.RoomID, eventID id.EventID, descriptor *event.BeeperStreamInfo) error {
+	return p.helper.Register(ctx, roomID, eventID, descriptor)
+}
+
+func (p *fixedBeeperStreamPublisher) Publish(ctx context.Context, roomID id.RoomID, eventID id.EventID, delta map[string]any) error {
+	return p.helper.Publish(ctx, roomID, eventID, delta)
+}
+
+func (p *fixedBeeperStreamPublisher) Unregister(roomID id.RoomID, eventID id.EventID) {
+	p.helper.Unregister(roomID, eventID)
+}
+
 func (p *recordingBeeperStreamPublisher) NewDescriptor(ctx context.Context, roomID id.RoomID, streamType string) (*event.BeeperStreamInfo, error) {
 	info := &event.BeeperStreamInfo{UserID: "@bot:example.com", DeviceID: p.deviceID, Type: streamType}
 	if len(p.encryptionKey) > 0 {
@@ -1758,6 +2346,13 @@ func (p *recordingBeeperStreamPublisher) Register(ctx context.Context, roomID id
 func (p *recordingBeeperStreamPublisher) Publish(ctx context.Context, roomID id.RoomID, eventID id.EventID, delta map[string]any) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	p.publishes++
+	if p.failOnPublish == p.publishes {
+		if p.failErr != nil {
+			return p.failErr
+		}
+		return errors.New("publish failed")
+	}
 	p.roomID = roomID
 	p.eventID = eventID
 	p.updates = append(p.updates, delta)
@@ -1777,3 +2372,4 @@ func (p *recordingBeeperStreamPublisher) unregisterCount() int {
 }
 
 var _ bridgev2.BeeperStreamPublisher = (*recordingBeeperStreamPublisher)(nil)
+var _ bridgev2.BeeperStreamPublisher = (*fixedBeeperStreamPublisher)(nil)

@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,8 +34,8 @@ const appServerStartupTimeout = 15 * time.Second
 const contactGhostSyncLimit = 20
 const messageMetadataSyncLimit = 500
 const bridgeInfoVersion = 2
-const roomCapabilitiesVersion = 8
-const roomFeaturesID = "com.beeper.codex.capabilities.2026_06_02.room_features_no_reactions_no_disappearing"
+const roomCapabilitiesVersion = 11
+const roomFeaturesID = "com.beeper.codex.capabilities.2026_06_02.room_features_user_ai_model_only"
 const defaultCodexAvatarMXC = "mxc://beeper.com/51a668657dd9e0132cc823ad9402c6c2d0fc3321"
 
 type Connector struct {
@@ -50,6 +51,12 @@ type Connector struct {
 
 	pendingStartMu sync.Mutex
 	pendingStarts  map[string]pendingTurnStart
+
+	matrixStartMu sync.Mutex
+	matrixStarts  map[string]struct{}
+
+	warmThreadMu sync.Mutex
+	warmThreads  map[string]struct{}
 
 	threadMu    sync.Mutex
 	threadRooms map[string]threadRoom
@@ -67,7 +74,9 @@ type threadRoom struct {
 	cwd             string
 	modelProvider   string
 	model           string
+	modelName       string
 	reasoningEffort string
+	reasoningMode   string
 }
 
 type pendingTurnStart struct {
@@ -120,6 +129,8 @@ func (c *Connector) Init(bridge *bridgev2.Bridge) {
 	}
 	c.active = map[string]*activeRun{}
 	c.pendingStarts = map[string]pendingTurnStart{}
+	c.matrixStarts = map[string]struct{}{}
+	c.warmThreads = map[string]struct{}{}
 	c.threadRooms = map[string]threadRoom{}
 	c.processes = map[string]*activeRun{}
 	c.globalState = map[string]any{}
@@ -368,29 +379,144 @@ func (c *Connector) handleGlobalNotification(method string, params json.RawMessa
 		}
 		go c.refreshAccountState(context.Background())
 	case "account/rateLimits/updated",
-		"mcpServer/oauthLogin/completed",
-		"mcpServer/startupStatus/updated",
 		"app/list/updated",
 		"remoteControl/status/changed",
 		"externalAgentConfig/import/completed",
 		"skills/changed",
-		"windows/worldWritableWarning",
-		"windowsSandbox/setupCompleted",
 		"fuzzyFileSearch/sessionUpdated",
 		"fuzzyFileSearch/sessionCompleted",
 		"fs/changed":
 		c.updateGlobalState(method, payload)
 		c.broadcastBridgeState(status.StateConnected, "")
+	case "mcpServer/oauthLogin/completed":
+		c.updateGlobalState(method, payload)
+		c.broadcastBridgeState(status.StateConnected, mcpOAuthLoginMessage(payload))
+	case "windows/worldWritableWarning":
+		c.updateGlobalState(method, payload)
+		c.broadcastBridgeState(status.StateConnected, windowsWorldWritableWarningMessage(payload))
+	case "windowsSandbox/setupCompleted":
+		c.updateGlobalState(method, payload)
+		c.broadcastBridgeState(status.StateConnected, windowsSandboxSetupMessage(payload))
 	case "warning", "configWarning", "deprecationNotice", "guardianWarning":
 		text := threadNoticeText(method, params)
 		c.updateGlobalState(method, payload)
 		c.broadcastBridgeState(status.StateConnected, text)
+	case "mcpServer/startupStatus/updated":
+		c.updateGlobalState(method, payload)
+		c.broadcastBridgeState(status.StateConnected, mcpStartupStatusMessage(payload))
 	case "error":
 		text := errorNoticeText(payload)
 		c.updateGlobalState(method, payload)
 		c.broadcastBridgeState(status.StateUnknownError, text)
 	default:
 		logFromContext(context.Background()).Debug().Str("method", method).RawJSON("params", params).Msg("Ignoring global Codex notification")
+	}
+}
+
+func mcpOAuthLoginMessage(payload map[string]any) string {
+	name := strings.TrimSpace(firstPayloadString(payload, "name", "server", "serverName"))
+	if name == "" {
+		name = "MCP server"
+	} else {
+		name = "MCP server " + name
+	}
+	if success, ok := payload["success"].(bool); ok && !success {
+		if message := strings.TrimSpace(firstPayloadString(payload, "error", "message")); message != "" {
+			return name + " OAuth login failed: " + message
+		}
+		return name + " OAuth login failed."
+	}
+	return name + " OAuth login completed."
+}
+
+func mcpStartupStatusMessage(payload map[string]any) string {
+	name, _ := payload["name"].(string)
+	state, _ := payload["status"].(string)
+	name = strings.TrimSpace(name)
+
+	server := "A Codex MCP server"
+	if name != "" {
+		server = "Codex MCP server " + name
+	}
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "failed":
+		message, _ := payload["error"].(string)
+		message = strings.TrimSpace(message)
+		if message != "" {
+			return server + " failed to start: " + message
+		}
+		return server + " failed to start."
+	case "cancelled", "canceled":
+		return server + " startup was cancelled."
+	default:
+		return ""
+	}
+}
+
+func windowsWorldWritableWarningMessage(payload map[string]any) string {
+	paths := stringSlicePayload(payload["samplePaths"])
+	if len(paths) == 0 {
+		paths = stringSlicePayload(payload["paths"])
+	}
+	if len(paths) == 0 {
+		return "Codex found world-writable Windows paths."
+	}
+	message := "Codex found world-writable Windows paths:\n\n" + strings.Join(paths, "\n")
+	if extra := intPayload(payload["extraCount"]); extra > 0 {
+		message += "\n\nAnd " + strconv.Itoa(extra) + " more."
+	}
+	if failed, _ := payload["failedScan"].(bool); failed {
+		message += "\n\nThe scan did not complete."
+	}
+	return message
+}
+
+func windowsSandboxSetupMessage(payload map[string]any) string {
+	mode := strings.TrimSpace(firstPayloadString(payload, "mode"))
+	if mode == "" {
+		mode = "Windows sandbox"
+	} else {
+		mode = "Windows sandbox " + mode
+	}
+	if success, ok := payload["success"].(bool); ok && !success {
+		if message := strings.TrimSpace(firstPayloadString(payload, "error", "message")); message != "" {
+			return mode + " setup failed: " + message
+		}
+		return mode + " setup failed."
+	}
+	return mode + " setup completed."
+}
+
+func firstPayloadString(payload map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, _ := payload[key].(string); strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func stringSlicePayload(value any) []string {
+	raw, _ := value.([]any)
+	out := make([]string, 0, len(raw))
+	for _, item := range raw {
+		if text, _ := item.(string); strings.TrimSpace(text) != "" {
+			out = append(out, strings.TrimSpace(text))
+		}
+	}
+	return out
+}
+
+func intPayload(value any) int {
+	switch typed := value.(type) {
+	case int:
+		return typed
+	case int64:
+		return int(typed)
+	case float64:
+		return int(typed)
+	default:
+		return 0
 	}
 }
 
@@ -717,6 +843,7 @@ func (c *Connector) forgetThread(threadID string) {
 	if c == nil || threadID == "" {
 		return
 	}
+	c.forgetWarmThread(threadID)
 	c.activeMu.Lock()
 	run := c.active[threadID]
 	delete(c.active, threadID)
@@ -787,6 +914,12 @@ func (c *Connector) rememberThreadRoom(threadID string, cl *Client, portalKey ne
 	if len(modelInfo) > 2 && strings.TrimSpace(modelInfo[2]) != "" {
 		room.reasoningEffort = strings.TrimSpace(modelInfo[2])
 	}
+	if len(modelInfo) > 3 && strings.TrimSpace(modelInfo[3]) != "" {
+		room.modelName = strings.TrimSpace(modelInfo[3])
+	}
+	if len(modelInfo) > 4 && strings.TrimSpace(modelInfo[4]) != "" {
+		room.reasoningMode = strings.TrimSpace(modelInfo[4])
+	}
 	c.threadRooms[threadID] = room
 	c.threadMu.Unlock()
 }
@@ -796,6 +929,41 @@ func (c *Connector) threadRoom(threadID string) (threadRoom, bool) {
 	defer c.threadMu.Unlock()
 	room, ok := c.threadRooms[threadID]
 	return room, ok && room.login != nil && room.portalKey.ID != ""
+}
+
+func (c *Connector) cachedThreadsForLogin(login *bridgev2.UserLogin) []appserver.Thread {
+	if c == nil {
+		return nil
+	}
+	c.threadMu.Lock()
+	defer c.threadMu.Unlock()
+	threads := make([]appserver.Thread, 0, len(c.threadRooms))
+	for threadID, room := range c.threadRooms {
+		if room.cwd == "" || (login != nil && (room.login == nil || room.login.ID != login.ID)) {
+			continue
+		}
+		raw := map[string]any{}
+		if room.model != "" {
+			raw["model"] = room.model
+		}
+		if room.modelName != "" {
+			raw["modelName"] = room.modelName
+		}
+		if room.reasoningEffort != "" {
+			raw["reasoningEffort"] = room.reasoningEffort
+		}
+		if room.reasoningMode != "" {
+			raw["reasoning_mode"] = room.reasoningMode
+		}
+		threads = append(threads, appserver.Thread{
+			ID:            threadID,
+			SessionID:     threadID,
+			Cwd:           room.cwd,
+			ModelProvider: room.modelProvider,
+			Raw:           raw,
+		})
+	}
+	return threads
 }
 
 func (c *Connector) modelStateForPortalKey(portalKey networkid.PortalKey) map[string]any {
@@ -812,6 +980,10 @@ func (c *Connector) modelStateForPortalKey(portalKey networkid.PortalKey) map[st
 		if room.model != "" {
 			state["model"] = room.model
 		}
+		if room.modelName != "" {
+			state["name"] = room.modelName
+			state["modelName"] = room.modelName
+		}
 		if room.modelProvider != "" {
 			state["provider"] = room.modelProvider
 			state["modelProvider"] = room.modelProvider
@@ -820,6 +992,10 @@ func (c *Connector) modelStateForPortalKey(portalKey networkid.PortalKey) map[st
 			state["effort"] = room.reasoningEffort
 			state["reasoning"] = room.reasoningEffort
 			state["reasoningEffort"] = room.reasoningEffort
+		}
+		if room.reasoningMode != "" {
+			state["reasoning_mode"] = room.reasoningMode
+			state["reasoningMode"] = room.reasoningMode
 		}
 		if len(state) > 0 {
 			return state
@@ -834,18 +1010,107 @@ func (c *Connector) setModelStateForPortalKey(portalKey networkid.PortalKey, sta
 	}
 	model := codexModelStateRef(state, firstStateString(state, "provider", "modelProvider"))
 	provider := firstStateString(state, "provider", "modelProvider")
+	name := firstStateString(state, "modelName", "name")
 	effort := firstStateString(state, "effort", "reasoning", "reasoningEffort", "reasoning_effort")
+	reasoningMode := firstStateString(state, "reasoning_mode", "reasoningMode")
+	var activeUpdates []struct {
+		threadID string
+		room     threadRoom
+	}
 	c.threadMu.Lock()
-	for threadID, room := range c.threadRooms {
-		if room.portalKey != portalKey {
-			continue
-		}
-		room.model = model
-		room.modelProvider = provider
-		room.reasoningEffort = effort
-		c.threadRooms[threadID] = room
+		for threadID, room := range c.threadRooms {
+			if room.portalKey != portalKey {
+				continue
+			}
+			if len(state) == 0 {
+				room.model = ""
+				room.modelProvider = ""
+				room.modelName = ""
+				room.reasoningEffort = ""
+				room.reasoningMode = ""
+			} else {
+				if model != "" {
+					room.model = model
+				}
+				if provider != "" {
+					room.modelProvider = provider
+				}
+				if name != "" {
+					room.modelName = name
+				}
+				if effort != "" {
+					room.reasoningEffort = effort
+				}
+				if reasoningMode != "" {
+					room.reasoningMode = reasoningMode
+				}
+			}
+			c.threadRooms[threadID] = room
+			activeUpdates = append(activeUpdates, struct {
+				threadID string
+			room     threadRoom
+		}{threadID: threadID, room: room})
 	}
 	c.threadMu.Unlock()
+	for _, update := range activeUpdates {
+		c.updateActiveRunRoom(update.threadID, update.room)
+	}
+}
+
+func (c *Connector) claimMatrixStart(key string) bool {
+	if c == nil || key == "" {
+		return false
+	}
+	c.matrixStartMu.Lock()
+	defer c.matrixStartMu.Unlock()
+	if c.matrixStarts == nil {
+		c.matrixStarts = map[string]struct{}{}
+	}
+	if _, ok := c.matrixStarts[key]; ok {
+		return false
+	}
+	c.matrixStarts[key] = struct{}{}
+	return true
+}
+
+func (c *Connector) finishMatrixStart(key string) {
+	if c == nil || key == "" {
+		return
+	}
+	c.matrixStartMu.Lock()
+	delete(c.matrixStarts, key)
+	c.matrixStartMu.Unlock()
+}
+
+func (c *Connector) rememberWarmThread(threadID string) {
+	if c == nil || threadID == "" {
+		return
+	}
+	c.warmThreadMu.Lock()
+	if c.warmThreads == nil {
+		c.warmThreads = map[string]struct{}{}
+	}
+	c.warmThreads[threadID] = struct{}{}
+	c.warmThreadMu.Unlock()
+}
+
+func (c *Connector) forgetWarmThread(threadID string) {
+	if c == nil || threadID == "" {
+		return
+	}
+	c.warmThreadMu.Lock()
+	delete(c.warmThreads, threadID)
+	c.warmThreadMu.Unlock()
+}
+
+func (c *Connector) isWarmThread(threadID string) bool {
+	if c == nil || threadID == "" {
+		return false
+	}
+	c.warmThreadMu.Lock()
+	defer c.warmThreadMu.Unlock()
+	_, ok := c.warmThreads[threadID]
+	return ok
 }
 
 func (c *Connector) lookupThreadRoom(ctx context.Context, threadID string) (threadRoom, bool) {
@@ -869,9 +1134,30 @@ func (c *Connector) hydrateThreadRooms(ctx context.Context) {
 		if c.deleteUnmaterializedProjectPortal(ctx, portal) {
 			continue
 		}
+		c.syncPortalMembers(ctx, portal)
 		portal = c.hydratePortalThreadRoomState(ctx, portal)
 		c.rememberPortalThreadRoom(portal)
 	}
+}
+
+func (c *Connector) syncPortalMembers(ctx context.Context, portal *bridgev2.Portal) {
+	if c == nil || c.Bridge == nil || portal == nil || portal.MXID == "" {
+		return
+	}
+	login := c.Bridge.GetCachedUserLoginByID(portal.PortalKey.Receiver)
+	if login == nil {
+		return
+	}
+	cl, ok := login.Client.(*Client)
+	if !ok || cl == nil {
+		cl = &Client{Main: c, UserLogin: login, loggedIn: true}
+	}
+	info := &bridgev2.ChatInfo{Members: cl.codexMembers()}
+	if isNewProjectPortalID(portal.ID) {
+		info = cl.newProjectChat("New Project").PortalInfo
+		applyStoredPortalInfo(info, portal)
+	}
+	portal.UpdateInfo(ctx, info, login, nil, time.Now())
 }
 
 func (c *Connector) syncBaseContactGhosts(ctx context.Context) {
@@ -888,7 +1174,7 @@ func (c *Connector) syncRecentContactGhosts(ctx context.Context) {
 	threads, _, err := (&Client{Main: c}).listThreadPage(ctx, "", contactGhostSyncLimit)
 	if err != nil {
 		logFromContext(ctx).Warn().Err(err).Msg("Failed to list Codex threads for contact ghost sync")
-		return
+		threads = c.cachedThreadsForLogin(nil)
 	}
 	c.syncContactGhostsForThreads(ctx, threads)
 }
@@ -1001,7 +1287,7 @@ func (c *Connector) hydratePortalThreadRoomState(ctx context.Context, portal *br
 			return synced
 		}
 	} else if c != nil {
-		c.rememberThreadRoom(threadID, cl, portal.PortalKey, cwd, thread.ModelProvider, threadModelRef(thread), threadReasoningEffort(thread))
+		c.rememberThreadRoom(threadID, cl, portal.PortalKey, cwd, thread.ModelProvider, threadModelRef(thread), threadReasoningEffort(thread), firstStateString(state, "modelName"), firstStateString(state, "reasoning_mode", "reasoningMode"))
 	}
 	return portal
 }
@@ -1075,6 +1361,12 @@ func (c *Connector) handleThreadMetadataNotification(method, threadID string, pa
 	if effort := firstStateString(state, "effort", "reasoning", "reasoningEffort", "reasoning_effort"); effort != "" {
 		room.reasoningEffort = effort
 	}
+	if name := firstStateString(state, "modelName"); name != "" {
+		room.modelName = name
+	}
+	if reasoningMode := firstStateString(state, "reasoning_mode", "reasoningMode"); reasoningMode != "" {
+		room.reasoningMode = reasoningMode
+	}
 	if codexModelStateRef(state, room.modelProvider) == "" && room.model != "" {
 		state["model"] = room.model
 	}
@@ -1084,6 +1376,12 @@ func (c *Connector) handleThreadMetadataNotification(method, threadID string, pa
 	if firstStateString(state, "effort", "reasoning", "reasoningEffort", "reasoning_effort") == "" && room.reasoningEffort != "" {
 		state["reasoningEffort"] = room.reasoningEffort
 	}
+	if firstStateString(state, "modelName") == "" && room.modelName != "" {
+		state["modelName"] = room.modelName
+	}
+	if firstStateString(state, "reasoning_mode", "reasoningMode") == "" && room.reasoningMode != "" {
+		state["reasoning_mode"] = room.reasoningMode
+	}
 	c.threadMu.Lock()
 	c.threadRooms[threadID] = room
 	c.threadMu.Unlock()
@@ -1092,6 +1390,13 @@ func (c *Connector) handleThreadMetadataNotification(method, threadID string, pa
 		return
 	}
 	info := codexThreadChatInfo(room.cwd, threadID, state)
+	if c.Bridge != nil {
+		if portal, err := c.Bridge.GetExistingPortalByKey(context.Background(), room.portalKey); err == nil {
+			applyStoredPortalInfo(info, portal)
+		} else {
+			logFromContext(context.Background()).Warn().Err(err).Str("thread_id", threadID).Stringer("portal_key", room.portalKey).Msg("Failed to load portal before Codex thread metadata update")
+		}
+	}
 	res := room.login.QueueRemoteEvent(&simplevent.ChatInfoChange{
 		EventMeta: remoteEventMeta(bridgev2.RemoteEventChatInfoChange, room.portalKey, codexUserID, time.Now()),
 		ChatInfoChange: &bridgev2.ChatInfoChange{
@@ -1372,7 +1677,7 @@ func hydrateThreadFromSessionFile(thread appserver.Thread) appserver.Thread {
 }
 
 func copySessionThreadFields(dst, payload map[string]any) {
-	for _, key := range []string{"cwd", "model", "effort"} {
+	for _, key := range []string{"cwd", "model", "modelName", "effort", "reasoning_mode", "reasoningMode"} {
 		if value, ok := payload[key]; ok {
 			dst[key] = value
 		}
@@ -1384,7 +1689,7 @@ func copySessionThreadFields(dst, payload map[string]any) {
 
 func copyThreadStateFields(dst, thread map[string]any) {
 	delete(thread, "turns")
-	for _, key := range []string{"sessionId", "forkedFromId", "parentThreadId", "cwd", "path", "name", "preview", "status", "model", "modelProvider", "serviceTier", "effort", "reasoningEffort", "summary", "createdAt", "updatedAt", "ephemeral", "cliVersion", "source", "threadSource", "agentNickname", "agentRole", "gitInfo"} {
+	for _, key := range []string{"sessionId", "forkedFromId", "parentThreadId", "cwd", "path", "name", "preview", "status", "model", "modelName", "modelProvider", "serviceTier", "effort", "reasoningEffort", "reasoning_mode", "reasoningMode", "summary", "createdAt", "updatedAt", "ephemeral", "cliVersion", "source", "threadSource", "agentNickname", "agentRole", "gitInfo"} {
 		if value, ok := thread[key]; ok {
 			dst[key] = value
 		}
@@ -1452,7 +1757,7 @@ func copyStateMap(src map[string]any) map[string]any {
 }
 
 func copyThreadSettingsFields(dst, settings map[string]any) {
-	for _, key := range []string{"cwd", "approvalPolicy", "approvalsReviewer", "sandboxPolicy", "activePermissionProfile", "model", "modelProvider", "serviceTier", "effort", "summary", "collaborationMode", "personality"} {
+	for _, key := range []string{"cwd", "approvalPolicy", "approvalsReviewer", "sandboxPolicy", "activePermissionProfile", "model", "modelName", "modelProvider", "serviceTier", "effort", "reasoning_mode", "reasoningMode", "summary", "collaborationMode", "personality"} {
 		if value, ok := settings[key]; ok {
 			dst[key] = value
 			dst["settings."+key] = value
@@ -1469,26 +1774,51 @@ func codexAIModelStateContent(state map[string]any) map[string]any {
 	if effort := firstStateString(state, "effort", "reasoning", "reasoningEffort", "reasoning_effort"); effort != "" {
 		content["reasoning"] = effort
 	}
-	if name := firstStateString(state, "modelName"); name != "" && name != firstStateString(state, "model", "toModel") {
+	if reasoningMode := firstStateString(state, "reasoning_mode", "reasoningMode"); reasoningMode != "" {
+		content["reasoning_mode"] = reasoningMode
+	}
+	if name := firstStateString(state, "modelName", "name"); name != "" && name != firstStateString(state, "model", "toModel") {
 		content["name"] = name
 	}
 	return content
 }
 
 func enrichThreadStateWithModelState(state, modelState map[string]any) map[string]any {
-	if codexAIModelStateContent(state) != nil || codexAIModelStateContent(modelState) == nil {
+	if len(modelState) == 0 {
 		return state
 	}
-	enriched := copyStateMap(state)
-	enriched["model"] = firstStateString(modelState, "model")
-	if provider := firstStateString(modelState, "modelProvider", "provider"); provider != "" && firstStateString(enriched, "modelProvider", "provider") == "" {
-		enriched["modelProvider"] = provider
+	var enriched map[string]any
+	ensureEnriched := func() map[string]any {
+		if enriched == nil {
+			enriched = copyStateMap(state)
+		}
+		return enriched
 	}
-	if effort := firstStateString(modelState, "effort", "reasoning", "reasoningEffort", "reasoning_effort"); effort != "" && firstStateString(enriched, "effort", "reasoning", "reasoningEffort", "reasoning_effort") == "" {
-		enriched["reasoningEffort"] = effort
+	currentString := func(keys ...string) string {
+		if enriched != nil {
+			return firstStateString(enriched, keys...)
+		}
+		return firstStateString(state, keys...)
 	}
-	if name := firstStateString(modelState, "modelName", "name"); name != "" && firstStateString(enriched, "modelName", "name") == "" {
-		enriched["modelName"] = name
+	if codexModelStateRef(state, "") == "" {
+		if model := firstStateString(modelState, "model"); model != "" {
+			ensureEnriched()["model"] = model
+		}
+	}
+	if provider := firstStateString(modelState, "modelProvider", "provider"); provider != "" && currentString("modelProvider", "provider") == "" {
+		ensureEnriched()["modelProvider"] = provider
+	}
+	if effort := firstStateString(modelState, "effort", "reasoning", "reasoningEffort", "reasoning_effort"); effort != "" && currentString("effort", "reasoning", "reasoningEffort", "reasoning_effort") == "" {
+		ensureEnriched()["reasoningEffort"] = effort
+	}
+	if name := firstStateString(modelState, "modelName", "name"); name != "" && currentString("modelName", "name") == "" {
+		ensureEnriched()["modelName"] = name
+	}
+	if reasoningMode := firstStateString(modelState, "reasoning_mode", "reasoningMode"); reasoningMode != "" && currentString("reasoning_mode", "reasoningMode") == "" {
+		ensureEnriched()["reasoning_mode"] = reasoningMode
+	}
+	if enriched == nil {
+		return state
 	}
 	return enriched
 }
@@ -1614,7 +1944,7 @@ func threadNoticeText(method string, params json.RawMessage) string {
 		}
 		return "Codex switched models."
 	case "model/verification":
-		return "Codex is verifying the selected model."
+		return modelVerificationNoticeText(payload)
 	case "thread/realtime/error":
 		if message, _ := payload["message"].(string); strings.TrimSpace(message) != "" {
 			return "Codex realtime error:\n\n" + strings.TrimSpace(message)
@@ -1632,6 +1962,37 @@ func threadNoticeText(method string, params json.RawMessage) string {
 	default:
 		return ""
 	}
+}
+
+func modelVerificationNoticeText(payload map[string]any) string {
+	for _, verification := range modelVerificationNames(payload["verifications"]) {
+		switch verification {
+		case "trustedAccessForCyber", "trusted_access_for_cyber":
+			return "Codex is running extra safety checks for possible cybersecurity risk. Responses may take longer.\n\nTrusted Access for Cyber: https://chatgpt.com/cyber"
+		}
+	}
+	return "Codex is verifying the selected model."
+}
+
+func modelVerificationNames(value any) []string {
+	values, _ := value.([]any)
+	names := make([]string, 0, len(values))
+	for _, value := range values {
+		switch typed := value.(type) {
+		case string:
+			if text := strings.TrimSpace(typed); text != "" {
+				names = append(names, text)
+			}
+		case map[string]any:
+			for _, key := range []string{"type", "verification", "name"} {
+				if text, _ := typed[key].(string); strings.TrimSpace(text) != "" {
+					names = append(names, strings.TrimSpace(text))
+					break
+				}
+			}
+		}
+	}
+	return names
 }
 
 func warningNoticeText(method string, payload map[string]any) string {
@@ -1808,7 +2169,7 @@ func applyStoredPortalInfo(info *bridgev2.ChatInfo, portal *bridgev2.Portal) {
 	if portal.NameSet {
 		info.Name = &portal.Name
 	}
-	if portal.TopicSet {
+	if strings.TrimSpace(portal.Topic) != "" {
 		info.Topic = &portal.Topic
 	}
 }
