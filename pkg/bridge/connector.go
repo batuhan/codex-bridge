@@ -1,9 +1,13 @@
 package bridge
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -29,8 +33,8 @@ const appServerStartupTimeout = 15 * time.Second
 const contactGhostSyncLimit = 20
 const messageMetadataSyncLimit = 500
 const bridgeInfoVersion = 2
-const roomCapabilitiesVersion = 5
-const roomFeaturesID = "com.beeper.codex.capabilities.2026_06_02.no_typing+state"
+const roomCapabilitiesVersion = 8
+const roomFeaturesID = "com.beeper.codex.capabilities.2026_06_02.room_features_no_reactions_no_disappearing"
 const defaultCodexAvatarMXC = "mxc://beeper.com/51a668657dd9e0132cc823ad9402c6c2d0fc3321"
 
 type Connector struct {
@@ -96,7 +100,6 @@ func (c *Connector) GetDBMetaTypes() database.MetaTypes {
 
 func (c *Connector) GetCapabilities() *bridgev2.NetworkGeneralCapabilities {
 	return &bridgev2.NetworkGeneralCapabilities{
-		DisappearingMessages: true,
 		AggressiveUpdateInfo: true,
 		Provisioning: bridgev2.ProvisioningCapabilities{
 			ResolveIdentifier: bridgev2.ResolveIdentifierCapabilities{
@@ -334,7 +337,6 @@ func (c *Connector) handleNotification(method string, params json.RawMessage) {
 		return
 	}
 	c.handleThreadMetadataNotification(method, threadID, params)
-	c.handleThreadNoticeNotification(method, threadID, params)
 	c.activeMu.Lock()
 	active := c.active[threadID]
 	c.activeMu.Unlock()
@@ -342,6 +344,7 @@ func (c *Connector) handleNotification(method string, params json.RawMessage) {
 		active = c.startActiveRunFromNotification(threadID, params)
 	}
 	if active == nil {
+		c.handleThreadNoticeNotification(method, threadID, params)
 		return
 	}
 	active.handle(method, params)
@@ -1198,6 +1201,9 @@ func remoteEventMeta(eventType bridgev2.RemoteEventType, portalKey networkid.Por
 }
 
 func codexThreadStateUpdater(state map[string]any) bridgev2.ExtraUpdater[*bridgev2.Portal] {
+	if state == nil {
+		state = map[string]any{}
+	}
 	return func(ctx context.Context, portal *bridgev2.Portal) bool {
 		if portal == nil || portal.MXID == "" {
 			return false
@@ -1289,6 +1295,7 @@ func codexThreadState(method, threadID, cwd string, params json.RawMessage) map[
 }
 
 func codexThreadInitialState(thread appserver.Thread) map[string]any {
+	thread = hydrateThreadFromSessionFile(thread)
 	state := copyStateMap(thread.Raw)
 	delete(state, "turns")
 	state["threadId"] = thread.ID
@@ -1319,6 +1326,60 @@ func codexThreadInitialState(thread appserver.Thread) map[string]any {
 	}
 	normalizeThreadState("thread/started", state)
 	return state
+}
+
+func hydrateThreadFromSessionFile(thread appserver.Thread) appserver.Thread {
+	if thread.Path == "" {
+		return thread
+	}
+	file, err := os.Open(thread.Path)
+	if err != nil {
+		return thread
+	}
+	defer file.Close()
+	raw := copyStateMap(thread.Raw)
+	reader := bufio.NewReader(file)
+	for {
+		line, err := reader.ReadString('\n')
+		if strings.Contains(line, `"type":"turn_context"`) {
+			var record struct {
+				Type    string         `json:"type"`
+				Payload map[string]any `json:"payload"`
+			}
+			if json.Unmarshal([]byte(line), &record) == nil && record.Type == "turn_context" {
+				copySessionThreadFields(raw, record.Payload)
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		} else if err != nil {
+			return thread
+		}
+	}
+	if len(raw) == 0 {
+		return thread
+	}
+	thread.Raw = raw
+	if thread.Cwd == "" {
+		thread.Cwd = firstStateString(raw, "cwd")
+	}
+	if thread.ModelProvider == "" {
+		if provider, _, ok := strings.Cut(firstStateString(raw, "model"), "/"); ok {
+			thread.ModelProvider = provider
+		}
+	}
+	return thread
+}
+
+func copySessionThreadFields(dst, payload map[string]any) {
+	for _, key := range []string{"cwd", "model", "effort"} {
+		if value, ok := payload[key]; ok {
+			dst[key] = value
+		}
+	}
+	if value, ok := payload["reasoning_effort"]; ok {
+		dst["reasoningEffort"] = value
+	}
 }
 
 func copyThreadStateFields(dst, thread map[string]any) {
@@ -1412,6 +1473,24 @@ func codexAIModelStateContent(state map[string]any) map[string]any {
 		content["name"] = name
 	}
 	return content
+}
+
+func enrichThreadStateWithModelState(state, modelState map[string]any) map[string]any {
+	if codexAIModelStateContent(state) != nil || codexAIModelStateContent(modelState) == nil {
+		return state
+	}
+	enriched := copyStateMap(state)
+	enriched["model"] = firstStateString(modelState, "model")
+	if provider := firstStateString(modelState, "modelProvider", "provider"); provider != "" && firstStateString(enriched, "modelProvider", "provider") == "" {
+		enriched["modelProvider"] = provider
+	}
+	if effort := firstStateString(modelState, "effort", "reasoning", "reasoningEffort", "reasoning_effort"); effort != "" && firstStateString(enriched, "effort", "reasoning", "reasoningEffort", "reasoning_effort") == "" {
+		enriched["reasoningEffort"] = effort
+	}
+	if name := firstStateString(modelState, "modelName", "name"); name != "" && firstStateString(enriched, "modelName", "name") == "" {
+		enriched["modelName"] = name
+	}
+	return enriched
 }
 
 func codexModelStateRef(state map[string]any, fallbackProvider string) string {
@@ -1545,7 +1624,7 @@ func threadNoticeText(method string, params json.RawMessage) string {
 		if reason, _ := payload["reason"].(string); strings.TrimSpace(reason) != "" {
 			return "Codex realtime closed:\n\n" + strings.TrimSpace(reason)
 		}
-		return ""
+		return "Codex realtime closed."
 	case "warning", "guardianWarning", "configWarning", "deprecationNotice":
 		return warningNoticeText(method, payload)
 	case "error":
@@ -1711,13 +1790,6 @@ func uniqueIdentifiers(values ...string) []string {
 
 func portalInfo(name string, members *bridgev2.ChatMemberList, cwd, threadID string, state map[string]any) *bridgev2.ChatInfo {
 	roomType := database.RoomTypeDM
-	extraUpdates := bridgev2.MergeExtraUpdaters(
-		codexPortalMetadataUpdater(cwd, threadID),
-		codexCommandStateUpdater(),
-	)
-	if state != nil {
-		extraUpdates = codexThreadMetadataUpdater(cwd, threadID, state)
-	}
 	return &bridgev2.ChatInfo{
 		Name:                       stringPtr(name),
 		Avatar:                     codexAvatar(),
@@ -1725,7 +1797,7 @@ func portalInfo(name string, members *bridgev2.ChatMemberList, cwd, threadID str
 		Members:                    members,
 		ExcludeChangesFromTimeline: true,
 		CanBackfill:                threadID != "",
-		ExtraUpdates:               extraUpdates,
+		ExtraUpdates:               codexThreadMetadataUpdater(cwd, threadID, state),
 	}
 }
 
@@ -1738,10 +1810,6 @@ func applyStoredPortalInfo(info *bridgev2.ChatInfo, portal *bridgev2.Portal) {
 	}
 	if portal.TopicSet {
 		info.Topic = &portal.Topic
-	}
-	if portal.Disappear.Type != "" {
-		disappear := portal.Disappear
-		info.Disappear = &disappear
 	}
 }
 

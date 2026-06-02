@@ -37,8 +37,13 @@ func runFakeAppServer() {
 			continue
 		}
 		appendFakeAppServerRequest(msg.Method, msg.Params)
-		result := fakeAppServerResult(msg.Method, msg.Params)
-		raw, _ := json.Marshal(fakeAppServerMessage{ID: msg.ID, Result: result})
+		resp := fakeAppServerMessage{ID: msg.ID}
+		if rpcErr := fakeAppServerError(msg.Method, msg.Params); rpcErr != nil {
+			resp.Error = rpcErr
+		} else {
+			resp.Result = fakeAppServerResult(msg.Method, msg.Params)
+		}
+		raw, _ := json.Marshal(resp)
 		_, _ = writer.Write(append(raw, '\n'))
 		_ = writer.Flush()
 	}
@@ -59,6 +64,15 @@ func appendFakeAppServerRequest(method string, params json.RawMessage) {
 	}
 	_, _ = file.Write(append(raw, '\n'))
 	_ = file.Close()
+}
+
+func fakeAppServerError(method string, params json.RawMessage) any {
+	payload := map[string]any{}
+	_ = json.Unmarshal(params, &payload)
+	if method == "thread/read" && firstFakeAppServerString(payload, "threadId") == "missing-thread" {
+		return map[string]any{"code": -32004, "message": "thread not loaded: missing-thread"}
+	}
+	return nil
 }
 
 func fakeAppServerResult(method string, params json.RawMessage) any {

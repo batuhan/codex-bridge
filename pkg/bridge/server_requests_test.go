@@ -365,6 +365,22 @@ func TestAnswerResponse(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected multi-answer response:\n got: %#v\nwant: %#v", got, want)
 	}
+
+	got, err = answerResponse(pending, `name="bridge bot" cwd="/tmp/my project"`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = map[string]any{
+		"name": map[string]any{"answers": []string{"bridge bot"}},
+		"cwd":  map[string]any{"answers": []string{"/tmp/my project"}},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected quoted multi-answer response:\n got: %#v\nwant: %#v", got, want)
+	}
+
+	if _, err = answerResponse(pending, `name="bridge bot cwd=/tmp/project`); err == nil {
+		t.Fatal("unterminated quoted value should fail")
+	}
 }
 
 func TestAnswerResolutionClearsStreamInterruptWithoutChangingCodexResponse(t *testing.T) {

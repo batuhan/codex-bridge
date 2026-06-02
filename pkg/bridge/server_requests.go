@@ -676,14 +676,78 @@ func answerResponse(pending *pendingServerRequest, raw string) (any, error) {
 		answers[ids[0]] = map[string]any{"answers": []string{raw}}
 		return answers, nil
 	}
-	for _, field := range fields {
-		key, value, ok := strings.Cut(field, "=")
-		if !ok || key == "" {
-			return nil, fmt.Errorf("invalid answer %q", field)
-		}
+	assignments, err := parseAnswerAssignments(raw)
+	if err != nil {
+		return nil, err
+	}
+	for key, value := range assignments {
 		answers[key] = map[string]any{"answers": []string{value}}
 	}
 	return answers, nil
+}
+
+func parseAnswerAssignments(raw string) (map[string]string, error) {
+	out := map[string]string{}
+	for i := 0; i < len(raw); {
+		for i < len(raw) && isAnswerSpace(raw[i]) {
+			i++
+		}
+		if i == len(raw) {
+			break
+		}
+		keyStart := i
+		for i < len(raw) && raw[i] != '=' && !isAnswerSpace(raw[i]) {
+			i++
+		}
+		if keyStart == i || i == len(raw) || raw[i] != '=' {
+			return nil, fmt.Errorf("invalid answer assignment near %q", raw[keyStart:])
+		}
+		key := raw[keyStart:i]
+		i++
+		value, next, err := parseAnswerValue(raw, i)
+		if err != nil {
+			return nil, err
+		}
+		out[key] = value
+		i = next
+	}
+	return out, nil
+}
+
+func parseAnswerValue(raw string, i int) (string, int, error) {
+	if i >= len(raw) {
+		return "", i, nil
+	}
+	if raw[i] != '"' && raw[i] != '\'' {
+		start := i
+		for i < len(raw) && !isAnswerSpace(raw[i]) {
+			i++
+		}
+		return raw[start:i], i, nil
+	}
+	quote := raw[i]
+	i++
+	var b strings.Builder
+	for i < len(raw) {
+		ch := raw[i]
+		i++
+		if ch == quote {
+			if i < len(raw) && !isAnswerSpace(raw[i]) {
+				return "", i, fmt.Errorf("invalid quoted answer value near %q", raw[i:])
+			}
+			return b.String(), i, nil
+		}
+		if ch == '\\' && i < len(raw) {
+			ch = raw[i]
+			i++
+		}
+		b.WriteByte(ch)
+	}
+	return "", i, fmt.Errorf("unterminated quoted answer value")
+}
+
+func isAnswerSpace(ch byte) bool {
+	return ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r'
 }
 
 func codexCommandDecision(response aistream.ToolApprovalResponse) any {

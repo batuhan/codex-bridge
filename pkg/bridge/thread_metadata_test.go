@@ -2,6 +2,8 @@ package bridge
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -139,6 +141,31 @@ func TestInitialThreadStateIncludesHydratedModelSettings(t *testing.T) {
 	content := codexAIModelStateContent(state)
 	if content["model"] != "openai/gpt-5" || content["reasoning"] != "high" || state["serviceTier"] != "priority" {
 		t.Fatalf("initial state did not include model settings: state=%#v ai=%#v", state, content)
+	}
+}
+
+func TestInitialThreadStateHydratesModelFromSessionFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	err := os.WriteFile(path, []byte(strings.Join([]string{
+		`{"type":"turn_context","payload":{"cwd":"/tmp/project","model":"openai/gpt-5.5","effort":"high"}}`,
+		`{"type":"event_msg","payload":{"type":"token_count"}}`,
+	}, "\n")), 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := codexThreadInitialState(appserver.Thread{
+		ID:            "thread-1",
+		SessionID:     "thread-1",
+		Path:          path,
+		ModelProvider: "openai",
+		Raw:           map[string]any{"modelProvider": "openai"},
+	})
+	if state["model"] != "openai/gpt-5.5" || state["effort"] != "high" || state["cwd"] != "/tmp/project" {
+		t.Fatalf("session model settings were not hydrated: %#v", state)
+	}
+	content := codexAIModelStateContent(state)
+	if content["model"] != "openai/gpt-5.5" || content["reasoning"] != "high" {
+		t.Fatalf("hydrated session settings did not project to AI model state: %#v", content)
 	}
 }
 
@@ -299,6 +326,115 @@ func TestCodexThreadChatInfoExtraUpdatesClearsMissingAIModelState(t *testing.T) 
 	}
 	if modelState.Content == nil || len(modelState.Content.Raw) != 0 {
 		t.Fatalf("Beeper AI model state clear used wrong content: %#v", modelState.Content)
+	}
+}
+
+func TestSyncThreadPortalKeepsExistingAIModelWhenThreadOmitsModel(t *testing.T) {
+	ctx := context.Background()
+	matrix := &modelStateMatrix{modelEvt: &event.Event{Content: event.Content{
+		Raw: map[string]any{"model": "openai/gpt-5.5", "reasoning": "high"},
+	}}}
+	connector, br := testBridgeWithDB(t, matrix)
+	user, err := br.GetUserByMXID(ctx, id.UserID("@user:example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := user.NewLogin(ctx, &database.UserLogin{
+		ID:            "sh-codex",
+		RemoteName:    "Codex",
+		RemoteProfile: status.RemoteProfile{Name: "Codex"},
+		Metadata:      map[string]any{},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := login.Client.(*Client)
+	key := projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.syncThreadPortal(ctx, portal, appserver.Thread{
+		ID:            "thread-1",
+		SessionID:     "thread-1",
+		Cwd:           "/tmp/project",
+		ModelProvider: "openai",
+		Raw:           map[string]any{"modelProvider": "openai"},
+	})
+
+	modelState := findFakeState(matrix.api.states, beeperAIModelStateType)
+	if modelState == nil || modelState.Content.Raw["model"] != "openai/gpt-5.5" || modelState.Content.Raw["reasoning"] != "high" {
+		t.Fatalf("syncThreadPortal cleared existing AI model state: %#v", matrix.api.states)
+	}
+	room, ok := connector.threadRoom("thread-1")
+	if !ok || room.model != "openai/gpt-5.5" || room.reasoningEffort != "high" {
+		t.Fatalf("syncThreadPortal did not cache existing AI model state: %#v", room)
+	}
+}
+
+func TestSyncThreadPortalRepairsAIModelFromSessionFile(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "session.jsonl")
+	if err := os.WriteFile(path, []byte(`{"type":"turn_context","payload":{"cwd":"/tmp/project","model":"openai/gpt-5.5","effort":"high"}}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	matrix := &modelStateMatrix{modelEvt: &event.Event{Content: event.Content{Raw: map[string]any{}}}}
+	connector, br := testBridgeWithDB(t, matrix)
+	user, err := br.GetUserByMXID(ctx, id.UserID("@user:example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := user.NewLogin(ctx, &database.UserLogin{
+		ID:            "sh-codex",
+		RemoteName:    "Codex",
+		RemoteProfile: status.RemoteProfile{Name: "Codex"},
+		Metadata:      map[string]any{},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := login.Client.(*Client)
+	key := projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.syncThreadPortal(ctx, portal, appserver.Thread{
+		ID:            "thread-1",
+		SessionID:     "thread-1",
+		Cwd:           "/tmp/project",
+		Path:          path,
+		ModelProvider: "openai",
+		Raw:           map[string]any{"modelProvider": "openai"},
+	})
+
+	modelState := findFakeState(matrix.api.states, beeperAIModelStateType)
+	if modelState == nil || modelState.Content.Raw["model"] != "openai/gpt-5.5" || modelState.Content.Raw["reasoning"] != "high" {
+		t.Fatalf("syncThreadPortal did not repair AI model state from session file: %#v", matrix.api.states)
+	}
+	room, ok := connector.threadRoom("thread-1")
+	if !ok || room.model != "openai/gpt-5.5" || room.reasoningEffort != "high" {
+		t.Fatalf("syncThreadPortal did not cache session model state: %#v", room)
 	}
 }
 
@@ -504,6 +640,10 @@ func TestThreadNoticeText(t *testing.T) {
 	got = threadNoticeText("thread/realtime/error", []byte(`{"threadId":"thread-1","message":"audio failed"}`))
 	if got != "Codex realtime error:\n\naudio failed" {
 		t.Fatalf("unexpected realtime error notice: %q", got)
+	}
+	got = threadNoticeText("thread/realtime/closed", []byte(`{"threadId":"thread-1"}`))
+	if got != "Codex realtime closed." {
+		t.Fatalf("unexpected realtime closed notice: %q", got)
 	}
 	got = threadNoticeText("thread/status/changed", []byte(`{"threadId":"thread-1","model":"openai/gpt-5.5","status":{"type":"systemError"}}`))
 	if got != "Codex entered system error state while using openai/gpt-5.5." {
@@ -845,6 +985,52 @@ func TestThreadNoticeNotificationQueuesBeeperAINotice(t *testing.T) {
 	meta, ok := dbMsg.Metadata.(*MessageMetadata)
 	if !ok || meta.Role != "assistant" || meta.ThreadID != "thread-1" || meta.StreamStatus != "notice" {
 		t.Fatalf("notice DB metadata was wrong: %#v", dbMsg.Metadata)
+	}
+}
+
+func TestThreadNoticeNotificationUsesActiveStreamWhenPresent(t *testing.T) {
+	ctx := context.Background()
+	oldPortalEventBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	t.Cleanup(func() { bridgev2.PortalEventBuffer = oldPortalEventBuffer })
+
+	matrix := &fakeMatrixConnector{}
+	connector, br := testBridgeWithDB(t, matrix)
+	user, err := br.GetUserByMXID(ctx, id.UserID("@user:example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := user.NewLogin(ctx, &database.UserLogin{
+		ID:            "sh-codex",
+		RemoteName:    "Codex",
+		RemoteProfile: status.RemoteProfile{Name: "Codex"},
+		Metadata:      map[string]any{},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	client := login.Client.(*Client)
+	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project", "openai", "gpt-5", "high")
+	run := newActiveRun(client, key, "thread-1", "turn-1")
+	connector.setActive("thread-1", run)
+
+	connector.handleNotification("thread/compacted", []byte(`{"threadId":"thread-1"}`))
+
+	if len(matrix.api.messages) != 0 {
+		t.Fatalf("active stream notice should not also queue a standalone message: %#v", matrix.api.messages)
+	}
+	if !hasTextDelta(run.run.Events, codexCompactionNotice) {
+		t.Fatalf("active stream did not include compaction notice: %#v", run.run.Events)
 	}
 }
 

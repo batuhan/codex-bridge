@@ -62,7 +62,7 @@ func TestActiveRunStartRequiresBridgeContext(t *testing.T) {
 	}
 }
 
-func TestAnchorEventIDUsesDeterministicOutgoingID(t *testing.T) {
+func TestAnchorEventIDDoesNotPredictOutgoingID(t *testing.T) {
 	run := newActiveRun(nil, projectPortalKey("/tmp/project", "sh-codex"), "thread-1", "turn-1")
 	portal := &bridgev2.Portal{
 		Portal: &database.Portal{
@@ -76,8 +76,8 @@ func TestAnchorEventIDUsesDeterministicOutgoingID(t *testing.T) {
 	}
 
 	got := run.anchorEventID(context.Background(), portal)
-	if got != "$deterministic:example.com" || run.anchorMXID != got {
-		t.Fatalf("expected deterministic anchor event ID, got %q cached %q", got, run.anchorMXID)
+	if got != "" || run.anchorMXID != "" {
+		t.Fatalf("anchor event ID should come from the sent event or DB, got %q cached %q", got, run.anchorMXID)
 	}
 }
 
@@ -322,8 +322,22 @@ func TestSemanticDeltasPreserveRawCodexCustomEvents(t *testing.T) {
 	}
 }
 
+func TestTurnStartedDoesNotCreateVisibleThinkingPart(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.handle("turn/started", []byte(`{"threadId":"thread-1","turn":{"id":"turn-1"}}`))
+	run.writer.Text("done")
+	run.writer.Finish(agui.FinishReasonStop)
+
+	message := run.run.FinalBeeperAIMessage(0, true)
+	for _, part := range message.Parts {
+		if part["type"] == "thinking" {
+			t.Fatalf("turn/started should not become a visible thinking part: %#v", message.Parts)
+		}
+	}
+}
+
 func TestActiveRunNotificationsPreserveRawCodexCustomEvents(t *testing.T) {
-	for _, method := range currentCodexServerNotifications {
+	for _, method := range generatedTypeScriptMethods(t, codexTypeScriptNotificationPath) {
 		if !isActiveRunNotification(method) || method == "turn/completed" {
 			continue
 		}
@@ -395,6 +409,12 @@ func TestTurnCompletedPreservesRawCodexCustomEvent(t *testing.T) {
 	if !hasCustomPayloadText(run.run.Events, "turn/completed", "marker", "raw-turn/completed") {
 		t.Fatalf("turn/completed did not preserve raw Codex payload as AG-UI custom event: %#v", run.run.Events)
 	}
+	message := run.run.FinalBeeperAIMessage(0, true)
+	for _, part := range message.Parts {
+		if part["type"] == "thinking" && (part["content"] == "turn-1" || part["stepId"] == "turn-1") {
+			t.Fatalf("turn/completed should not become a visible thinking part: %#v", message.Parts)
+		}
+	}
 	if connector.activeRun("thread-1") != nil {
 		t.Fatal("turn/completed should clear the active run")
 	}
@@ -415,6 +435,20 @@ func TestRealtimeTranscriptDoneRecoversAssistantText(t *testing.T) {
 	run.handle("thread/realtime/transcript/done", []byte(`{"threadId":"thread-1","role":"assistant","text":"delta"}`))
 	if got := run.run.Text(); got != "delta" {
 		t.Fatalf("transcript done duplicated streamed delta text: %q", got)
+	}
+
+	run = newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.handle("thread/compacted", []byte(`{"threadId":"thread-1"}`))
+	run.handle("thread/realtime/transcript/done", []byte(`{"threadId":"thread-1","role":"assistant","text":"after notice"}`))
+	if got := run.run.Text(); !strings.Contains(got, "after notice") {
+		t.Fatalf("transcript done was hidden by unrelated visible text: %q", got)
+	}
+
+	run = newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.handle("thread/realtime/transcript/delta", []byte(`{"threadId":"thread-1","role":"assistant","delta":"hel"}`))
+	run.handle("thread/realtime/transcript/done", []byte(`{"threadId":"thread-1","role":"assistant","text":"hello"}`))
+	if got := run.run.Text(); got != "hello" {
+		t.Fatalf("transcript done did not append missing suffix: %q", got)
 	}
 }
 
@@ -490,6 +524,12 @@ func TestActiveRunNoticeNotificationsAreUserVisible(t *testing.T) {
 			params: `{"threadId":"thread-1","reason":"microphone disconnected"}`,
 			want:   "Codex realtime closed:\n\nmicrophone disconnected",
 		},
+		{
+			name:   "realtime closed without reason",
+			method: "thread/realtime/closed",
+			params: `{"threadId":"thread-1"}`,
+			want:   "Codex realtime closed.",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -521,6 +561,9 @@ func TestStreamPublisherPublishesCarriers(t *testing.T) {
 	ai, ok := publisher.updates[0][aistream.BeeperAIKey].(aistream.BeeperAI)
 	if !ok || ai.Kind != aistream.AIKindStream || len(ai.Events) == 0 {
 		t.Fatalf("unexpected stream payload: %#v", publisher.updates[0])
+	}
+	if ai.Protocol != "ag-ui" || ai.ThreadID != "thread-1" || ai.RunID != "turn-1" || ai.MessageID != string(run.messageID) {
+		t.Fatalf("stream payload lost run identity: %#v", ai)
 	}
 	if publisher.roomID != "!room:example.com" || publisher.eventID != "$anchor:example.com" {
 		t.Fatalf("published to wrong target: room=%s event=%s", publisher.roomID, publisher.eventID)
@@ -628,7 +671,7 @@ func TestActiveRunPreservesEncryptedBeeperStreamDescriptor(t *testing.T) {
 	}
 }
 
-func TestActiveRunRegistersStreamBeforeAnchorSend(t *testing.T) {
+func TestActiveRunRegistersStreamOnActualAnchorEventID(t *testing.T) {
 	ctx := context.Background()
 	oldPortalEventBuffer := bridgev2.PortalEventBuffer
 	bridgev2.PortalEventBuffer = 0
@@ -669,8 +712,8 @@ func TestActiveRunRegistersStreamBeforeAnchorSend(t *testing.T) {
 			return
 		}
 		checkedAnchorSend = true
-		if publisher.eventID == "" {
-			t.Fatalf("Beeper stream publisher was not registered before anchor send")
+		if publisher.eventID != "" {
+			t.Fatalf("Beeper stream publisher registered before the actual anchor event ID was known: %s", publisher.eventID)
 		}
 	}
 
@@ -683,6 +726,12 @@ func TestActiveRunRegistersStreamBeforeAnchorSend(t *testing.T) {
 	}
 	if !checkedAnchorSend {
 		t.Fatal("anchor send hook was not called")
+	}
+	if run.anchorMXID != "$message" || publisher.eventID != "$message" {
+		t.Fatalf("stream should register on actual anchor event, run=%s publisher=%s", run.anchorMXID, publisher.eventID)
+	}
+	if publisher.eventID == "$deterministic:example.com" {
+		t.Fatal("stream registered on predicted deterministic event ID")
 	}
 }
 
@@ -1031,6 +1080,34 @@ func TestTurnCompletedBeforeStreamStartDoesNotFinalizeWithoutAnchor(t *testing.T
 	}
 	if hasEventType(run.run.Events, agui.EventRunFinished) {
 		t.Fatalf("completion should wait for a stream anchor before finishing, got %#v", run.run.Events)
+	}
+}
+
+func TestFinishTurnMapsCodexTerminalStatuses(t *testing.T) {
+	tests := []struct {
+		status    string
+		message   string
+		wantState string
+	}{
+		{status: "completed", wantState: "complete"},
+		{status: "failed", wantState: "error"},
+		{status: "timed_out", wantState: "error"},
+		{status: "cancelled", wantState: "aborted"},
+		{status: "interrupted", wantState: "aborted"},
+		{status: "inProgress", wantState: "aborted"},
+		{status: "completed", message: "runtime failed", wantState: "error"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.status+"/"+tc.message, func(t *testing.T) {
+			run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+			run.finishTurnLocked(tc.status, tc.message)
+			if run.run.Status.State != tc.wantState {
+				t.Fatalf("status %q message %q mapped to %q, want %q", tc.status, tc.message, run.run.Status.State, tc.wantState)
+			}
+			if tc.wantState == "aborted" && finalStreamStatus(*run.run) != "aborted" {
+				t.Fatalf("aborted turn should persist aborted stream status, got %#v", run.run.Status)
+			}
+		})
 	}
 }
 

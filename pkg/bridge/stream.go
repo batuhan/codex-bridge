@@ -2,7 +2,6 @@ package bridge
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -52,6 +51,7 @@ type activeRun struct {
 	toolResult   map[string]bool
 	agentText    map[string]string
 	reasoning    map[string]string
+	realtimeText string
 	published    int
 	nextSeq      int
 	started      bool
@@ -136,19 +136,9 @@ func (r *activeRun) startLocked(ctx context.Context) error {
 		return err
 	}
 	r.client.queueCodexTyping(r.portalKey, 30*time.Second)
-	publisherStarted := false
-	if r.resolvePredictableAnchorEventIDLocked(ctx) {
-		if err := r.startPublisherLocked(ctx, descriptor); err != nil {
-			return err
-		}
-		publisherStarted = true
-	}
 	msg := r.anchorMessage(descriptor, time.Now())
 	res := r.client.UserLogin.QueueRemoteEvent(msg)
 	if !res.Success {
-		if publisherStarted {
-			r.stopPublisherLocked(ctx)
-		}
 		if res.Error != nil {
 			return res.Error
 		}
@@ -157,14 +147,12 @@ func (r *activeRun) startLocked(ctx context.Context) error {
 	if res.EventID != "" {
 		r.anchorMXID = res.EventID
 	}
-	if !publisherStarted {
-		r.resolveAnchorEventIDLocked(ctx)
-		if r.anchorMXID == "" {
-			return fmt.Errorf("failed to resolve Codex stream anchor event ID")
-		}
-		if err := r.startPublisherLocked(ctx, descriptor); err != nil {
-			return err
-		}
+	r.resolveAnchorEventIDLocked(ctx)
+	if r.anchorMXID == "" {
+		return fmt.Errorf("failed to resolve Codex stream anchor event ID")
+	}
+	if err := r.startPublisherLocked(ctx, descriptor); err != nil {
+		return err
 	}
 	r.persistLocked(ctx)
 	return nil
@@ -290,16 +278,6 @@ func (r *activeRun) resolveAnchorEventIDLocked(ctx context.Context) {
 			Msg("Resolved Codex stream anchor event ID")
 		return
 	}
-	if portal.MXID != "" && bridge.Matrix != nil {
-		r.anchorMXID = bridge.Matrix.GenerateDeterministicEventID(portal.MXID, r.portalKey, r.messageID, partID("text"))
-		logFromContext(ctx).Debug().
-			Str("room_id", string(portal.MXID)).
-			Str("event_id", string(r.anchorMXID)).
-			Str("thread_id", r.threadID).
-			Str("turn_id", r.turnID).
-			Msg("Using deterministic Codex stream anchor event ID")
-		return
-	}
 	eventID, waitErr := aibridgev2.WaitForMessageEventID(ctx, bridge, portal.Receiver, r.messageID, partID("text"), streamAnchorEventIDTimeout)
 	if eventID != "" {
 		r.anchorMXID = eventID
@@ -319,29 +297,6 @@ func (r *activeRun) resolveAnchorEventIDLocked(ctx context.Context) {
 		Msg("Failed to resolve Codex stream anchor event ID")
 }
 
-func (r *activeRun) resolvePredictableAnchorEventIDLocked(ctx context.Context) bool {
-	if r.anchorMXID != "" {
-		return true
-	}
-	if r.client == nil || r.client.Main == nil || r.client.Main.Bridge == nil {
-		return false
-	}
-	portal, err := r.client.Main.Bridge.GetExistingPortalByKey(ctx, r.portalKey)
-	if err != nil || portal == nil {
-		return false
-	}
-	if eventID := r.anchorEventID(ctx, portal); eventID != "" {
-		logFromContext(ctx).Debug().
-			Str("room_id", string(portal.MXID)).
-			Str("event_id", string(eventID)).
-			Str("thread_id", r.threadID).
-			Str("turn_id", r.turnID).
-			Msg("Resolved predictable Codex stream anchor event ID")
-		return true
-	}
-	return false
-}
-
 func (r *activeRun) handle(method string, params json.RawMessage) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -354,7 +309,6 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		r.writer.StateDelta(map[string]any{"codexThread": state})
 		r.writer.Custom(method, rawPayload(params))
 	case "turn/started":
-		r.writer.StepStart(r.turnID)
 		r.writer.Custom(method, rawPayload(params))
 	case "hook/started":
 		payload := rawPayload(params)
@@ -516,6 +470,7 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		payload := rawPayload(params)
 		if role, _ := payload["role"].(string); role == agui.RoleAssistant {
 			if delta, _ := payload["delta"].(string); delta != "" {
+				r.realtimeText += delta
 				r.writer.Text(delta)
 			}
 		}
@@ -523,9 +478,16 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		r.writer.Custom(method, payload)
 	case "thread/realtime/transcript/done":
 		payload := rawPayload(params)
-		if role, _ := payload["role"].(string); role == agui.RoleAssistant && !r.writer.HasTextContent() {
-			if text, _ := payload["text"].(string); strings.TrimSpace(text) != "" {
-				r.writer.Text(text)
+		if role, _ := payload["role"].(string); role == agui.RoleAssistant {
+			if text, _ := payload["text"].(string); text != "" {
+				if r.realtimeText == "" {
+					r.writer.Text(text)
+				} else if strings.HasPrefix(text, r.realtimeText) {
+					if suffix := strings.TrimPrefix(text, r.realtimeText); suffix != "" {
+						r.writer.Text(suffix)
+					}
+				}
+				r.realtimeText = text
 			}
 		}
 		r.writer.StateDelta(map[string]any{"codexRealtime": map[string]any{method: payload}})
@@ -598,16 +560,11 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 				return
 			}
 		}
-		r.writer.StepFinish(r.turnID)
-		if payload.Turn.Status == "failed" {
-			message := "Codex turn failed"
-			if payload.Turn.Error != nil && payload.Turn.Error.Message != "" {
-				message = payload.Turn.Error.Message
-			}
-			r.writer.Error(message)
-		} else {
-			r.writer.Finish(agui.FinishReasonStop)
+		message := ""
+		if payload.Turn.Error != nil {
+			message = payload.Turn.Error.Message
 		}
+		r.finishTurnLocked(payload.Turn.Status, message)
 		r.writer.Custom(method, rawPayload(params))
 		r.publishLocked()
 		r.finalizeLocked(time.Now())
@@ -617,6 +574,56 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 		r.writer.Custom(method, rawPayload(params))
 	}
 	r.publishLocked()
+}
+
+func (r *activeRun) finishTurnLocked(status, message string) {
+	finishCodexTurn(r.writer, status, message)
+}
+
+func finishCodexTurn(writer *aistream.Writer, status, message string) {
+	if writer == nil {
+		return
+	}
+	message = strings.TrimSpace(message)
+	if message != "" {
+		writer.Error(message)
+		return
+	}
+	statusKind := codexTurnStatusKind(status)
+	switch statusKind {
+	case "error":
+		writer.Error("Codex turn failed")
+	case "aborted":
+		status = strings.ToLower(strings.TrimSpace(status))
+		if status == "" {
+			status = "aborted"
+		}
+		if writer.Run.Text() == "" {
+			writer.Text("Codex turn was " + status)
+		}
+		writer.Abort("Codex turn was " + status)
+	case "in_progress":
+		if writer.Run.Text() == "" {
+			writer.Text("Codex turn is still in progress.")
+		}
+		writer.Abort("Codex turn is still in progress.")
+	default:
+		writer.Finish(agui.FinishReasonStop)
+	}
+}
+
+func codexTurnStatusKind(status string) string {
+	normalized := strings.NewReplacer("-", "", "_", "", " ", "").Replace(strings.ToLower(strings.TrimSpace(status)))
+	switch normalized {
+	case "failed", "error", "errored", "timedout":
+		return "error"
+	case "aborted", "cancelled", "canceled", "interrupted":
+		return "aborted"
+	case "inprogress", "running", "active":
+		return "in_progress"
+	default:
+		return "complete"
+	}
 }
 
 func (r *activeRun) writeActiveNoticeLocked(method string, params json.RawMessage) {
@@ -895,10 +902,6 @@ func suppressStreamCarrierRequestLogs(ctx context.Context) context.Context {
 
 func (r *activeRun) anchorEventID(ctx context.Context, portal *bridgev2.Portal) id.EventID {
 	if r.anchorMXID != "" {
-		return r.anchorMXID
-	}
-	if portal != nil && portal.MXID != "" && portal.Bridge != nil && portal.Bridge.Matrix != nil && portal.Bridge.Config != nil && portal.Bridge.Config.OutgoingMessageReID {
-		r.anchorMXID = portal.Bridge.Matrix.GenerateDeterministicEventID(portal.MXID, r.portalKey, r.messageID, partID("text"))
 		return r.anchorMXID
 	}
 	if portal == nil || portal.Bridge == nil || portal.Bridge.DB == nil {
@@ -1785,13 +1788,9 @@ func matrixFinalContent(run aistream.Run) (*event.MessageEventContent, map[strin
 }
 
 func matrixFinalContentWithAttachment(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, run aistream.Run) (*event.MessageEventContent, map[string]any, error) {
-	projection := aimatrix.ProjectFinal(run, nil)
-	if projection.NeedsAttachment {
-		partsRef, err := uploadFinalPartsRef(ctx, portal, intent, run, projection.Message)
-		if err != nil {
-			return nil, nil, err
-		}
-		projection = aimatrix.ProjectFinal(run, partsRef)
+	projection, err := aimatrix.ProjectFinalWithAttachment(ctx, portal, intent, run)
+	if err != nil {
+		return nil, nil, err
 	}
 	applyCodexMessageProfile(projection.Content)
 	return projection.Content, projection.Extra, nil
@@ -1808,35 +1807,4 @@ func applyCodexMessageProfile(content *event.MessageEventContent) {
 		AvatarURL:   &avatarURL,
 		HasFallback: true,
 	}
-}
-
-func uploadFinalPartsRef(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, run aistream.Run, message aistream.UIMessage) (*aistream.FinalPartsRef, error) {
-	if portal == nil || portal.Portal == nil || portal.MXID == "" {
-		return nil, fmt.Errorf("missing portal for AI final parts upload")
-	}
-	if intent == nil {
-		return nil, fmt.Errorf("missing Matrix API for AI final parts upload")
-	}
-	payload, err := json.Marshal(run.FinalPartsPayload(message))
-	if err != nil {
-		return nil, fmt.Errorf("failed to encode AI final parts: %w", err)
-	}
-	hash := sha256.Sum256(payload)
-	url, file, err := intent.UploadMedia(ctx, portal.MXID, payload, fmt.Sprintf("ai-final-parts-%s.json", run.RunID), aistream.FinalPartsMediaType)
-	if err != nil {
-		return nil, fmt.Errorf("failed to upload AI final parts: %w", err)
-	}
-	ref := &aistream.FinalPartsRef{
-		Schema:     aistream.FinalPartsRefSchema,
-		MediaType:  aistream.FinalPartsMediaType,
-		ByteSize:   len(payload),
-		SHA256:     base64.RawURLEncoding.EncodeToString(hash[:]),
-		PartsCount: len(message.Parts),
-	}
-	if file != nil {
-		ref.File = file
-	} else {
-		ref.URL = string(url)
-	}
-	return ref, nil
 }

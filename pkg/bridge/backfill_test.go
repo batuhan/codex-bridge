@@ -63,10 +63,203 @@ func TestBackfillAssistantMessageUsesBeeperAI(t *testing.T) {
 	if len(ai.Message.Parts) < 2 {
 		t.Fatalf("expected text and tool parts, got %#v", ai.Message.Parts)
 	}
+	assertNoTurnIDThinkingPart(t, ai, "turn-1")
 	assertCodexProfile(t, part.Content)
 	if !strings.Contains(part.Content.Body, "done") {
 		t.Fatalf("assistant fallback body missing text: %q", part.Content.Body)
 	}
+}
+
+func TestBackfillAssistantMessageMarksFailedTurn(t *testing.T) {
+	client := &Client{UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "codex"}}}
+	thread := appserver.Thread{
+		ID:            "thread-1",
+		ModelProvider: "openai/gpt-5",
+		CreatedAt:     100,
+		Turns: []appserver.Turn{{
+			ID:        "turn-1",
+			StartedAt: 100,
+			Error: &struct {
+				Message string `json:"message"`
+			}{Message: "command failed"},
+			Items: []appserver.TurnItem{
+				{ID: "cmd-1", Type: "commandExecution", Command: "go test ./...", AggregatedOutput: "failed"},
+			},
+		}},
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: networkid.PortalKey{ID: "portal", Receiver: "codex"}}}
+	messages, err := client.projectBackfillMessages(context.Background(), portal, thread)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected one assistant backfill message, got %d", len(messages))
+	}
+	part := messages[0].ConvertedMessage.Parts[0]
+	meta, ok := part.DBMetadata.(*MessageMetadata)
+	if !ok || meta.Role != "assistant" || meta.ThreadID != "thread-1" || meta.TurnID != "turn-1" || meta.StreamStatus != "error" {
+		t.Fatalf("failed assistant backfill has wrong DB metadata: %#v", part.DBMetadata)
+	}
+	ai, ok := part.Extra[aistream.BeeperAIKey].(aistream.BeeperAI)
+	if !ok || ai.Kind != aistream.AIKindFinal {
+		t.Fatalf("failed assistant backfill missing final com.beeper.ai payload: %#v", part.Extra)
+	}
+	if !strings.Contains(part.Content.Body, "command failed") {
+		t.Fatalf("failed assistant fallback body missing error: %q", part.Content.Body)
+	}
+}
+
+func TestBackfillAssistantMessageMarksCancelledTurn(t *testing.T) {
+	client := &Client{UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "codex"}}}
+	thread := appserver.Thread{
+		ID:            "thread-1",
+		ModelProvider: "openai/gpt-5",
+		CreatedAt:     100,
+		Turns: []appserver.Turn{{
+			ID:        "turn-1",
+			Status:    "cancelled",
+			StartedAt: 100,
+			Items: []appserver.TurnItem{
+				{ID: "agent-1", Type: "agentMessage", Text: "partial"},
+			},
+		}},
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: networkid.PortalKey{ID: "portal", Receiver: "codex"}}}
+	messages, err := client.projectBackfillMessages(context.Background(), portal, thread)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected one assistant backfill message, got %d", len(messages))
+	}
+	part := messages[0].ConvertedMessage.Parts[0]
+	meta, ok := part.DBMetadata.(*MessageMetadata)
+	if !ok || meta.StreamStatus != "aborted" {
+		t.Fatalf("cancelled assistant backfill has wrong DB metadata: %#v", part.DBMetadata)
+	}
+	ai, ok := part.Extra[aistream.BeeperAIKey].(aistream.BeeperAI)
+	if !ok || len(ai.Events) == 0 || ai.Events[len(ai.Events)-1].Event.Type() != agui.EventRunError || ai.Events[len(ai.Events)-1].Event.Get("code") != agui.FinishReasonCancelled {
+		t.Fatalf("cancelled assistant backfill missing cancelled RUN_ERROR: %#v", part.Extra)
+	}
+}
+
+func TestBackfillAssistantMessageMarksEmptyInterruptedTurn(t *testing.T) {
+	client := &Client{UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "codex"}}}
+	thread := appserver.Thread{
+		ID:            "thread-1",
+		ModelProvider: "openai/gpt-5",
+		CreatedAt:     100,
+		Turns: []appserver.Turn{{
+			ID:        "turn-1",
+			Status:    "interrupted",
+			StartedAt: 100,
+		}},
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: networkid.PortalKey{ID: "portal", Receiver: "codex"}}}
+	messages, err := client.projectBackfillMessages(context.Background(), portal, thread)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected one interrupted assistant backfill message, got %d", len(messages))
+	}
+	part := messages[0].ConvertedMessage.Parts[0]
+	meta, ok := part.DBMetadata.(*MessageMetadata)
+	if !ok || meta.StreamStatus != "aborted" {
+		t.Fatalf("interrupted assistant backfill has wrong DB metadata: %#v", part.DBMetadata)
+	}
+	if !strings.Contains(part.Content.Body, "Codex turn was interrupted") {
+		t.Fatalf("interrupted assistant fallback body missing status: %q", part.Content.Body)
+	}
+	ai, ok := part.Extra[aistream.BeeperAIKey].(aistream.BeeperAI)
+	if !ok || len(ai.Events) == 0 || ai.Events[len(ai.Events)-1].Event.Type() != agui.EventRunError || ai.Events[len(ai.Events)-1].Event.Get("code") != agui.FinishReasonCancelled {
+		t.Fatalf("interrupted assistant backfill missing cancelled RUN_ERROR: %#v", part.Extra)
+	}
+}
+
+func TestBackfillAssistantMessageMarksEmptyFailedTurn(t *testing.T) {
+	client := &Client{UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "codex"}}}
+	thread := appserver.Thread{
+		ID:            "thread-1",
+		ModelProvider: "openai/gpt-5",
+		CreatedAt:     100,
+		Turns: []appserver.Turn{{
+			ID:        "turn-1",
+			Status:    "failed",
+			StartedAt: 100,
+		}},
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: networkid.PortalKey{ID: "portal", Receiver: "codex"}}}
+	messages, err := client.projectBackfillMessages(context.Background(), portal, thread)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected one failed assistant backfill message, got %d", len(messages))
+	}
+	part := messages[0].ConvertedMessage.Parts[0]
+	meta, ok := part.DBMetadata.(*MessageMetadata)
+	if !ok || meta.StreamStatus != "error" {
+		t.Fatalf("failed assistant backfill has wrong DB metadata: %#v", part.DBMetadata)
+	}
+	if !strings.Contains(part.Content.Body, "Codex turn failed") {
+		t.Fatalf("failed assistant fallback body missing status: %q", part.Content.Body)
+	}
+}
+
+func TestBackfillAssistantMessageSkipsInProgressTurn(t *testing.T) {
+	client := &Client{UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "codex"}}}
+	thread := appserver.Thread{
+		ID:            "thread-1",
+		ModelProvider: "openai/gpt-5",
+		CreatedAt:     100,
+		Turns: []appserver.Turn{{
+			ID:        "turn-1",
+			Status:    "inProgress",
+			StartedAt: 100,
+			Items: []appserver.TurnItem{
+				{ID: "agent-1", Type: "agentMessage", Text: "partial"},
+			},
+		}},
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: networkid.PortalKey{ID: "portal", Receiver: "codex"}}}
+	messages, err := client.projectBackfillMessages(context.Background(), portal, thread)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 0 {
+		t.Fatalf("in-progress assistant turn should not be backfilled as final, got %d messages", len(messages))
+	}
+}
+
+func TestBackfillAssistantMessageDoesNotUseTurnIDAsThinkingStep(t *testing.T) {
+	client := &Client{UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "codex"}}}
+	thread := appserver.Thread{
+		ID:            "thread-1",
+		ModelProvider: "openai/gpt-5",
+		CreatedAt:     100,
+		Turns: []appserver.Turn{{
+			ID:        "turn-1",
+			StartedAt: 100,
+			Items: []appserver.TurnItem{
+				{ID: "agent-1", Type: "agentMessage", Text: "done"},
+			},
+		}},
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: networkid.PortalKey{ID: "portal", Receiver: "codex"}}}
+	messages, err := client.projectBackfillMessages(context.Background(), portal, thread)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected assistant backfill message, got %d", len(messages))
+	}
+	part := messages[0].ConvertedMessage.Parts[0]
+	ai, ok := part.Extra[aistream.BeeperAIKey].(aistream.BeeperAI)
+	if !ok || ai.Message == nil {
+		t.Fatalf("assistant backfill missing com.beeper.ai payload: %#v", part.Extra)
+	}
+	assertNoTurnIDThinkingPart(t, ai, "turn-1")
 }
 
 func TestBackfillAssistantMessageUploadsOversizedFinalParts(t *testing.T) {
@@ -702,4 +895,19 @@ func aiMessageHasText(ai aistream.BeeperAI, text string) bool {
 		}
 	}
 	return false
+}
+
+func assertNoTurnIDThinkingPart(t *testing.T, ai aistream.BeeperAI, turnID string) {
+	t.Helper()
+	if ai.Message == nil {
+		t.Fatalf("AI message missing")
+	}
+	for _, part := range ai.Message.Parts {
+		if part["type"] != "thinking" {
+			continue
+		}
+		if part["content"] == turnID || part["stepId"] == turnID {
+			t.Fatalf("turn ID leaked as visible thinking part: %#v", ai.Message.Parts)
+		}
+	}
 }

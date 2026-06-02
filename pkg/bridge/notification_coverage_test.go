@@ -86,7 +86,7 @@ func TestGlobalCodexNotificationsBroadcastBridgeState(t *testing.T) {
 			drainBridgeStates(matrix.bridgeStateCh)
 
 			connector.handleGlobalNotification(tt.method, []byte(tt.params))
-			state := waitBridgeState(t, matrix.bridgeStateCh)
+			state := waitBridgeStateForNotification(t, matrix.bridgeStateCh, tt.method)
 			if state.StateEvent != tt.wantState {
 				t.Fatalf("state event = %s, want %s: %#v", state.StateEvent, tt.wantState, state)
 			}
@@ -108,8 +108,25 @@ func TestGlobalCodexNotificationsBroadcastBridgeState(t *testing.T) {
 	}
 }
 
+func waitBridgeStateForNotification(t *testing.T, ch <-chan status.BridgeState, method string) status.BridgeState {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		select {
+		case state := <-ch:
+			codex, _ := state.Info["codex"].(map[string]any)
+			if codex["lastNotification"] == method {
+				return state
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for bridge state for %s", method)
+			return status.BridgeState{}
+		}
+	}
+}
+
 func TestGlobalCodexNotificationsPreserveRawBridgeInfo(t *testing.T) {
-	for _, method := range currentCodexServerNotifications {
+	for _, method := range generatedTypeScriptMethods(t, codexTypeScriptNotificationPath) {
 		if !handledAsGlobalNotification(method) {
 			continue
 		}
@@ -160,7 +177,7 @@ func waitBridgeState(t *testing.T, ch <-chan status.BridgeState) status.BridgeSt
 }
 
 func TestCurrentCodexServerNotificationsAreClassified(t *testing.T) {
-	for _, method := range currentCodexServerNotifications {
+	for _, method := range generatedTypeScriptMethods(t, codexTypeScriptNotificationPath) {
 		if !isThreadNotification(method) && !isGlobalNotification(method) {
 			t.Fatalf("Codex server notification %q is not classified", method)
 		}
@@ -189,6 +206,10 @@ func TestTypeScriptCodexServerNotificationsAreClassified(t *testing.T) {
 			t.Fatalf("TypeScript Codex server notification %q is not classified", method)
 		}
 	}
+}
+
+func TestCurrentCodexServerNotificationsMatchGeneratedSchemas(t *testing.T) {
+	assertStringSetEqual(t, currentCodexServerNotifications, generatedTypeScriptMethods(t, codexTypeScriptNotificationPath), "TypeScript")
 }
 
 func TestTypeScriptCodexThreadNotificationsHaveDispatchLane(t *testing.T) {
@@ -327,6 +348,34 @@ func generatedTypeScriptMethods(t *testing.T, path string) []string {
 	}
 	sort.Strings(methods)
 	return methods
+}
+
+func assertStringSetEqual(t *testing.T, got, want []string, label string) {
+	t.Helper()
+	gotSet := map[string]bool{}
+	wantSet := map[string]bool{}
+	for _, value := range got {
+		gotSet[value] = true
+	}
+	for _, value := range want {
+		wantSet[value] = true
+	}
+	var missing, extra []string
+	for value := range wantSet {
+		if !gotSet[value] {
+			missing = append(missing, value)
+		}
+	}
+	for value := range gotSet {
+		if !wantSet[value] {
+			extra = append(extra, value)
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(extra)
+	if len(missing) > 0 || len(extra) > 0 {
+		t.Fatalf("current Codex notification list differs from %s schema: missing=%v extra=%v", label, missing, extra)
+	}
 }
 
 func isThreadNotification(method string) bool {

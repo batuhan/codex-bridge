@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,7 +14,6 @@ import (
 
 	"github.com/rs/zerolog"
 	"go.mau.fi/util/dbutil"
-	"go.mau.fi/util/jsontime"
 	"maunium.net/go/mautrix"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
@@ -195,7 +195,7 @@ func TestHandleMatrixRoomStateUpdatesAIModelCache(t *testing.T) {
 	}
 }
 
-func TestHandleMatrixRoomStateUpdatesCodexThreadMetadataAndCache(t *testing.T) {
+func TestHandleMatrixRoomStateIgnoresBridgeOwnedCodexThreadMetadata(t *testing.T) {
 	key := newProjectPortalKey("sh-codex")
 	connector := &Connector{}
 	connector.Init(&bridgev2.Bridge{})
@@ -223,19 +223,19 @@ func TestHandleMatrixRoomStateUpdatesCodexThreadMetadataAndCache(t *testing.T) {
 		t.Fatalf("Codex thread room state update failed: ok=%v err=%v", ok, err)
 	}
 	meta := portalMetadata(portal.Metadata)
-	if meta.ThreadID != "thread-1" || meta.Cwd != "/tmp/project" {
-		t.Fatalf("portal metadata not updated from Codex state: %#v", meta)
+	if meta.ThreadID != "old-thread" || meta.Cwd != "/old/project" {
+		t.Fatalf("bridge-owned Codex state should not rewrite portal metadata: %#v", meta)
 	}
-	if _, ok := connector.threadRoom("old-thread"); ok {
-		t.Fatalf("old thread room cache should have been cleared")
+	if _, ok := connector.threadRoom("thread-1"); ok {
+		t.Fatalf("bridge-owned Codex state should not create a new thread cache entry")
 	}
-	room, ok := connector.threadRoom("thread-1")
-	if !ok || room.portalKey != key || room.cwd != "/tmp/project" || room.model != "openai/gpt-5" || room.reasoningEffort != "high" {
-		t.Fatalf("thread room cache not updated from Codex state: ok=%v room=%#v", ok, room)
+	room, ok := connector.threadRoom("old-thread")
+	if !ok || room.portalKey != key || room.cwd != "/old/project" || room.model != "openai/gpt-4.1" || room.reasoningEffort != "low" {
+		t.Fatalf("existing thread room cache should be preserved: ok=%v room=%#v", ok, room)
 	}
 	state := connector.modelStateForPortalKey(key)
-	if state["model"] != "openai/gpt-5" || state["reasoning"] != "high" {
-		t.Fatalf("model cache not updated from Codex state: %#v", state)
+	if state["model"] != "openai/gpt-4.1" || state["reasoning"] != "low" {
+		t.Fatalf("model cache should be preserved: %#v", state)
 	}
 }
 
@@ -293,25 +293,6 @@ func TestHandleMatrixRoomNameUpdatesCodexThreadAndPortal(t *testing.T) {
 	}
 }
 
-func TestHandleMatrixDisappearingTimerUpdatesPortal(t *testing.T) {
-	portal := &bridgev2.Portal{Portal: &database.Portal{}}
-	ok, err := (&Client{}).HandleMatrixDisappearingTimer(context.Background(), &bridgev2.MatrixDisappearingTimer{
-		MatrixEventBase: bridgev2.MatrixEventBase[*event.BeeperDisappearingTimer]{
-			Portal: portal,
-			Content: &event.BeeperDisappearingTimer{
-				Type:  event.DisappearingTypeAfterSend,
-				Timer: jsontime.Milliseconds{Duration: time.Hour},
-			},
-		},
-	})
-	if err != nil || !ok {
-		t.Fatalf("disappearing timer update failed: ok=%v err=%v", ok, err)
-	}
-	if portal.Disappear.Type != event.DisappearingTypeAfterSend || portal.Disappear.Timer != time.Hour {
-		t.Fatalf("portal disappearing timer not updated: %#v", portal.Disappear)
-	}
-}
-
 func TestGetChatInfoIncludesStoredPortalRoomState(t *testing.T) {
 	portal := &bridgev2.Portal{Portal: &database.Portal{
 		Name:     "Custom Codex",
@@ -333,8 +314,8 @@ func TestGetChatInfoIncludesStoredPortalRoomState(t *testing.T) {
 	if info.Topic == nil || *info.Topic != "Codex work" {
 		t.Fatalf("stored room topic was not returned: %#v", info.Topic)
 	}
-	if info.Disappear == nil || info.Disappear.Type != event.DisappearingTypeAfterRead || info.Disappear.Timer != time.Hour {
-		t.Fatalf("stored disappearing timer was not returned: %#v", info.Disappear)
+	if info.Disappear != nil {
+		t.Fatalf("stored disappearing timer should not be returned: %#v", info.Disappear)
 	}
 	if info.Avatar == nil || string(info.Avatar.MXC) != defaultCodexAvatarMXC {
 		t.Fatalf("stored chat info should include Codex avatar %q, got %#v", defaultCodexAvatarMXC, info.Avatar)
@@ -351,6 +332,80 @@ func TestGetChatInfoForNewProjectAsksForDirectory(t *testing.T) {
 	}
 	if info.Topic == nil || *info.Topic != newProjectPrompt {
 		t.Fatalf("new project chat should ask for a directory: %#v", info.Topic)
+	}
+}
+
+func TestGetChatInfoClearsMissingThreadMetadataAndState(t *testing.T) {
+	ctx := context.Background()
+	matrix := &fakeMatrixConnector{}
+	connector, br := testBridgeWithDB(t, matrix)
+	logPath := filepath.Join(t.TempDir(), "fake-appserver.jsonl")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := appserver.Start(ctx, exe, map[string]string{
+		fakeAppServerEnv:    "1",
+		fakeAppServerLogEnv: logPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	connector.appMu.Lock()
+	connector.app = app
+	connector.appMu.Unlock()
+
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{Main: connector, UserLogin: login, loggedIn: true}
+	login.Client = client
+	key := projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "missing-thread", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connector.rememberThreadRoom("missing-thread", client, key, "/tmp/project", "openai", "gpt-5")
+
+	info, err := client.GetChatInfo(ctx, portal)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.CanBackfill {
+		t.Fatalf("missing thread chat info should not keep backfill enabled: %#v", info)
+	}
+	meta := portalMetadata(portal.Metadata)
+	if meta.ThreadID != "" || meta.Cwd != "/tmp/project" {
+		t.Fatalf("missing thread metadata was not cleared: %#v", meta)
+	}
+	if _, ok := connector.threadRoom("missing-thread"); ok {
+		t.Fatal("missing thread should be removed from thread room cache")
+	}
+	if !info.ExtraUpdates(ctx, portal) {
+		t.Fatal("expected missing-thread chat info to clear custom room state")
+	}
+	threadState := findFakeState(matrix.api.states, codexThreadStateType)
+	if threadState == nil || threadState.Content == nil || len(threadState.Content.Raw) != 0 {
+		t.Fatalf("missing thread should clear Codex thread room state: %#v", matrix.api.states)
+	}
+	modelState := findFakeState(matrix.api.states, beeperAIModelStateType)
+	if modelState == nil || modelState.Content == nil || len(modelState.Content.Raw) != 0 {
+		t.Fatalf("missing thread should clear Beeper AI model room state: %#v", matrix.api.states)
 	}
 }
 
@@ -697,6 +752,9 @@ func TestIsThreadNotFoundErrorOnlyMatchesCodexRPCError(t *testing.T) {
 	if !isThreadNotFoundError(&appserver.RPCError{Method: "turn/start", Msg: "thread not found: thread-1"}) {
 		t.Fatal("expected Codex thread-not-found RPC error to match")
 	}
+	if !isThreadNotFoundError(&appserver.RPCError{Method: "thread/read", Msg: "thread/read: thread not loaded: thread-1"}) {
+		t.Fatal("expected Codex thread-not-loaded RPC error to match")
+	}
 	if isThreadNotFoundError(&appserver.RPCError{Method: "turn/start", Msg: "different failure"}) {
 		t.Fatal("unrelated RPC error should not match")
 	}
@@ -858,7 +916,6 @@ func TestCodexMembersUseGlobalGhost(t *testing.T) {
 	for _, evtType := range []event.Type{
 		event.StateRoomName,
 		event.StateTopic,
-		event.StateBeeperDisappearingTimer,
 	} {
 		if level, ok := members.PowerLevels.Events[evtType]; !ok || level != 0 {
 			t.Fatalf("expected %s power level 0, got %d (present=%v)", evtType.Type, level, ok)
@@ -1091,6 +1148,7 @@ func TestHandleMatrixMessageStartsTurnThroughAppServerTransport(t *testing.T) {
 	login.Client = client
 	cwd := t.TempDir()
 	key := projectPortalKey(cwd, login.ID)
+	connector.rememberThreadRoom("thread-1", client, key, cwd, "openai", "gpt-5.5", "high")
 	if err = br.DB.Portal.Insert(ctx, &database.Portal{
 		PortalKey: key,
 		MXID:      "!room:example.com",
@@ -1124,7 +1182,7 @@ func TestHandleMatrixMessageStartsTurnThroughAppServerTransport(t *testing.T) {
 		t.Fatalf("missing Matrix response: %#v", resp)
 	}
 	meta, _ := resp.DB.Metadata.(*MessageMetadata)
-	if resp.DB.Room != key || resp.DB.SenderID != networkid.UserID("login:sh-codex") || meta == nil || meta.Role != "user" || meta.ThreadID != "thread-1" || meta.StreamStatus != "done" {
+	if resp.DB.Room != key || resp.DB.SenderID != networkid.UserID("login:sh-codex") || meta == nil || meta.Role != "user" || meta.ThreadID != "thread-1" || meta.TurnID != "turn-1" || meta.StreamStatus != "done" {
 		t.Fatalf("unexpected Matrix response DB: db=%#v meta=%#v", resp.DB, meta)
 	}
 	run := connector.activeRun("thread-1")
@@ -1161,15 +1219,70 @@ func TestHandleMatrixMessageStartsTurnThroughAppServerTransport(t *testing.T) {
 	}
 }
 
+func TestHandleMatrixMessageSteersActiveTurnWithTurnMetadata(t *testing.T) {
+	ctx := context.Background()
+	connector, _ := testBridgeWithDB(t, &fakeMatrixConnector{})
+	logPath := filepath.Join(t.TempDir(), "fake-appserver.jsonl")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := appserver.Start(ctx, exe, map[string]string{
+		fakeAppServerEnv:    "1",
+		fakeAppServerLogEnv: logPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	connector.appMu.Lock()
+	connector.app = app
+	connector.appMu.Unlock()
+
+	login := testUserLogin("codex")
+	client := &Client{Main: connector, UserLogin: login, loggedIn: true}
+	login.Client = client
+	msg := testMatrixMessage("thread-1", "steer this")
+	run := newActiveRun(client, msg.Portal.PortalKey, "thread-1", "turn-1")
+	connector.setActive("thread-1", run)
+
+	resp, err := client.HandleMatrixMessage(ctx, msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil || resp.DB == nil {
+		t.Fatalf("missing Matrix response: %#v", resp)
+	}
+	meta, _ := resp.DB.Metadata.(*MessageMetadata)
+	if meta == nil || meta.Role != "user" || meta.ThreadID != "thread-1" || meta.TurnID != "turn-1" || meta.StreamStatus != "done" {
+		t.Fatalf("unexpected Matrix response DB: resp=%#v meta=%#v", resp, meta)
+	}
+
+	requests := readFakeAppServerRequests(t, logPath)
+	steer, ok := findFakeAppServerRequest(requests, "turn/steer")
+	if !ok {
+		t.Fatalf("turn/steer request missing: %#v", requests)
+	}
+	if steer.Params["threadId"] != "thread-1" || steer.Params["expectedTurnId"] != "turn-1" || steer.Params["clientUserMessageId"] != "$event" {
+		t.Fatalf("bad turn/steer params: %#v", steer.Params)
+	}
+	if text := fakeAppServerInputText(steer.Params); text != "steer this" {
+		t.Fatalf("turn/steer prompt mismatch: %q", text)
+	}
+}
+
 func TestStartTurnClearsUnsupportedRoomModel(t *testing.T) {
 	ctx := context.Background()
+	oldPortalEventBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	t.Cleanup(func() { bridgev2.PortalEventBuffer = oldPortalEventBuffer })
+
 	matrix := &modelStateMatrix{
 		modelEvt: &event.Event{Content: event.Content{Raw: map[string]any{
 			"model":     "openai/gpt-5.5",
 			"reasoning": "high",
 		}}},
 		publisher: &recordingBeeperStreamPublisher{},
-		eventID:   "$deterministic:example.com",
 	}
 	connector, br := testBridgeWithDB(t, matrix)
 	logPath := filepath.Join(t.TempDir(), "fake-appserver.jsonl")
@@ -1228,6 +1341,9 @@ func TestStartTurnClearsUnsupportedRoomModel(t *testing.T) {
 	state := findFakeState(matrix.intent().states, beeperAIModelStateType)
 	if state == nil || state.Content == nil || len(state.Content.Raw) != 0 {
 		t.Fatalf("unsupported room model state was not cleared: %#v", state)
+	}
+	if state := connector.modelStateForPortalKey(key); state != nil {
+		t.Fatalf("unsupported room model cache was not cleared: %#v", state)
 	}
 }
 
@@ -1680,7 +1796,6 @@ type modelStateMatrix struct {
 	fakeMatrixConnector
 	modelEvt  *event.Event
 	publisher bridgev2.BeeperStreamPublisher
-	eventID   id.EventID
 }
 
 func (m *modelStateMatrix) GetStateEvent(ctx context.Context, roomID id.RoomID, eventType event.Type, stateKey string) (*event.Event, error) {
@@ -1692,10 +1807,6 @@ func (m *modelStateMatrix) GetStateEvent(ctx context.Context, roomID id.RoomID, 
 
 func (m *modelStateMatrix) GetBeeperStreamPublisher() bridgev2.BeeperStreamPublisher {
 	return m.publisher
-}
-
-func (m *modelStateMatrix) GenerateDeterministicEventID(id.RoomID, networkid.PortalKey, networkid.MessageID, networkid.PartID) id.EventID {
-	return m.eventID
 }
 
 type fakeMatrixAPI struct {
@@ -1722,8 +1833,12 @@ func (f *fakeMatrixAPI) SendMessage(ctx context.Context, roomID id.RoomID, event
 	if f.onSendMessage != nil {
 		f.onSendMessage(roomID, eventType, content, extra)
 	}
+	eventID := id.EventID("$message")
+	if len(f.messages) > 0 {
+		eventID = id.EventID(fmt.Sprintf("$message-%d", len(f.messages)+1))
+	}
 	f.messages = append(f.messages, fakeMessageEvent{RoomID: roomID, Type: eventType, Content: content, Extra: extra})
-	return &mautrix.RespSendEvent{EventID: id.EventID("$message")}, nil
+	return &mautrix.RespSendEvent{EventID: eventID}, nil
 }
 
 func (f *fakeMatrixAPI) SendState(ctx context.Context, roomID id.RoomID, eventType event.Type, stateKey string, content *event.Content, ts time.Time) (*mautrix.RespSendEvent, error) {

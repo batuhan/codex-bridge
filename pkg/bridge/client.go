@@ -45,7 +45,6 @@ var _ bridgev2.BackfillingNetworkAPIWithLimits = (*Client)(nil)
 var _ bridgev2.RoomNameHandlingNetworkAPI = (*Client)(nil)
 var _ bridgev2.RoomTopicHandlingNetworkAPI = (*Client)(nil)
 var _ bridgev2.RoomStateHandlingNetworkAPI = (*Client)(nil)
-var _ bridgev2.DisappearTimerChangingNetworkAPI = (*Client)(nil)
 var _ status.BridgeStateFiller = (*Client)(nil)
 
 func (cl *Client) Connect(ctx context.Context) {
@@ -121,6 +120,9 @@ func (cl *Client) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*br
 			}
 			if isThreadNotFoundError(err) {
 				cl.clearMissingThread(ctx, portal, meta)
+				if portal != nil {
+					meta = portalMetadata(portal.Metadata)
+				}
 			}
 		}
 	} else if meta.Cwd != "" {
@@ -158,18 +160,11 @@ func (cl *Client) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) 
 	return &event.RoomFeatures{
 		ID: roomFeaturesID,
 		State: event.StateFeatureMap{
-			event.StateRoomName.Type:                {Level: event.CapLevelFullySupported},
-			event.StateTopic.Type:                   {Level: event.CapLevelFullySupported},
-			event.StateBeeperDisappearingTimer.Type: {Level: event.CapLevelFullySupported},
-			event.StateMSC4391BotCommand.Type:       {Level: event.CapLevelFullySupported},
-			codexThreadStateType:                    {Level: event.CapLevelFullySupported},
-			beeperAIModelStateType:                  {Level: event.CapLevelFullySupported},
-		},
-		DisappearingTimer: &event.DisappearingTimerCapability{
-			Types: []event.DisappearingType{
-				event.DisappearingTypeAfterSend,
-				event.DisappearingTypeAfterRead,
-			},
+			event.StateRoomName.Type:          {Level: event.CapLevelFullySupported},
+			event.StateTopic.Type:             {Level: event.CapLevelFullySupported},
+			event.StateMSC4391BotCommand.Type: {Level: event.CapLevelFullySupported},
+			codexThreadStateType:              {Level: event.CapLevelFullySupported},
+			beeperAIModelStateType:            {Level: event.CapLevelFullySupported},
 		},
 	}
 }
@@ -259,6 +254,7 @@ func (cl *Client) handleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixM
 			log.Err(err).Str("thread_id", meta.ThreadID).Str("turn_id", active.turnID).Msg("Failed to steer Codex turn from Matrix message")
 			return nil, err
 		}
+		setMessageMetadataTurnID(userDB, active.turnID)
 	} else {
 		if !startedThread {
 			thread, err := cl.resumeThreadForPortal(ctx, msg.Portal, meta)
@@ -282,7 +278,8 @@ func (cl *Client) handleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixM
 				userDB.Room = msg.Portal.PortalKey
 			}
 		}
-		if _, err := cl.startTurn(ctx, msg.Portal.PortalKey, meta.ThreadID, clientUserMessageID, prompt); err != nil {
+		run, err := cl.startTurn(ctx, msg.Portal.PortalKey, meta.ThreadID, clientUserMessageID, prompt)
+		if err != nil {
 			if isThreadNotFoundError(err) {
 				oldThreadID := meta.ThreadID
 				thread, err := cl.resumeThreadForPortal(ctx, msg.Portal, meta)
@@ -300,9 +297,13 @@ func (cl *Client) handleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixM
 					msg.Portal = synced
 					userDB.Room = msg.Portal.PortalKey
 				}
-				if _, retryErr := cl.startTurn(ctx, msg.Portal.PortalKey, meta.ThreadID, clientUserMessageID, prompt); retryErr != nil {
+				run, retryErr := cl.startTurn(ctx, msg.Portal.PortalKey, meta.ThreadID, clientUserMessageID, prompt)
+				if retryErr != nil {
 					log.Err(retryErr).Str("old_thread_id", oldThreadID).Str("thread_id", meta.ThreadID).Msg("Failed to start Codex turn after replacing missing thread")
 					return nil, retryErr
+				}
+				if run != nil {
+					setMessageMetadataTurnID(userDB, run.turnID)
 				}
 				log.Warn().Str("old_thread_id", oldThreadID).Str("thread_id", meta.ThreadID).Msg("Recovered missing Codex thread and retried Matrix message")
 				log.Debug().Str("thread_id", meta.ThreadID).Msg("Accepted Codex Matrix message")
@@ -311,9 +312,24 @@ func (cl *Client) handleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixM
 			log.Err(err).Str("thread_id", meta.ThreadID).Msg("Failed to start Codex turn from Matrix message")
 			return nil, err
 		}
+		if run != nil {
+			setMessageMetadataTurnID(userDB, run.turnID)
+		}
 	}
 	log.Debug().Str("thread_id", meta.ThreadID).Msg("Accepted Codex Matrix message")
 	return &bridgev2.MatrixMessageResponse{DB: userDB, StreamOrder: userDB.Timestamp.UnixNano()}, nil
+}
+
+func setMessageMetadataTurnID(msg *database.Message, turnID string) {
+	if msg == nil || turnID == "" {
+		return
+	}
+	meta, _ := msg.Metadata.(*MessageMetadata)
+	if meta == nil {
+		meta = &MessageMetadata{}
+	}
+	meta.TurnID = turnID
+	msg.Metadata = meta
 }
 
 func (cl *Client) HandleMatrixRoomName(ctx context.Context, msg *bridgev2.MatrixRoomName) (bool, error) {
@@ -358,61 +374,13 @@ func (cl *Client) HandleMatrixRoomState(ctx context.Context, msg *bridgev2.Matri
 		return false, fmt.Errorf("%s state key must be empty", msg.Type.Type)
 	}
 	if msg.Type.Type == codexThreadStateType {
-		cl.handleCodexThreadRoomState(msg)
+		// Codex thread metadata is bridge-owned state. The bridge advertises and
+		// syncs it for clients, but Matrix users shouldn't rewrite session identity.
 		return true, nil
 	}
 	if cl != nil && cl.Main != nil {
 		cl.Main.setModelStateForPortalKey(msg.Portal.PortalKey, msg.Content)
 	}
-	return true, nil
-}
-
-func (cl *Client) handleCodexThreadRoomState(msg *bridgev2.MatrixRoomState) {
-	if cl == nil || msg == nil || msg.Portal == nil {
-		return
-	}
-	state := copyStateMap(msg.Content)
-	normalizeThreadState("room/state", state)
-	threadID := firstStateString(state, "threadId", "sessionId")
-	cwd := firstStateString(state, "cwd", "settings.cwd")
-	meta := portalMetadata(msg.Portal.Metadata)
-	oldThreadID := meta.ThreadID
-	if threadID == "" {
-		threadID = meta.ThreadID
-	}
-	if cwd == "" {
-		cwd = meta.Cwd
-	}
-	if cwd == "" {
-		cwd, _ = parseProjectPortalID(msg.Portal.ID)
-	}
-	if threadID != "" {
-		meta.ThreadID = threadID
-	}
-	if cwd != "" {
-		meta.Cwd = cwd
-	}
-	if meta.ThreadID != "" || meta.Cwd != "" {
-		msg.Portal.Metadata = meta
-	}
-	if cl.Main == nil || threadID == "" {
-		return
-	}
-	if oldThreadID != "" && oldThreadID != threadID {
-		cl.Main.forgetThread(oldThreadID)
-	}
-	provider := firstStateString(state, "modelProvider", "provider")
-	model := codexModelStateRef(state, provider)
-	effort := firstStateString(state, "effort", "reasoning", "reasoningEffort", "reasoning_effort")
-	cl.Main.rememberThreadRoom(threadID, cl, msg.Portal.PortalKey, cwd, provider, model, effort)
-	cl.Main.setModelStateForPortalKey(msg.Portal.PortalKey, state)
-}
-
-func (cl *Client) HandleMatrixDisappearingTimer(ctx context.Context, msg *bridgev2.MatrixDisappearingTimer) (bool, error) {
-	if msg == nil || msg.Portal == nil {
-		return false, nil
-	}
-	msg.Portal.Disappear = database.DisappearingSettingFromEvent(msg.Content)
 	return true, nil
 }
 
@@ -802,9 +770,20 @@ func (cl *Client) codexMembers() *bridgev2.ChatMemberList {
 			Events: map[event.Type]int{
 				event.StateRoomName:                        0,
 				event.StateTopic:                           0,
-				event.StateBeeperDisappearingTimer:         0,
-				roomStateEventType(codexThreadStateType):   0,
 				roomStateEventType(beeperAIModelStateType): 0,
+			},
+			Custom: func(content *event.PowerLevelsEventContent) bool {
+				changed := false
+				for _, eventType := range []event.Type{
+					event.StateBeeperDisappearingTimer,
+					roomStateEventType(codexThreadStateType),
+				} {
+					if _, ok := content.Events[eventType.Type]; ok {
+						delete(content.Events, eventType.Type)
+						changed = true
+					}
+				}
+				return changed
 			},
 		},
 	}
@@ -1094,7 +1073,11 @@ func readRawRoomState(ctx context.Context, reader bridgev2.MatrixConnectorWithAr
 
 func isThreadNotFoundError(err error) bool {
 	var rpcErr *appserver.RPCError
-	return errors.As(err, &rpcErr) && strings.Contains(strings.ToLower(rpcErr.Msg), "thread not found")
+	if !errors.As(err, &rpcErr) {
+		return false
+	}
+	msg := strings.ToLower(rpcErr.Msg)
+	return strings.Contains(msg, "thread not found") || strings.Contains(msg, "thread not loaded")
 }
 
 func isThreadTurnsListUnavailable(err error) bool {
@@ -1177,7 +1160,9 @@ func (cl *Client) syncThreadPortal(ctx context.Context, portal *bridgev2.Portal,
 	cl.ensureBackfillVersion(ctx, portal)
 	cl.Main.rememberThreadRoom(thread.ID, cl, portal.PortalKey, thread.Cwd, thread.ModelProvider, threadModelRef(thread), threadReasoningEffort(thread))
 	name := threadName(thread)
-	portal.UpdateInfo(ctx, portalInfo(name, cl.codexMembers(), thread.Cwd, thread.ID, codexThreadInitialState(thread)), cl.UserLogin, nil, time.Now())
+	state := enrichThreadStateWithModelState(codexThreadInitialState(thread), cl.roomAIModelState(ctx, portal))
+	cl.Main.rememberThreadRoom(thread.ID, cl, portal.PortalKey, thread.Cwd, firstStateString(state, "modelProvider", "provider"), codexModelStateRef(state, ""), firstStateString(state, "effort", "reasoning", "reasoningEffort", "reasoning_effort"))
+	portal.UpdateInfo(ctx, portalInfo(name, cl.codexMembers(), thread.Cwd, thread.ID, state), cl.UserLogin, nil, time.Now())
 	if cl.Main != nil && cl.Main.Bridge != nil {
 		cl.Main.Bridge.WakeupBackfillQueue()
 	}
@@ -1445,6 +1430,9 @@ func (cl *Client) supportsModel(ctx context.Context, model string) (bool, error)
 func (cl *Client) clearUnsupportedRoomModel(ctx context.Context, portal *bridgev2.Portal, portalKey networkid.PortalKey, model string) {
 	if cl == nil || cl.UserLogin == nil || cl.UserLogin.Bridge == nil {
 		return
+	}
+	if cl.Main != nil {
+		cl.Main.setModelStateForPortalKey(portalKey, nil)
 	}
 	if portal == nil && portalKey.ID != "" {
 		var err error

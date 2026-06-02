@@ -30,6 +30,9 @@ func TestRoomCapabilitiesMatchImplementedHandlers(t *testing.T) {
 	if caps.Reaction != event.CapLevelUnsupported {
 		t.Fatalf("reactions should not be advertised, got %v", caps.Reaction)
 	}
+	if caps.ReactionCount != 0 || len(caps.AllowedReactions) != 0 || caps.CustomEmojiReactions {
+		t.Fatalf("reaction details should not be advertised, got count=%d allowed=%v custom=%v", caps.ReactionCount, caps.AllowedReactions, caps.CustomEmojiReactions)
+	}
 	if caps.Reply != event.CapLevelUnsupported {
 		t.Fatalf("reply support should not be advertised until ReplyTo is mapped, got %v", caps.Reply)
 	}
@@ -54,11 +57,11 @@ func TestRoomCapabilitiesMatchImplementedHandlers(t *testing.T) {
 	if _, ok := caps.State[event.StateRoomAvatar.Type]; ok {
 		t.Fatalf("room avatar state should not be advertised: %#v", caps.State)
 	}
-	if caps.State[event.StateBeeperDisappearingTimer.Type].Level != event.CapLevelFullySupported {
-		t.Fatalf("disappearing timer state not advertised: %#v", caps.State)
+	if _, ok := caps.State[event.StateBeeperDisappearingTimer.Type]; ok {
+		t.Fatalf("disappearing timer state should not be advertised: %#v", caps.State)
 	}
-	if caps.DisappearingTimer == nil || len(caps.DisappearingTimer.Types) != 2 {
-		t.Fatalf("disappearing timer capability not advertised: %#v", caps.DisappearingTimer)
+	if caps.DisappearingTimer != nil {
+		t.Fatalf("disappearing timer capability should not be advertised: %#v", caps.DisappearingTimer)
 	}
 	if caps.State[event.StateMSC4391BotCommand.Type].Level != event.CapLevelFullySupported {
 		t.Fatalf("command state not advertised: %#v", caps.State)
@@ -79,8 +82,6 @@ func TestCodexMembersAllowUserEditableRoomState(t *testing.T) {
 	for _, evtType := range []event.Type{
 		event.StateRoomName,
 		event.StateTopic,
-		event.StateBeeperDisappearingTimer,
-		roomStateEventType(codexThreadStateType),
 		roomStateEventType(beeperAIModelStateType),
 	} {
 		if level, ok := members.PowerLevels.Events[evtType]; !ok || level != 0 {
@@ -89,10 +90,34 @@ func TestCodexMembersAllowUserEditableRoomState(t *testing.T) {
 	}
 	for _, evtType := range []event.Type{
 		event.StateMSC4391BotCommand,
+		roomStateEventType(codexThreadStateType),
 	} {
 		if _, ok := members.PowerLevels.Events[evtType]; ok {
 			t.Fatalf("%s is bridge-owned state and should not be user-editable: %#v", evtType.Type, members.PowerLevels.Events)
 		}
+	}
+}
+
+func TestCodexMembersRemoveStaleBridgeOwnedPowerLevels(t *testing.T) {
+	members := (&Client{}).codexMembers()
+	content := &event.PowerLevelsEventContent{
+		Events: map[string]int{
+			event.StateBeeperDisappearingTimer.Type:       0,
+			roomStateEventType(codexThreadStateType).Type: 0,
+			event.StateRoomName.Type:                      0,
+		},
+	}
+	if !members.PowerLevels.Apply("", content) {
+		t.Fatal("expected stale bridge-owned power levels to be removed")
+	}
+	if _, ok := content.Events[event.StateBeeperDisappearingTimer.Type]; ok {
+		t.Fatalf("disappearing timer power level was not removed: %#v", content.Events)
+	}
+	if _, ok := content.Events[roomStateEventType(codexThreadStateType).Type]; ok {
+		t.Fatalf("Codex thread state power level was not removed: %#v", content.Events)
+	}
+	if content.Events[event.StateRoomName.Type] != 0 {
+		t.Fatalf("room name power level should be preserved: %#v", content.Events)
 	}
 }
 
@@ -112,7 +137,6 @@ func TestClientBridgeV2InterfacesMatchAdvertisedSupport(t *testing.T) {
 		{"RoomNameHandlingNetworkAPI", implements[bridgev2.RoomNameHandlingNetworkAPI](client)},
 		{"RoomTopicHandlingNetworkAPI", implements[bridgev2.RoomTopicHandlingNetworkAPI](client)},
 		{"RoomStateHandlingNetworkAPI", implements[bridgev2.RoomStateHandlingNetworkAPI](client)},
-		{"DisappearTimerChangingNetworkAPI", implements[bridgev2.DisappearTimerChangingNetworkAPI](client)},
 	}
 	for _, iface := range mustImplement {
 		if !iface.ok {
@@ -143,6 +167,7 @@ func TestClientBridgeV2InterfacesMatchAdvertisedSupport(t *testing.T) {
 		{"PowerLevelHandlingNetworkAPI", implements[bridgev2.PowerLevelHandlingNetworkAPI](client)},
 		{"PushableNetworkAPI", implements[bridgev2.PushableNetworkAPI](client)},
 		{"StickerImportingNetworkAPI", implements[bridgev2.StickerImportingNetworkAPI](client)},
+		{"DisappearTimerChangingNetworkAPI", implements[bridgev2.DisappearTimerChangingNetworkAPI](client)},
 	}
 	for _, iface := range mustNotImplement {
 		if iface.ok {
@@ -164,8 +189,8 @@ func TestBridgeInfoVersionTracksRoomCapabilities(t *testing.T) {
 	if capabilities != roomCapabilitiesVersion {
 		t.Fatalf("room capabilities version = %d, want %d", capabilities, roomCapabilitiesVersion)
 	}
-	if capabilities < 5 {
-		t.Fatal("room capabilities version must stay bumped for explicit Beeper AI capability IDs and room state support")
+	if capabilities < 8 {
+		t.Fatal("room capabilities version must stay bumped for explicit room feature removals")
 	}
 }
 
@@ -176,10 +201,10 @@ func TestBridgeNameUsesSharedAIAvatar(t *testing.T) {
 	}
 }
 
-func TestNetworkCapabilitiesAdvertiseDisappearingMessages(t *testing.T) {
+func TestNetworkCapabilitiesDoNotAdvertiseDisappearingMessages(t *testing.T) {
 	caps := (&Connector{}).GetCapabilities()
-	if caps == nil || !caps.DisappearingMessages {
-		t.Fatalf("expected disappearing message support, got %#v", caps)
+	if caps == nil || caps.DisappearingMessages {
+		t.Fatalf("disappearing messages should not be advertised, got %#v", caps)
 	}
 	if !caps.AggressiveUpdateInfo {
 		t.Fatalf("expected aggressive ghost info refresh support, got %#v", caps)

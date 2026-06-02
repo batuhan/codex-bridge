@@ -13,7 +13,6 @@ import (
 	"maunium.net/go/mautrix/bridgev2/networkid"
 	"maunium.net/go/mautrix/event"
 
-	agui "github.com/beeper/ai-bridge/pkg/ag-ui"
 	aistream "github.com/beeper/ai-bridge/pkg/ai-stream"
 	"github.com/beeper/ai-bridge/pkg/msgconv"
 	"github.com/beeper/codex-bridge/pkg/appserver"
@@ -153,7 +152,6 @@ func (cl *Client) backfillAssistantMessage(ctx context.Context, portal *bridgev2
 	run.Data["capabilities"] = codexAgentCapabilities()
 	writer := aistream.NewWriter(run, func() time.Time { return ts })
 	writer.Start()
-	writer.StepStart(turn.ID)
 
 	hasContent := false
 	for _, item := range turn.Items {
@@ -162,15 +160,18 @@ func (cl *Client) backfillAssistantMessage(ctx context.Context, portal *bridgev2
 		}
 		hasContent = mapBackfillItem(writer, run.MessageID, item) || hasContent
 	}
-	if !hasContent && turn.Error == nil {
+	statusKind := codexTurnStatusKind(turn.Status)
+	if statusKind == "in_progress" && turn.Error == nil {
 		return nil, false, nil
 	}
-	writer.StepFinish(turn.ID)
-	if turn.Error != nil && strings.TrimSpace(turn.Error.Message) != "" {
-		writer.Error(turn.Error.Message)
-	} else {
-		writer.Finish(agui.FinishReasonStop)
+	if !hasContent && turn.Error == nil && statusKind != "error" && statusKind != "aborted" {
+		return nil, false, nil
 	}
+	message := ""
+	if turn.Error != nil {
+		message = turn.Error.Message
+	}
+	finishCodexTurn(writer, turn.Status, message)
 
 	content, extra, err := cl.backfillFinalContent(ctx, portal, *run)
 	if err != nil {
@@ -183,7 +184,7 @@ func (cl *Client) backfillAssistantMessage(ctx context.Context, portal *bridgev2
 			Type:       event.EventMessage,
 			Content:    content,
 			Extra:      extra,
-			DBMetadata: &MessageMetadata{Role: "assistant", ThreadID: thread.ID, TurnID: turn.ID, StreamStatus: "complete"},
+			DBMetadata: &MessageMetadata{Role: "assistant", ThreadID: thread.ID, TurnID: turn.ID, StreamStatus: finalStreamStatus(*run)},
 		}}},
 		Sender:      bridgev2.EventSender{Sender: codexUserID},
 		ID:          networkid.MessageID(msgID),
