@@ -604,7 +604,10 @@ func hookPromptText(item appserver.TurnItem) string {
 			fragments = append(fragments, strings.TrimSpace(fragment.Text))
 		}
 	}
-	return strings.Join(fragments, "\n\n")
+	if len(fragments) > 0 {
+		return strings.Join(fragments, "\n\n")
+	}
+	return liveHookPromptText(backfillItemData(item))
 }
 
 func reviewModeText(item appserver.TurnItem) string {

@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
@@ -30,6 +31,9 @@ import (
 
 const streamAnchorEventIDTimeout = 30 * time.Second
 const interruptedStreamMessage = "Codex stream was interrupted before completion"
+const streamCarrierBudgetBytes = aistream.FinalMessageBudgetBytes
+const streamEventPreviewBytes = 8192
+const streamPayloadTruncatedText = "[stream payload truncated; full content is available in final message parts]"
 
 var activeStreamIdleTimeout = 5 * time.Minute
 var activeStreamUnregisterDelay = 30 * time.Second
@@ -247,7 +251,7 @@ func (r *activeRun) stopPublisherLocked(ctx context.Context) {
 	r.publisher.Unregister(r.roomID, r.anchorMXID)
 	r.unregistered = true
 	r.started = false
-	if r.client != nil && r.client.Main != nil && r.client.UserLogin != nil {
+	if r.client != nil && r.client.Main != nil && r.client.Main.Store != nil && r.client.UserLogin != nil {
 		if err := r.client.Main.Store.DeleteActiveStream(ctx, r.client.UserLogin.ID, r.turnID); err != nil {
 			logFromContext(ctx).Err(err).
 				Str("thread_id", r.threadID).
@@ -956,7 +960,7 @@ func (r *activeRun) publishLocked() {
 	}
 	copyRun := *r.run
 	copyRun.Events = append([]agui.Event(nil), r.run.Events[r.published:]...)
-	carriers, err := aistream.PackRunFromSeq(copyRun, r.nextSeq)
+	carriers, err := packStreamCarriersForPublish(copyRun, r.nextSeq)
 	if err != nil {
 		return
 	}
@@ -989,6 +993,187 @@ func (r *activeRun) publishLocked() {
 			Int("seq_start", firstSeq).
 			Msg("Published Codex stream carrier")
 	}
+}
+
+func packStreamCarriersForPublish(run aistream.Run, startSeq int) ([]aistream.Carrier, error) {
+	if startSeq <= 0 {
+		startSeq = 1
+	}
+	if err := run.Validate(); err != nil {
+		return nil, err
+	}
+	var carriers []aistream.Carrier
+	var current aistream.Carrier
+	seq := startSeq
+	for _, event := range run.Events {
+		event = compactStreamEventForPublish(run, event, seq)
+		env, err := aistream.BuildEnvelope(run, seq, event)
+		if err != nil {
+			return nil, err
+		}
+		candidate := append(append([]aistream.Envelope(nil), current.Envelopes...), env)
+		if len(current.Envelopes) > 0 && streamCarrierContentSize(run, candidate) > streamCarrierBudgetBytes {
+			carriers = append(carriers, current)
+			current = aistream.Carrier{}
+		}
+		current.Envelopes = append(current.Envelopes, env)
+		seq++
+	}
+	if len(current.Envelopes) > 0 {
+		carriers = append(carriers, current)
+	}
+	return carriers, nil
+}
+
+func compactStreamEventForPublish(run aistream.Run, event agui.Event, seq int) agui.Event {
+	env, err := aistream.BuildEnvelope(run, seq, event)
+	if err == nil && streamCarrierContentSize(run, []aistream.Envelope{env}) <= streamCarrierBudgetBytes {
+		return event
+	}
+	limit := streamEventPreviewBytes
+	for attempt := 0; attempt < 6; attempt++ {
+		compact := compactStreamEventFields(event, limit)
+		env, err = aistream.BuildEnvelope(run, seq, compact)
+		if err == nil && streamCarrierContentSize(run, []aistream.Envelope{env}) <= streamCarrierBudgetBytes {
+			return compact
+		}
+		limit /= 2
+		if limit < 512 {
+			limit = 512
+		}
+	}
+	return collapsedStreamEvent(event)
+}
+
+func compactStreamEventFields(event agui.Event, stringLimit int) agui.Event {
+	fields := event.Map()
+	fields["streamTruncated"] = true
+	switch event.Type() {
+	case agui.EventToolCallResult:
+		fields["content"] = streamPayloadTruncatedText
+	case agui.EventActivitySnapshot:
+		fields["content"] = map[string]any{
+			"truncated": true,
+			"summary":   streamPayloadTruncatedText,
+		}
+	case agui.EventMessagesSnapshot:
+		fields["messages"] = []any{map[string]any{
+			"id":      firstNonEmptyString(event.String("messageId"), event.String("runId"), "stream-truncated"),
+			"role":    agui.RoleAssistant,
+			"content": streamPayloadTruncatedText,
+		}}
+	case agui.EventStateSnapshot:
+		fields["snapshot"] = map[string]any{
+			"truncated": true,
+			"summary":   streamPayloadTruncatedText,
+		}
+	case agui.EventStateDelta:
+		fields["delta"] = []any{map[string]any{
+			"op":    "replace",
+			"path":  "/streamTruncated",
+			"value": streamPayloadTruncatedText,
+		}}
+	case agui.EventRaw:
+		fields["event"] = map[string]any{
+			"truncated": true,
+			"summary":   streamPayloadTruncatedText,
+		}
+	default:
+		for key, value := range fields {
+			if key == "type" || key == "timestamp" {
+				continue
+			}
+			fields[key] = compactStreamValue(value, stringLimit)
+		}
+	}
+	return agui.NewEvent(fields)
+}
+
+func collapsedStreamEvent(event agui.Event) agui.Event {
+	fields := map[string]any{
+		"type":            agui.EventCustom,
+		"name":            "com.beeper.codex.stream_truncated",
+		"originalType":    event.Type(),
+		"streamTruncated": true,
+		"message":         streamPayloadTruncatedText,
+	}
+	if event.Has("timestamp") {
+		fields["timestamp"] = event.Get("timestamp")
+	}
+	if event.Has("messageId") {
+		fields["messageId"] = event.Get("messageId")
+	}
+	if event.Has("toolCallId") {
+		fields["toolCallId"] = event.Get("toolCallId")
+	}
+	return agui.NewEvent(fields)
+}
+
+func compactStreamValue(value any, stringLimit int) any {
+	switch typed := value.(type) {
+	case string:
+		if len(typed) <= stringLimit {
+			return typed
+		}
+		return utf8PrefixBytes(typed, stringLimit) + "\n\n" + streamPayloadTruncatedText
+	case map[string]any:
+		out := make(map[string]any, len(typed)+1)
+		for key, child := range typed {
+			out[key] = compactStreamValue(child, max(256, stringLimit/2))
+		}
+		out["truncated"] = true
+		return out
+	case []any:
+		if len(typed) == 0 {
+			return typed
+		}
+		limit := min(len(typed), 4)
+		out := make([]any, 0, limit+1)
+		for _, child := range typed[:limit] {
+			out = append(out, compactStreamValue(child, max(256, stringLimit/2)))
+		}
+		if len(typed) > limit {
+			out = append(out, map[string]any{
+				"truncated": true,
+				"remaining": len(typed) - limit,
+				"summary":   streamPayloadTruncatedText,
+			})
+		}
+		return out
+	default:
+		return typed
+	}
+}
+
+func streamCarrierContentSize(run aistream.Run, envelopes []aistream.Envelope) int {
+	raw, err := json.Marshal(aistream.CarrierContent(run, envelopes))
+	if err != nil {
+		return streamCarrierBudgetBytes + 1
+	}
+	return len(raw)
+}
+
+func utf8PrefixBytes(text string, maxBytes int) string {
+	if maxBytes >= len(text) {
+		return text
+	}
+	if maxBytes <= 0 {
+		return ""
+	}
+	end := maxBytes
+	for end > 0 && !utf8.RuneStart(text[end]) {
+		end--
+	}
+	return text[:end]
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func (r *activeRun) persistLocked(ctx context.Context) {

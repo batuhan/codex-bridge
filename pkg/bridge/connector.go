@@ -1222,11 +1222,10 @@ func (c *Connector) syncContactGhostsForThreads(ctx context.Context, threads []a
 		{newProjectUserID, codexUserInfo("New Project", false)},
 	}
 	for _, thread := range sortedRecentDirectories(threads) {
-		name := directoryName(thread.Cwd)
 		contacts = append(contacts, struct {
 			id   networkid.UserID
 			info *bridgev2.UserInfo
-		}{projectUserID(thread.Cwd), projectUserInfo(thread, thread.Cwd, name)})
+		}{projectUserID(thread.Cwd), projectUserInfo(thread, thread.Cwd, projectDisplayName(thread.Cwd))})
 	}
 	for _, contact := range contacts {
 		ghost, err := c.Bridge.GetGhostByID(ctx, contact.id)
@@ -1811,7 +1810,7 @@ func codexAIModelStateContent(state map[string]any) map[string]any {
 	if reasoningMode := firstStateString(state, "reasoning_mode", "reasoningMode"); reasoningMode != "" {
 		content["reasoning_mode"] = reasoningMode
 	}
-	if name := firstStateString(state, "modelName", "name"); name != "" && name != firstStateString(state, "model", "toModel") {
+	if name := firstStateString(state, "modelName"); name != "" && name != firstStateString(state, "model", "toModel") {
 		content["name"] = name
 	}
 	return content
@@ -2118,6 +2117,14 @@ func directoryName(path string) string {
 		return path
 	}
 	return base
+}
+
+func projectDisplayName(cwd string) string {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" {
+		return "New Project"
+	}
+	return cwd
 }
 
 func sortedRecentDirectories(threads []appserver.Thread) []appserver.Thread {

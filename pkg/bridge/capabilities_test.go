@@ -42,8 +42,11 @@ func TestRoomCapabilitiesMatchImplementedHandlers(t *testing.T) {
 	if caps.Delete != event.CapLevelUnsupported || caps.DeleteForMe || caps.DeleteMaxAge != nil {
 		t.Fatalf("message deletes should not be advertised, got level=%v for_me=%v age=%v", caps.Delete, caps.DeleteForMe, caps.DeleteMaxAge)
 	}
-	if caps.ReadReceipts || caps.Archive || caps.MarkAsUnread || caps.DeleteChat || caps.DeleteChatForEveryone {
+	if caps.ReadReceipts || caps.Archive || caps.MarkAsUnread || caps.DeleteChatForEveryone {
 		t.Fatalf("unsupported room booleans should stay disabled: %#v", caps)
+	}
+	if !caps.DeleteChat {
+		t.Fatalf("local Matrix chat deletion should be advertised: %#v", caps)
 	}
 	if !caps.TypingNotifications {
 		t.Fatalf("Codex typing notifications are emitted during live runs and should be advertised: %#v", caps)
@@ -166,7 +169,6 @@ func TestClientBridgeV2InterfacesMatchAdvertisedSupport(t *testing.T) {
 		{"MuteHandlingNetworkAPI", implements[bridgev2.MuteHandlingNetworkAPI](client)},
 		{"TagHandlingNetworkAPI", implements[bridgev2.TagHandlingNetworkAPI](client)},
 		{"RoomAvatarHandlingNetworkAPI", implements[bridgev2.RoomAvatarHandlingNetworkAPI](client)},
-		{"DeleteChatHandlingNetworkAPI", implements[bridgev2.DeleteChatHandlingNetworkAPI](client)},
 		{"MessageRequestAcceptingNetworkAPI", implements[bridgev2.MessageRequestAcceptingNetworkAPI](client)},
 		{"GroupCreatingNetworkAPI", implements[bridgev2.GroupCreatingNetworkAPI](client)},
 		{"PersonalFilteringCustomizingNetworkAPI", implements[bridgev2.PersonalFilteringCustomizingNetworkAPI](client)},
@@ -180,6 +182,9 @@ func TestClientBridgeV2InterfacesMatchAdvertisedSupport(t *testing.T) {
 		if iface.ok {
 			t.Fatalf("Client unexpectedly implements %s; update capabilities and tests before enabling it", iface.name)
 		}
+	}
+	if !implements[bridgev2.DeleteChatHandlingNetworkAPI](client) {
+		t.Fatal("Client must implement DeleteChatHandlingNetworkAPI for local chat detach")
 	}
 }
 

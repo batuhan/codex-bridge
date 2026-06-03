@@ -1225,10 +1225,13 @@ func TestContactsIncludeRecentDirectoriesWithLatestThread(t *testing.T) {
 	if !identifiersContain(project.UserInfo, "/tmp/project") || !identifiersContain(project.UserInfo, "new-thread") {
 		t.Fatalf("project contact identifiers should include cwd and latest thread id: %#v", project.UserInfo)
 	}
+	if project.UserInfo == nil || project.UserInfo.Name == nil || *project.UserInfo.Name != "/tmp/project" {
+		t.Fatalf("project contact should use full path display name: %#v", project.UserInfo)
+	}
 	if project.Chat != nil {
 		t.Fatalf("project contact should not allocate a chat before opening it: %#v", project.Chat)
 	}
-	chat := client.chatForProject(context.Background(), "/tmp/project", "project", "new-thread", nil)
+	chat := client.chatForProject(context.Background(), "/tmp/project", "/tmp/project", "new-thread", nil)
 	if chat == nil || chat.PortalKey != projectPortalKey("/tmp/project", "sh-codex") {
 		t.Fatalf("project chat has unexpected key: %#v", chat)
 	}
@@ -1269,6 +1272,35 @@ func TestRecentDirectoryContactsAreSearchable(t *testing.T) {
 	}
 }
 
+func TestSearchUsersReturnsExistingDirectoryPathAsProjectGhost(t *testing.T) {
+	cwd := t.TempDir()
+	client := &Client{UserLogin: testUserLogin("sh-codex")}
+
+	results, err := client.SearchUsers(context.Background(), cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 || results[0].UserID != projectUserID(cwd) {
+		t.Fatalf("directory search did not return direct project ghost: %#v", results)
+	}
+	if results[0].UserInfo == nil || results[0].UserInfo.Name == nil || *results[0].UserInfo.Name != cwd {
+		t.Fatalf("direct project ghost should use full path display name: %#v", results[0].UserInfo)
+	}
+}
+
+func TestSearchUsersReturnsDirectoryPathWhenContactListFails(t *testing.T) {
+	cwd := t.TempDir()
+	client := &Client{Main: &Connector{}, UserLogin: testUserLogin("sh-codex")}
+
+	results, err := client.SearchUsers(context.Background(), cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].UserID != projectUserID(cwd) {
+		t.Fatalf("directory search should survive contact list failure: %#v", results)
+	}
+}
+
 func TestSyncContactGhostsCreatesBaseAndRecentDirectoryGhosts(t *testing.T) {
 	ctx := context.Background()
 	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
@@ -1302,8 +1334,8 @@ func TestSyncContactGhostsCreatesBaseAndRecentDirectoryGhosts(t *testing.T) {
 	if identifiersContain(&bridgev2.UserInfo{Identifiers: project.Identifiers}, "preview preview") {
 		t.Fatalf("project contact should not include preview identifiers: %#v", project.Identifiers)
 	}
-	if project.Name != "project" {
-		t.Fatalf("project contact should use directory name, got %q", project.Name)
+	if project.Name != "/tmp/project" {
+		t.Fatalf("project contact should use full path display name, got %q", project.Name)
 	}
 	portals, err := br.GetAllPortals(ctx)
 	if err != nil {
@@ -1328,7 +1360,7 @@ func TestSyncRecentContactGhostsFallsBackToCachedThreadRooms(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if project == nil || project.Name != "project" || !identifiersContain(&bridgev2.UserInfo{Identifiers: project.Identifiers}, "thread-1") {
+	if project == nil || project.Name != "/tmp/project" || !identifiersContain(&bridgev2.UserInfo{Identifiers: project.Identifiers}, "thread-1") {
 		t.Fatalf("cached project contact ghost was not synced: %#v", project)
 	}
 }
@@ -1974,6 +2006,129 @@ func TestHandleMatrixEditRejectsNonPromptTargetsBeforeCodexRollback(t *testing.T
 	}
 	if requests := readFakeAppServerRequestsIfExists(t, logPath); len(requests) != 0 {
 		t.Fatalf("rejected edit should not touch Codex app-server: %#v", requests)
+	}
+}
+
+func TestHandleMatrixEditRejectsWhenCodexRollbackFails(t *testing.T) {
+	ctx := context.Background()
+	matrixAPI := &fakeMatrixAPI{}
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{api: matrixAPI})
+	logPath := filepath.Join(t.TempDir(), "fake-appserver.jsonl")
+	app := startTestFakeAppServer(t, ctx, connector, logPath)
+	defer app.Close()
+
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{Main: connector, UserLogin: login, loggedIn: true}
+	login.Client = client
+	key := projectPortalKey("/tmp/project", login.ID)
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Metadata:  &PortalMetadata{ThreadID: "missing-thread", Cwd: "/tmp/project"},
+	}}
+	target := &database.Message{
+		ID:        "user:$prompt-1",
+		PartID:    partID("text"),
+		MXID:      "$prompt-1",
+		Room:      key,
+		SenderID:  client.GetUserID(),
+		Timestamp: time.Unix(1, 0),
+		Metadata:  &MessageMetadata{Role: "user", ThreadID: "missing-thread", TurnID: "turn-1", StreamStatus: "done"},
+	}
+	following := &database.Message{
+		ID:        "codex:turn-1:assistant",
+		PartID:    partID("text"),
+		MXID:      "$assistant-1",
+		Room:      key,
+		SenderID:  codexUserID,
+		Timestamp: time.Unix(2, 0),
+		Metadata:  &MessageMetadata{Role: "assistant", ThreadID: "missing-thread", TurnID: "turn-1", StreamStatus: "complete"},
+	}
+	for _, msg := range []*database.Message{target, following} {
+		if err = br.DB.Message.Insert(ctx, msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	err = client.HandleMatrixEdit(ctx, &bridgev2.MatrixEdit{
+		MatrixEventBase: bridgev2.MatrixEventBase[*event.MessageEventContent]{
+			Event:   &event.Event{ID: "$edit-1"},
+			Content: &event.MessageEventContent{MsgType: event.MsgText, Body: "edited prompt"},
+			Portal:  portal,
+		},
+		EditTarget: target,
+	})
+	if err == nil {
+		t.Fatal("expected Codex rollback failure to reject edit")
+	}
+	requests := readFakeAppServerRequests(t, logPath)
+	if read, ok := findFakeAppServerRequest(requests, "thread/read"); !ok || read.Params["threadId"] != "missing-thread" {
+		t.Fatalf("thread/read failure path missing or bad: req=%#v requests=%#v", read, requests)
+	}
+	if _, ok := findFakeAppServerRequest(requests, "thread/rollback"); ok {
+		t.Fatalf("failed thread/read should not roll back: %#v", requests)
+	}
+	if _, ok := findFakeAppServerRequest(requests, "turn/start"); ok {
+		t.Fatalf("rejected edit should not start replacement turn: %#v", requests)
+	}
+	if got := countRedactions(matrixAPI.messages); got != 0 {
+		t.Fatalf("rejected edit should not redact stale messages, got %d events=%#v", got, matrixAPI.messages)
+	}
+	got, err := br.DB.Message.GetPartByID(ctx, key.Receiver, following.ID, following.PartID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("rejected edit deleted stale message before Codex accepted rollback")
+	}
+}
+
+func TestHandleMatrixDeleteChatDetachesWithoutDeletingCodexSession(t *testing.T) {
+	ctx := context.Background()
+	connector := &Connector{
+		active:      map[string]*activeRun{},
+		threadRooms: map[string]threadRoom{},
+		processes:   map[string]*activeRun{},
+		warmThreads: map[string]struct{}{"thread-1": {}},
+	}
+	login := testUserLogin("sh-codex")
+	client := &Client{Main: connector, UserLogin: login}
+	key := projectPortalKey("/tmp/project", login.ID)
+	run := newActiveRun(client, key, "thread-1", "turn-1")
+	connector.setActive("thread-1", run)
+	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project")
+	connector.rememberProcess("proc-1", run)
+
+	err := client.HandleMatrixDeleteChat(ctx, &bridgev2.MatrixDeleteChat{
+		Event: &event.Event{ID: "$delete"},
+		Portal: &bridgev2.Portal{Portal: &database.Portal{
+			PortalKey: key,
+			MXID:      "!room:example.com",
+			Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+		}},
+		Content: &event.BeeperChatDeleteEventContent{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if connector.activeRun("thread-1") != nil {
+		t.Fatal("deleted Matrix chat should stop active bridging")
+	}
+	if _, ok := connector.threadRoom("thread-1"); ok {
+		t.Fatal("deleted Matrix chat should remove thread room mapping")
+	}
+	if run := connector.activeRunForProcess([]byte(`{"processId":"proc-1"}`)); run != nil {
+		t.Fatal("deleted Matrix chat should remove process bridge mapping")
+	}
+	if _, warm := connector.warmThreads["thread-1"]; warm {
+		t.Fatal("deleted Matrix chat should forget warm thread state")
 	}
 }
 

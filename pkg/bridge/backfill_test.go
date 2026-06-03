@@ -487,6 +487,68 @@ func TestBackfillMessagesHaveMonotonicStreamOrder(t *testing.T) {
 	}
 }
 
+func TestDirectoryBackfillMessagesMergesSessionsOldestFirst(t *testing.T) {
+	client := &Client{UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "codex"}}}
+	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: networkid.PortalKey{ID: "portal", Receiver: "codex"}}}
+	threads := []appserver.Thread{
+		{
+			ID:            "thread-new",
+			Cwd:           "/tmp/project",
+			ModelProvider: "openai/gpt-5",
+			CreatedAt:     200,
+			Turns: []appserver.Turn{{
+				ID:        "turn-new",
+				Status:    "completed",
+				StartedAt: 200,
+				Items: []appserver.TurnItem{
+					{ID: "user-new", Type: "userMessage", Content: []appserver.InputPart{{Type: "text", Text: "new prompt"}}},
+					{ID: "agent-new", Type: "agentMessage", Text: "new answer"},
+				},
+			}},
+		},
+		{
+			ID:            "thread-old",
+			Cwd:           "/tmp/project",
+			ModelProvider: "openai/gpt-5",
+			CreatedAt:     100,
+			Turns: []appserver.Turn{{
+				ID:        "turn-old",
+				Status:    "completed",
+				StartedAt: 100,
+				Items: []appserver.TurnItem{
+					{ID: "user-old", Type: "userMessage", Content: []appserver.InputPart{{Type: "text", Text: "old prompt"}}},
+					{ID: "agent-old", Type: "agentMessage", Text: "old answer"},
+				},
+			}},
+		},
+	}
+
+	messages, err := client.directoryBackfillMessages(context.Background(), portal, threads)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := backfillMessageIDs(messages); strings.Join(got, ",") != "codex:turn-old:user-old,codex:turn-old:assistant,codex:turn-new:user-new,codex:turn-new:assistant" {
+		t.Fatalf("directory backfill did not merge sessions oldest first: %#v", got)
+	}
+	for i, msg := range messages {
+		if i > 0 && msg.StreamOrder <= messages[i-1].StreamOrder {
+			t.Fatalf("directory backfill stream order did not increase at %d: %d <= %d", i, msg.StreamOrder, messages[i-1].StreamOrder)
+		}
+	}
+}
+
+func TestArchivedThreadDetection(t *testing.T) {
+	if !isArchivedThread(appserver.Thread{Raw: map[string]any{"archived": true}}) {
+		t.Fatal("archived bool should mark thread archived")
+	}
+	if !isArchivedThread(appserver.Thread{Raw: map[string]any{"archivedAt": "2026-06-03T00:00:00Z"}}) {
+		t.Fatal("archivedAt should mark thread archived")
+	}
+	if isArchivedThread(appserver.Thread{Raw: map[string]any{"archived": false}}) {
+		t.Fatal("non-archived thread was treated as archived")
+	}
+}
+
 func TestBackfillSortsTurnsOldestFirst(t *testing.T) {
 	client := &Client{UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "codex"}}}
 	thread := appserver.Thread{
@@ -1428,6 +1490,43 @@ func TestBackfillHookPromptMapsTextState(t *testing.T) {
 	if !hasCodexRunStateDelta(run.Events, "item/hookPrompt", "text", "Preserve approval context.") ||
 		!hasCodexRunStateDelta(run.Events, "item/hookPrompt", "itemId", "hook-prompt-1") {
 		t.Fatalf("expected hook prompt text state, got %#v", run.Events)
+	}
+}
+
+func TestBackfillHookPromptMapsRawTextState(t *testing.T) {
+	for _, item := range []appserver.TurnItem{
+		{
+			ID:   "hook-prompt-raw-fragments",
+			Type: "hookPrompt",
+			Raw: map[string]any{
+				"id":        "hook-prompt-raw-fragments",
+				"type":      "hookPrompt",
+				"fragments": []any{map[string]any{"text": "Raw fragment approval context."}},
+			},
+		},
+		{
+			ID:   "hook-prompt-raw-text",
+			Type: "hookPrompt",
+			Raw: map[string]any{
+				"id":   "hook-prompt-raw-text",
+				"type": "hookPrompt",
+				"text": "Raw text approval context.",
+			},
+		},
+	} {
+		run := aistream.NewRun("turn-1", "thread-1", "codex", "codex", "Codex", time.Unix(0, 0))
+		writer := aistream.NewWriter(run, func() time.Time { return time.Unix(0, 0) })
+		if !mapBackfillItem(writer, run.MessageID, item, nil) {
+			t.Fatalf("expected raw hook prompt item %s to be backfilled", item.ID)
+		}
+		want := "Raw fragment approval context."
+		if item.ID == "hook-prompt-raw-text" {
+			want = "Raw text approval context."
+		}
+		if !hasCodexRunStateDelta(run.Events, "item/hookPrompt", "text", want) ||
+			!hasCodexRunStateDelta(run.Events, "item/hookPrompt", "itemId", item.ID) {
+			t.Fatalf("expected raw hook prompt text state for %s, got %#v", item.ID, run.Events)
+		}
 	}
 }
 

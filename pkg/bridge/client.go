@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -49,6 +50,7 @@ var _ bridgev2.UserSearchingNetworkAPI = (*Client)(nil)
 var _ bridgev2.BackfillingNetworkAPI = (*Client)(nil)
 var _ bridgev2.BackfillingNetworkAPIWithLimits = (*Client)(nil)
 var _ bridgev2.EditHandlingNetworkAPI = (*Client)(nil)
+var _ bridgev2.DeleteChatHandlingNetworkAPI = (*Client)(nil)
 var _ bridgev2.RoomNameHandlingNetworkAPI = (*Client)(nil)
 var _ bridgev2.RoomTopicHandlingNetworkAPI = (*Client)(nil)
 var _ bridgev2.RoomStateHandlingNetworkAPI = (*Client)(nil)
@@ -121,7 +123,7 @@ func (cl *Client) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*br
 			name = threadName(thread)
 			state = enrichThreadStateWithModelState(codexThreadInitialState(thread), cl.roomAIModelState(ctx, portal))
 			if cl.Main != nil {
-				cl.Main.rememberThreadRoom(thread.ID, cl, portal.PortalKey, thread.Cwd, thread.ModelProvider, threadModelRef(thread), threadReasoningEffort(thread), firstStateString(state, "modelName", "name"), firstStateString(state, "reasoning_mode", "reasoningMode"))
+				cl.Main.rememberThreadRoom(thread.ID, cl, portal.PortalKey, thread.Cwd, thread.ModelProvider, threadModelRef(thread), threadReasoningEffort(thread), firstStateString(state, "modelName"), firstStateString(state, "reasoning_mode", "reasoningMode"))
 			}
 		} else {
 			if meta.Cwd != "" {
@@ -158,7 +160,7 @@ func (cl *Client) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*brid
 		return codexUserInfo("New Project", false), nil
 	default:
 		if cwd, ok := parseProjectUserID(ghost.ID); ok {
-			return codexUserInfo(directoryName(cwd), false, cwd), nil
+			return codexUserInfo(projectDisplayName(cwd), false, cwd), nil
 		}
 		if strings.HasPrefix(string(ghost.ID), "login:") {
 			return loginUserInfo(), nil
@@ -177,6 +179,7 @@ func (cl *Client) GetCapabilities(ctx context.Context, portal *bridgev2.Portal) 
 		},
 		TypingNotifications: true,
 		Edit:                event.CapLevelFullySupported,
+		DeleteChat:          true,
 	}
 }
 
@@ -344,6 +347,31 @@ func (cl *Client) HandleMatrixEdit(ctx context.Context, msg *bridgev2.MatrixEdit
 		cl.logMatrixMessageError(&bridgev2.MatrixMessage{MatrixEventBase: msg.MatrixEventBase}, err, "Codex Matrix edit failed")
 		return matrixMessageStatusForCodexError(err)
 	}
+	return nil
+}
+
+func (cl *Client) HandleMatrixDeleteChat(ctx context.Context, msg *bridgev2.MatrixDeleteChat) error {
+	if msg == nil || msg.Portal == nil {
+		return fmt.Errorf("missing Codex chat delete")
+	}
+	if cl == nil || cl.Main == nil {
+		return nil
+	}
+	meta := portalMetadata(msg.Portal.Metadata)
+	if meta.ThreadID != "" {
+		if active := cl.Main.activeRun(meta.ThreadID); active != nil {
+			active.mu.Lock()
+			active.stopPublisherLocked(ctx)
+			active.deletePersistedLocked(ctx)
+			active.mu.Unlock()
+		}
+		cl.Main.forgetThread(meta.ThreadID)
+	}
+	logFromContext(ctx).Info().
+		Stringer("portal_key", msg.Portal.PortalKey).
+		Str("thread_id", meta.ThreadID).
+		Str("cwd", meta.Cwd).
+		Msg("Detached Codex chat after Matrix chat delete")
 	return nil
 }
 
@@ -823,12 +851,11 @@ func (cl *Client) resolveProject(ctx context.Context, cwd string, createChat boo
 	if err != nil {
 		return nil, err
 	}
-	name := directoryName(cwd)
+	name := projectDisplayName(cwd)
 	threadID := ""
 	var state map[string]any
 	thread, ok := cl.latestThreadForDirectory(ctx, cwd)
 	if ok {
-		name = threadName(thread)
 		threadID = thread.ID
 		state = codexThreadInitialState(thread)
 	}
@@ -863,11 +890,10 @@ func (cl *Client) CreateChatWithGhost(ctx context.Context, ghost *bridgev2.Ghost
 			log.Debug().Msg("Rejected unknown Codex ghost")
 			return nil, fmt.Errorf("unknown Codex ghost %s", ghost.ID)
 		}
-		name := directoryName(cwd)
+		name := projectDisplayName(cwd)
 		threadID := ""
 		var state map[string]any
 		if thread, ok := cl.latestThreadForDirectory(ctx, cwd); ok {
-			name = threadName(thread)
 			threadID = thread.ID
 			state = codexThreadInitialState(thread)
 		}
@@ -906,8 +932,8 @@ func (cl *Client) contactsForThreads(ctx context.Context, threads []appserver.Th
 		cl.resolveUser(ctx, newProjectUserID, codexUserInfo("New Project", false)),
 	}
 	for _, thread := range sortedRecentDirectories(threads) {
-		contact := cl.resolveUser(ctx, projectUserID(thread.Cwd), projectUserInfo(thread, thread.Cwd, directoryName(thread.Cwd)))
-		contact.Chat = cl.existingChatForProject(ctx, thread.Cwd, directoryName(thread.Cwd), thread.ID, codexThreadInitialState(thread))
+		contact := cl.resolveUser(ctx, projectUserID(thread.Cwd), projectUserInfo(thread, thread.Cwd, projectDisplayName(thread.Cwd)))
+		contact.Chat = cl.existingChatForProject(ctx, thread.Cwd, projectDisplayName(thread.Cwd), thread.ID, codexThreadInitialState(thread))
 		contacts = append(contacts, contact)
 	}
 	return contacts
@@ -940,33 +966,65 @@ func projectUserInfo(thread appserver.Thread, cwd, name string) *bridgev2.UserIn
 }
 
 func (cl *Client) SearchUsers(ctx context.Context, query string) ([]*bridgev2.ResolveIdentifierResponse, error) {
-	query = strings.ToLower(strings.TrimSpace(query))
-	log := logFromContext(ctx).With().Str("query", query).Logger()
+	rawQuery := strings.TrimSpace(query)
+	query = strings.ToLower(rawQuery)
+	log := logFromContext(ctx).With().Str("query", rawQuery).Logger()
 	if cl != nil && cl.UserLogin != nil {
 		log = log.With().Str("login_id", string(cl.UserLogin.ID)).Logger()
 	}
 	log.Debug().Msg("Searching Codex contacts")
 	contacts, err := cl.GetContactList(ctx)
-	if err != nil || query == "" {
-		if err != nil {
-			log.Debug().Err(err).Msg("Failed to search Codex contacts")
-		} else {
-			log.Debug().Int("results", len(contacts)).Msg("Search query empty, returning all Codex contacts")
+	if err != nil {
+		if direct, ok := cl.directPathSearchResult(ctx, rawQuery); ok {
+			log.Debug().Err(err).Msg("Contact listing failed, returning direct Codex project path")
+			return []*bridgev2.ResolveIdentifierResponse{direct}, nil
 		}
+		log.Debug().Err(err).Msg("Failed to search Codex contacts")
 		return contacts, err
 	}
+	if query == "" {
+		log.Debug().Int("results", len(contacts)).Msg("Search query empty, returning all Codex contacts")
+		return contacts, nil
+	}
 	filtered := contacts[:0]
+	if direct, ok := cl.directPathSearchResult(ctx, rawQuery); ok {
+		filtered = append(filtered, direct)
+	}
 	for _, contact := range contacts {
 		name := ""
 		if contact.UserInfo != nil && contact.UserInfo.Name != nil {
 			name = strings.ToLower(*contact.UserInfo.Name)
 		}
 		if strings.Contains(name, query) || strings.Contains(strings.ToLower(string(contact.UserID)), query) || identifiersContain(contact.UserInfo, query) {
+			if hasResolveResult(filtered, contact.UserID) {
+				continue
+			}
 			filtered = append(filtered, contact)
 		}
 	}
 	log.Debug().Int("contacts", len(contacts)).Int("results", len(filtered)).Msg("Searched Codex contacts")
 	return filtered, nil
+}
+
+func (cl *Client) directPathSearchResult(ctx context.Context, query string) (*bridgev2.ResolveIdentifierResponse, bool) {
+	cwd, err := cleanProjectDir(query)
+	if err != nil || cwd == "" {
+		return nil, false
+	}
+	resp, err := cl.resolveProject(ctx, cwd, false)
+	if err != nil {
+		return nil, false
+	}
+	return resp, true
+}
+
+func hasResolveResult(results []*bridgev2.ResolveIdentifierResponse, userID networkid.UserID) bool {
+	for _, result := range results {
+		if result != nil && result.UserID == userID {
+			return true
+		}
+	}
+	return false
 }
 
 func identifiersContain(info *bridgev2.UserInfo, query string) bool {
@@ -1084,7 +1142,7 @@ func (cl *Client) chatForProject(ctx context.Context, cwd, name, threadID string
 		}
 	}
 	if threadID != "" && cl.Main != nil {
-		cl.Main.rememberThreadRoom(threadID, cl, key, cwd, firstStateString(state, "modelProvider"), codexModelStateRef(state, ""), firstStateString(state, "effort", "reasoning", "reasoningEffort", "reasoning_effort"), firstStateString(state, "modelName", "name"), firstStateString(state, "reasoning_mode", "reasoningMode"))
+		cl.Main.rememberThreadRoom(threadID, cl, key, cwd, firstStateString(state, "modelProvider"), codexModelStateRef(state, ""), firstStateString(state, "effort", "reasoning", "reasoningEffort", "reasoning_effort"), firstStateString(state, "modelName"), firstStateString(state, "reasoning_mode", "reasoningMode"))
 	}
 	return &bridgev2.CreateChatResponse{
 		PortalKey:      key,
@@ -1583,7 +1641,7 @@ func (cl *Client) syncThreadPortal(ctx context.Context, portal *bridgev2.Portal,
 	cl.ensureBackfillVersion(ctx, portal)
 	name := threadName(thread)
 	state := enrichThreadStateWithModelState(codexThreadInitialState(thread), cl.roomAIModelState(ctx, portal))
-	cl.Main.rememberThreadRoom(thread.ID, cl, portal.PortalKey, thread.Cwd, firstStateString(state, "modelProvider", "provider"), codexModelStateRef(state, ""), firstStateString(state, "effort", "reasoning", "reasoningEffort", "reasoning_effort"), firstStateString(state, "modelName", "name"), firstStateString(state, "reasoning_mode", "reasoningMode"))
+	cl.Main.rememberThreadRoom(thread.ID, cl, portal.PortalKey, thread.Cwd, firstStateString(state, "modelProvider", "provider"), codexModelStateRef(state, ""), firstStateString(state, "effort", "reasoning", "reasoningEffort", "reasoning_effort"), firstStateString(state, "modelName"), firstStateString(state, "reasoning_mode", "reasoningMode"))
 	info := portalInfo(name, cl.codexMembers(), thread.Cwd, thread.ID, state)
 	applyStoredPortalInfo(info, portal)
 	portal.UpdateInfo(ctx, info, cl.UserLogin, nil, time.Now())
@@ -1765,6 +1823,19 @@ func (cl *Client) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	}
 	meta := portalMetadata(params.Portal.Metadata)
 	meta = cl.hydratePortalThreadMetadata(ctx, params.Portal, meta)
+	if meta.Cwd != "" {
+		threads, err := cl.readDirectoryThreadsForBackfill(ctx, meta.Cwd)
+		if err != nil {
+			return nil, err
+		}
+		if len(threads) > 0 {
+			messages, err := cl.directoryBackfillMessages(ctx, params.Portal, threads)
+			if err != nil {
+				return nil, err
+			}
+			return paginateBackfillMessages(messages, params), nil
+		}
+	}
 	if meta.ThreadID == "" {
 		return &bridgev2.FetchMessagesResponse{HasMore: false}, nil
 	}
@@ -1787,7 +1858,8 @@ func (cl *Client) GetBackfillMaxBatchCount(ctx context.Context, portal *bridgev2
 	if portal == nil || portal.RoomType == database.RoomTypeSpace {
 		return 0
 	}
-	if portalMetadata(portal.Metadata).ThreadID == "" {
+	meta := portalMetadata(portal.Metadata)
+	if meta.ThreadID == "" && meta.Cwd == "" {
 		return 0
 	}
 	return -1
@@ -1795,6 +1867,90 @@ func (cl *Client) GetBackfillMaxBatchCount(ctx context.Context, portal *bridgev2
 
 func (cl *Client) backfillMessages(ctx context.Context, portal *bridgev2.Portal, thread appserver.Thread) ([]*bridgev2.BackfillMessage, error) {
 	return cl.projectBackfillMessages(ctx, portal, thread)
+}
+
+func (cl *Client) readDirectoryThreadsForBackfill(ctx context.Context, cwd string) ([]appserver.Thread, error) {
+	if cwd == "" {
+		return nil, nil
+	}
+	threads, err := cl.listThreads(ctx, "", 100)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]appserver.Thread, 0, len(threads))
+	for _, listed := range threads {
+		if listed.Cwd != cwd || isArchivedThread(listed) {
+			continue
+		}
+		thread, err := cl.readThreadForBackfill(ctx, listed.ID)
+		if err != nil {
+			if isThreadNotFoundError(err) {
+				continue
+			}
+			return nil, err
+		}
+		if thread.Cwd == "" {
+			thread.Cwd = listed.Cwd
+		}
+		if thread.Cwd != cwd || isArchivedThread(thread) {
+			continue
+		}
+		out = append(out, thread)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		left := threadSortTime(out[i])
+		right := threadSortTime(out[j])
+		if left == right {
+			return out[i].ID < out[j].ID
+		}
+		return left < right
+	})
+	return out, nil
+}
+
+func (cl *Client) directoryBackfillMessages(ctx context.Context, portal *bridgev2.Portal, threads []appserver.Thread) ([]*bridgev2.BackfillMessage, error) {
+	var messages []*bridgev2.BackfillMessage
+	for _, thread := range threads {
+		threadMessages, err := cl.projectBackfillMessages(ctx, portal, thread)
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, threadMessages...)
+	}
+	sort.SliceStable(messages, func(i, j int) bool {
+		if messages[i].Timestamp.Equal(messages[j].Timestamp) {
+			return messages[i].ID < messages[j].ID
+		}
+		return messages[i].Timestamp.Before(messages[j].Timestamp)
+	})
+	var streamOrder int64
+	for _, msg := range messages {
+		streamOrder = nextBackfillStreamOrder(streamOrder, msg.Timestamp)
+		msg.StreamOrder = streamOrder
+	}
+	return messages, nil
+}
+
+func threadSortTime(thread appserver.Thread) int64 {
+	if thread.CreatedAt != 0 {
+		return thread.CreatedAt
+	}
+	return thread.UpdatedAt
+}
+
+func isArchivedThread(thread appserver.Thread) bool {
+	if thread.Raw == nil {
+		return false
+	}
+	for _, key := range []string{"archived", "isArchived"} {
+		if value, _ := thread.Raw[key].(bool); value {
+			return true
+		}
+	}
+	if value, _ := thread.Raw["archivedAt"].(string); strings.TrimSpace(value) != "" {
+		return true
+	}
+	return false
 }
 
 func (cl *Client) applyValidatedRoomTurnSettings(ctx context.Context, params map[string]any, state map[string]any, portal *bridgev2.Portal, portalKey networkid.PortalKey) {

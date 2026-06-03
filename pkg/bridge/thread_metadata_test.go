@@ -127,9 +127,12 @@ func TestCodexAIModelStateContent(t *testing.T) {
 		t.Fatalf("model display name should write AI model state: %#v", content)
 	}
 
-	content = codexAIModelStateContent(map[string]any{"model": "gpt-b", "modelProvider": "openai", "name": "GPT-B"})
-	if content["model"] != "openai/gpt-b" || content["name"] != "GPT-B" {
-		t.Fatalf("AI model state name alias should be preserved: %#v", content)
+	content = codexAIModelStateContent(map[string]any{"model": "gpt-b", "modelProvider": "openai", "name": "Thread title"})
+	if content["model"] != "openai/gpt-b" {
+		t.Fatalf("thread name should not affect AI model state: %#v", content)
+	}
+	if _, ok := content["name"]; ok {
+		t.Fatalf("generic thread name leaked into AI model state: %#v", content)
 	}
 
 	state = codexThreadState("thread/started", "thread-1", "", []byte(`{"thread":{"id":"thread-1","model":"gpt-5","modelName":"GPT-5","modelProvider":"openai"}}`))
@@ -362,6 +365,65 @@ func TestCodexThreadChatInfoExtraUpdatesClearsMissingAIModelState(t *testing.T) 
 	}
 	if modelState.Content == nil || len(modelState.Content.Raw) != 0 {
 		t.Fatalf("Beeper AI model state clear used wrong content: %#v", modelState.Content)
+	}
+}
+
+func TestSyncThreadPortalDoesNotUseThreadNameAsAIModelName(t *testing.T) {
+	ctx := context.Background()
+	matrix := &fakeMatrixConnector{}
+	connector, br := testBridgeWithDB(t, matrix)
+	user, err := br.GetUserByMXID(ctx, id.UserID("@user:example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := user.NewLogin(ctx, &database.UserLogin{
+		ID:            "sh-codex",
+		RemoteName:    "Codex",
+		RemoteProfile: status.RemoteProfile{Name: "Codex"},
+		Metadata:      map[string]any{},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := login.Client.(*Client)
+	key := projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client.syncThreadPortal(ctx, portal, appserver.Thread{
+		ID:            "thread-1",
+		SessionID:     "thread-1",
+		Cwd:           "/tmp/project",
+		Name:          "Check storage offload options",
+		ModelProvider: "openai",
+		Raw: map[string]any{
+			"model":         "gpt-5.5",
+			"modelProvider": "openai",
+			"name":          "Check storage offload options",
+		},
+	})
+
+	modelState := findFakeState(matrix.api.states, beeperAIModelStateType)
+	if modelState == nil || modelState.Content.Raw["model"] != "openai/gpt-5.5" {
+		t.Fatalf("syncThreadPortal did not sync AI model state: %#v", matrix.api.states)
+	}
+	if _, ok := modelState.Content.Raw["name"]; ok {
+		t.Fatalf("thread title leaked into AI model state: %#v", modelState.Content.Raw)
+	}
+	room, ok := connector.threadRoom("thread-1")
+	if !ok || room.model != "openai/gpt-5.5" || room.modelName != "" {
+		t.Fatalf("thread title leaked into cached model metadata: %#v", room)
 	}
 }
 

@@ -414,6 +414,78 @@ func TestSemanticDeltasMapToChatWithoutRawCodexCustomEvents(t *testing.T) {
 	}
 }
 
+func TestPublishedStreamCarrierMapsSemanticDeltasWithoutRawCodexEvents(t *testing.T) {
+	publisher := &recordingBeeperStreamPublisher{}
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.anchorMXID = "$anchor:example.com"
+	run.roomID = "!room:example.com"
+	run.publisher = publisher
+	run.started = true
+
+	run.handle("item/agentMessage/delta", []byte(`{"threadId":"thread-1","turnId":"turn-1","itemId":"msg-1","delta":"hello"}`))
+	run.handle("item/reasoning/textDelta", []byte(`{"threadId":"thread-1","turnId":"turn-1","itemId":"reason-1","contentIndex":0,"delta":"thinking"}`))
+	run.handle("thread/realtime/transcript/delta", []byte(`{"threadId":"thread-1","turnId":"turn-1","role":"assistant","delta":"live"}`))
+
+	if len(publisher.updates) == 0 {
+		t.Fatal("expected semantic deltas to publish Beeper stream carriers")
+	}
+	events := publishedStreamEvents(t, publisher)
+	if !hasTextDelta(events, "hello") {
+		t.Fatalf("published carrier did not include mapped assistant text: %#v", events)
+	}
+	if !hasTextDelta(events, "live") {
+		t.Fatalf("published carrier did not include mapped realtime text: %#v", events)
+	}
+	if countReasoningDelta(events, "thinking") != 1 {
+		t.Fatalf("published carrier did not include mapped reasoning text: %#v", events)
+	}
+	raw, err := json.Marshal(publisher.updates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, method := range []string{"item/agentMessage/delta", "item/reasoning/textDelta", "thread/realtime/transcript/delta"} {
+		if strings.Contains(string(raw), method) {
+			t.Fatalf("published carrier leaked raw Codex notification %q: %s", method, raw)
+		}
+	}
+}
+
+func TestPublishedStreamCarrierIncludesToolCallsAndRoomStateDeltas(t *testing.T) {
+	publisher := &recordingBeeperStreamPublisher{}
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.anchorMXID = "$anchor:example.com"
+	run.roomID = "!room:example.com"
+	run.publisher = publisher
+	run.started = true
+
+	run.handle("item/started", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"mcpToolCall","id":"mcp-1","server":"github","tool":"list_issues","arguments":{"state":"open"},"status":"inProgress"}}`))
+	run.handle("item/mcpToolCall/progress", []byte(`{"threadId":"thread-1","turnId":"turn-1","itemId":"mcp-1","message":"Fetching issues"}`))
+	run.handle("item/completed", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"mcpToolCall","id":"mcp-1","server":"github","tool":"list_issues","arguments":{"state":"open"},"status":"completed","result":{"content":[{"type":"text","text":"found two issues"}],"structuredContent":{"count":2}}}}`))
+	run.writeCodexRoomState(beeperAIModelStateType, map[string]any{"model": "openai/gpt-5.5", "reasoning": "high"})
+
+	events := publishedStreamEvents(t, publisher)
+	if !hasToolCallStartName(events, "mcp-1", "github list_issues") {
+		t.Fatalf("published carrier did not include mapped tool start: %#v", events)
+	}
+	if !hasToolArgsContaining(events, "mcp-1", `"state":"open"`) ||
+		!hasToolArgsContaining(events, "mcp-1", `"server":"github"`) ||
+		!hasToolArgsContaining(events, "mcp-1", `"tool":"list_issues"`) {
+		t.Fatalf("published carrier did not include tool input metadata: %#v", events)
+	}
+	if !hasToolResultState(events, "mcp-1", "Fetching issues", agui.ToolResultStateStreaming) {
+		t.Fatalf("published carrier did not include streaming tool progress: %#v", events)
+	}
+	if !hasToolResultStateContaining(events, "mcp-1", "found two issues", agui.ToolResultStateComplete) ||
+		!hasToolResultStateContaining(events, "mcp-1", `"structuredContent":{"count":2}`, agui.ToolResultStateComplete) ||
+		!hasToolCallEnd(events, "mcp-1") {
+		t.Fatalf("published carrier did not include completed tool result/end: %#v", events)
+	}
+	if !hasCodexRoomStateDelta(events, beeperAIModelStateType, "model", "openai/gpt-5.5") ||
+		!hasCodexRoomStateDelta(events, beeperAIModelStateType, "reasoning", "high") {
+		t.Fatalf("published carrier did not include room state delta: %#v", events)
+	}
+}
+
 func TestTurnStartedDoesNotCreateVisibleThinkingPart(t *testing.T) {
 	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
 	run.handle("turn/started", []byte(`{"threadId":"thread-1","turn":{"id":"turn-1"}}`))
@@ -822,6 +894,51 @@ func TestStreamPublisherPublishesCarriers(t *testing.T) {
 	}
 	if publisher.roomID != "!room:example.com" || publisher.eventID != "$anchor:example.com" {
 		t.Fatalf("published to wrong target: room=%s event=%s", publisher.roomID, publisher.eventID)
+	}
+}
+
+func TestStreamPublisherCompactsOversizedCarrierWithoutMutatingRun(t *testing.T) {
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.anchorMXID = "$anchor:example.com"
+	run.roomID = "!room:example.com"
+	publisher := &recordingBeeperStreamPublisher{}
+	run.publisher = publisher
+	run.started = true
+	large := strings.Repeat("x", streamCarrierBudgetBytes*2)
+	run.run.Events = append(run.run.Events, agui.NewEvent(map[string]any{
+		"type":       agui.EventToolCallResult,
+		"messageId":  "msg-1",
+		"toolCallId": "tool-1",
+		"role":       agui.RoleTool,
+		"state":      agui.ToolResultStateComplete,
+		"content":    large,
+	}))
+
+	run.publishLocked()
+
+	if len(publisher.updates) != 1 {
+		t.Fatalf("expected one compacted update, got %#v", publisher.updates)
+	}
+	raw, err := json.Marshal(publisher.updates[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) > streamCarrierBudgetBytes {
+		t.Fatalf("compacted stream carrier is still oversized: %d > %d", len(raw), streamCarrierBudgetBytes)
+	}
+	ai, ok := publisher.updates[0][aistream.BeeperAIKey].(aistream.BeeperAI)
+	if !ok || len(ai.Events) < 1 {
+		t.Fatalf("unexpected compacted stream payload: %#v", publisher.updates[0])
+	}
+	oversized := ai.Events[len(ai.Events)-1].Event
+	if oversized.Type() != agui.EventToolCallResult {
+		t.Fatalf("last stream event was not the compacted tool result: %#v", oversized)
+	}
+	if got, _ := oversized.Get("content").(string); got != streamPayloadTruncatedText {
+		t.Fatalf("oversized tool result was not replaced with stream preview: %q", got)
+	}
+	if got, _ := run.run.Events[len(run.run.Events)-1].Get("content").(string); got != large {
+		t.Fatalf("publish-time compaction mutated the durable run event")
 	}
 }
 
@@ -2335,6 +2452,24 @@ func hasEventType(events []agui.Event, eventType string) bool {
 		}
 	}
 	return false
+}
+
+func publishedStreamEvents(t *testing.T, publisher *recordingBeeperStreamPublisher) []agui.Event {
+	t.Helper()
+	publisher.mu.Lock()
+	updates := append([]map[string]any(nil), publisher.updates...)
+	publisher.mu.Unlock()
+	var events []agui.Event
+	for _, update := range updates {
+		ai, ok := update[aistream.BeeperAIKey].(aistream.BeeperAI)
+		if !ok {
+			t.Fatalf("missing com.beeper.ai stream carrier: %#v", update[aistream.BeeperAIKey])
+		}
+		for _, envelope := range ai.Events {
+			events = append(events, envelope.Event)
+		}
+	}
+	return events
 }
 
 func hasTextDelta(events []agui.Event, delta string) bool {

@@ -319,6 +319,30 @@ func TestTypeScriptActiveRunNotificationsHaveMappingDecision(t *testing.T) {
 	}
 }
 
+func TestActiveRunMappedNotificationsAreExplicitlyHandled(t *testing.T) {
+	handled := sourceSwitchCases(t, "stream.go", "func (r *activeRun) handle(", "func (r *activeRun) finishTurnLocked")
+	for _, method := range generatedTypeScriptMethods(t, codexTypeScriptNotificationPath) {
+		if !isActiveRunNotificationMapped(method) {
+			continue
+		}
+		if !handled[method] {
+			t.Fatalf("active-run notification %q is marked mapped but has no explicit activeRun.handle case", method)
+		}
+	}
+}
+
+func TestGlobalNotificationsAreExplicitlyHandled(t *testing.T) {
+	handled := sourceSwitchCases(t, "connector.go", "func (c *Connector) handleGlobalNotification(", "func mcpOAuthLoginMessage")
+	for _, method := range generatedTypeScriptMethods(t, codexTypeScriptNotificationPath) {
+		if !handledAsGlobalNotification(method) {
+			continue
+		}
+		if !handled[method] {
+			t.Fatalf("global notification %q is classified but has no explicit handleGlobalNotification case", method)
+		}
+	}
+}
+
 func TestTypeScriptRawResponseCompactionItemsAreMapped(t *testing.T) {
 	itemTypes := generatedTypeScriptResponseItemTypes(t)
 	for _, itemType := range itemTypes {
@@ -603,6 +627,30 @@ func generatedTypeScriptMethods(t *testing.T, path string) []string {
 	}
 	sort.Strings(methods)
 	return methods
+}
+
+func sourceSwitchCases(t *testing.T, path, start, end string) map[string]bool {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read source %s: %v", path, err)
+	}
+	text := string(raw)
+	startIndex := strings.Index(text, start)
+	if startIndex < 0 {
+		t.Fatalf("source %s missing start marker %q", path, start)
+	}
+	endIndex := strings.Index(text[startIndex:], end)
+	if endIndex < 0 {
+		t.Fatalf("source %s missing end marker %q", path, end)
+	}
+	body := text[startIndex : startIndex+endIndex]
+	re := regexp.MustCompile(`"([^"]+/[^"]+|error|warning|guardianWarning|deprecationNotice|configWarning)"`)
+	handled := map[string]bool{}
+	for _, match := range re.FindAllStringSubmatch(body, -1) {
+		handled[match[1]] = true
+	}
+	return handled
 }
 
 func generatedTypeScriptV2NotificationTypes(t *testing.T) []string {
