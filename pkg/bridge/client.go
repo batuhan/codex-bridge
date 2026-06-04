@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -47,10 +49,11 @@ const (
 	threadTurnsListLimit   = 100
 	modelListLimit         = 200
 
-	threadListSortKey       = "updated_at"
-	sortDirectionAscending  = "asc"
-	sortDirectionDescending = "desc"
-	threadTurnsItemsView    = "full"
+	threadListSortKey         = "updated_at"
+	sortDirectionAscending    = "asc"
+	sortDirectionDescending   = "desc"
+	threadTurnsItemsView      = "full"
+	backfillEntryCursorPrefix = "entry:"
 )
 
 var _ bridgev2.NetworkAPI = (*Client)(nil)
@@ -1294,16 +1297,26 @@ func (cl *Client) listThreads(ctx context.Context, cursor string, limit int) ([]
 	var out []appserver.Thread
 	seen := map[string]bool{}
 	for {
-		params := threadListParams(cursor, limit)
-		var resp appserver.ThreadListResponse
-		if err := cl.Main.request(ctx, "thread/list", params, &resp); err != nil {
+		data, nextCursor, err := cl.listThreadPage(ctx, cursor, limit)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, resp.Data...)
-		if !advanceCursor(seen, &cursor, resp.NextCursor) {
+		out = append(out, data...)
+		if !advanceCursor(seen, &cursor, nextCursor) {
 			return out, nil
 		}
 	}
+}
+
+func (cl *Client) listThreadPage(ctx context.Context, cursor string, limit int) ([]appserver.Thread, string, error) {
+	if limit <= 0 {
+		limit = defaultThreadListLimit
+	}
+	var resp appserver.ThreadListResponse
+	if err := cl.Main.request(ctx, "thread/list", threadListParams(cursor, limit), &resp); err != nil {
+		return nil, "", err
+	}
+	return resp.Data, resp.NextCursor, nil
 }
 
 func (cl *Client) listRecentContactThreads(ctx context.Context) ([]appserver.Thread, error) {
@@ -1895,6 +1908,9 @@ func (cl *Client) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 	meta := portalMetadata(params.Portal.Metadata)
 	meta = cl.hydratePortalThreadMetadata(ctx, params.Portal, meta)
 	if meta.Kind != portalKindSubagent && meta.Cwd != "" {
+		if !params.Forward {
+			return cl.backfillDirectoryPage(ctx, params.Portal, meta.Cwd, params)
+		}
 		threads, err := cl.readDirectoryThreadsForBackfill(ctx, meta.Cwd)
 		if err != nil {
 			return nil, err
@@ -1926,6 +1942,81 @@ func (cl *Client) backfillThreadPage(ctx context.Context, portal *bridgev2.Porta
 	}
 	resp.Messages = messages
 	return resp, nil
+}
+
+func (cl *Client) backfillDirectoryPage(ctx context.Context, portal *bridgev2.Portal, cwd string, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
+	entries, hasMore, err := cl.readDirectoryBackfillEntryPage(ctx, cwd, params)
+	if err != nil {
+		return nil, err
+	}
+	messages, err := cl.backfillMessagesFromEntries(ctx, portal, entries)
+	if err != nil {
+		return nil, err
+	}
+	resp := &bridgev2.FetchMessagesResponse{
+		Messages: messages,
+		HasMore:  hasMore,
+		MarkRead: params.AnchorMessage == nil && params.Cursor == "",
+	}
+	if len(entries) > 0 {
+		resp.Cursor = backfillEntryCursorFor(entries[0])
+	}
+	return resp, nil
+}
+
+func (cl *Client) readDirectoryBackfillEntryPage(ctx context.Context, cwd string, params bridgev2.FetchMessagesParams) ([]*backfillEntry, bool, error) {
+	if cwd == "" {
+		return nil, false, nil
+	}
+	count := params.Count
+	if count <= 0 {
+		count = defaultThreadListLimit
+	}
+	maxEntries := count + 1
+	cutoff, hasCutoff := backfillEntryCursorCutoff(params)
+	var entries []*backfillEntry
+	var hasMore bool
+	cursor := ""
+	seen := map[string]bool{}
+	for {
+		listed, nextCursor, err := cl.listThreadPage(ctx, cursor, defaultThreadListLimit)
+		if err != nil {
+			return nil, false, err
+		}
+		for _, listedThread := range listed {
+			thread, ok, err := cl.readListedDirectoryThreadForBackfill(ctx, listedThread, cwd)
+			if err != nil {
+				return nil, false, err
+			}
+			if !ok {
+				continue
+			}
+			for _, entry := range projectBackfillEntries(thread) {
+				if hasCutoff && !backfillEntryBeforeCursor(entry, cutoff) {
+					continue
+				}
+				entries = append(entries, entry)
+			}
+			var overflow bool
+			entries, overflow = newestBackfillEntryWindow(entries, maxEntries)
+			hasMore = hasMore || overflow
+			if len(entries) >= maxEntries {
+				hasMore = true
+				selected, _ := newestBackfillEntryWindow(entries, count)
+				return selected, hasMore, nil
+			}
+		}
+		if !advanceCursor(seen, &cursor, nextCursor) {
+			break
+		}
+		if len(entries) >= count {
+			hasMore = true
+			break
+		}
+	}
+	var overflow bool
+	entries, overflow = newestBackfillEntryWindow(entries, count)
+	return entries, hasMore || overflow, nil
 }
 
 func emptyFetchMessagesResponse() *bridgev2.FetchMessagesResponse {
@@ -2031,6 +2122,80 @@ func assignBackfillEntryStreamOrder(entries []*backfillEntry) {
 		streamOrder = nextBackfillStreamOrder(streamOrder, entry.Timestamp)
 		entry.StreamOrder = streamOrder
 	}
+}
+
+func newestBackfillEntryWindow(entries []*backfillEntry, count int) ([]*backfillEntry, bool) {
+	sort.SliceStable(entries, func(i, j int) bool {
+		return backfillEntryBefore(entries[i], entries[j])
+	})
+	if count <= 0 || len(entries) <= count {
+		assignBackfillEntryStreamOrder(entries)
+		return entries, false
+	}
+	entries = append([]*backfillEntry(nil), entries[len(entries)-count:]...)
+	assignBackfillEntryStreamOrder(entries)
+	return entries, true
+}
+
+type backfillEntryCursor struct {
+	timestamp time.Time
+	id        networkid.MessageID
+}
+
+func backfillEntryCursorFor(entry *backfillEntry) networkid.PaginationCursor {
+	if entry == nil {
+		return ""
+	}
+	encodedID := base64.RawURLEncoding.EncodeToString([]byte(entry.ID))
+	return networkid.PaginationCursor(backfillEntryCursorPrefix + strconv.FormatInt(entry.Timestamp.UnixNano(), 10) + ":" + encodedID)
+}
+
+func parseBackfillEntryCursor(raw networkid.PaginationCursor) (backfillEntryCursor, bool) {
+	text := string(raw)
+	if !strings.HasPrefix(text, backfillEntryCursorPrefix) {
+		return backfillEntryCursor{}, false
+	}
+	tsText, idText, ok := strings.Cut(strings.TrimPrefix(text, backfillEntryCursorPrefix), ":")
+	if !ok {
+		return backfillEntryCursor{}, false
+	}
+	ts, err := strconv.ParseInt(tsText, 10, 64)
+	if err != nil {
+		return backfillEntryCursor{}, false
+	}
+	id, err := base64.RawURLEncoding.DecodeString(idText)
+	if err != nil {
+		return backfillEntryCursor{}, false
+	}
+	return backfillEntryCursor{timestamp: time.Unix(0, ts), id: networkid.MessageID(id)}, true
+}
+
+func backfillEntryCursorCutoff(params bridgev2.FetchMessagesParams) (backfillEntryCursor, bool) {
+	var cutoff backfillEntryCursor
+	hasCutoff := false
+	if params.AnchorMessage != nil {
+		cutoff = backfillEntryCursor{timestamp: params.AnchorMessage.Timestamp, id: params.AnchorMessage.ID}
+		hasCutoff = true
+	}
+	if cursor, ok := parseBackfillEntryCursor(params.Cursor); ok && (!hasCutoff || backfillCursorBefore(cursor, cutoff)) {
+		cutoff = cursor
+		hasCutoff = true
+	}
+	return cutoff, hasCutoff
+}
+
+func backfillCursorBefore(left, right backfillEntryCursor) bool {
+	if left.timestamp.Equal(right.timestamp) {
+		return left.id < right.id
+	}
+	return left.timestamp.Before(right.timestamp)
+}
+
+func backfillEntryBeforeCursor(entry *backfillEntry, cursor backfillEntryCursor) bool {
+	if entry == nil {
+		return false
+	}
+	return backfillCursorBefore(backfillEntryCursor{timestamp: entry.Timestamp, id: entry.ID}, cursor)
 }
 
 func backfillMessageBefore(left, right *bridgev2.BackfillMessage) bool {

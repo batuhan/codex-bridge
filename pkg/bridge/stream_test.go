@@ -1348,9 +1348,10 @@ func TestActiveRunRegistersStreamOnActualAnchorEventID(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	requireEventually(t, time.Second, func() bool { return len(matrixAPI.messages) == 1 })
 	checkedAnchorSend := false
 	matrixAPI.onSendMessage = func(roomID id.RoomID, eventType event.Type, content *event.Content, extra *bridgev2.MatrixSendExtra) {
-		if eventType != event.EventMessage {
+		if roomID != "!room:example.com" || eventType != event.EventMessage {
 			return
 		}
 		checkedAnchorSend = true
@@ -1369,7 +1370,7 @@ func TestActiveRunRegistersStreamOnActualAnchorEventID(t *testing.T) {
 	if !checkedAnchorSend {
 		t.Fatal("anchor send hook was not called")
 	}
-	if run.anchorMXID != "$message" || publisher.eventID != "$message" {
+	if run.anchorMXID != "$message-2" || publisher.eventID != "$message-2" {
 		t.Fatalf("stream should register on actual anchor event, run=%s publisher=%s", run.anchorMXID, publisher.eventID)
 	}
 	if publisher.eventID == "$deterministic:example.com" {

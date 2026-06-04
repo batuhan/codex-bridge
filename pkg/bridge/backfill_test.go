@@ -354,14 +354,34 @@ func TestBackfillUserMessageUploadsOversizedBody(t *testing.T) {
 		t.Fatalf("expected one user backfill message, got %d", len(messages))
 	}
 	part := messages[0].ConvertedMessage.Parts[0]
-	if part.Content.MsgType != event.MsgFile || part.Content.URL != intent.url || part.Content.FileName == "" {
-		t.Fatalf("oversized user backfill should become a file attachment: %#v", part.Content)
+	if part.Content.MsgType != event.MsgText {
+		t.Fatalf("oversized user backfill should remain a text carrier, got %#v", part.Content)
 	}
-	if intent.roomID != portal.MXID || intent.mimeType != "text/plain" || len(intent.data) <= backfillTextEventBudgetBytes {
+	if intent.roomID != portal.MXID || intent.mimeType != aistream.FinalPartsMediaType || len(intent.data) <= backfillTextEventBudgetBytes {
 		t.Fatalf("backfill upload used wrong media data: room=%q mime=%q bytes=%d", intent.roomID, intent.mimeType, len(intent.data))
 	}
-	if part.Content.Info == nil || part.Content.Info.Size != len(intent.data) {
-		t.Fatalf("backfill attachment missing file size: %#v", part.Content.Info)
+	ai, ok := part.Extra[aistream.BeeperAIKey].(aistream.BeeperAI)
+	if !ok {
+		t.Fatalf("oversized user backfill missing Beeper AI payload: %#v", part.Extra)
+	}
+	if ai.Kind != aistream.AIKindFinal || ai.Message == nil || len(ai.Message.Parts) != 0 {
+		t.Fatalf("oversized user backfill should advertise uploaded parts only: %#v", ai)
+	}
+	if ai.Message.Role != agui.RoleUser {
+		t.Fatalf("oversized user backfill should preserve user role: %#v", ai.Message)
+	}
+	if ai.Final == nil || ai.Final.Delivery != "attachment" || ai.Final.PartsComplete || ai.Final.PartsRef == nil || ai.Final.PartsRef.URL != string(intent.url) {
+		t.Fatalf("oversized user backfill missing uploaded parts ref: %#v", ai.Final)
+	}
+	var payload aistream.FinalPartsPayload
+	if err := json.Unmarshal(intent.data, &payload); err != nil {
+		t.Fatalf("uploaded user backfill payload is not final parts JSON: %v", err)
+	}
+	if payload.Schema != aistream.FinalPartsPayloadSchema || payload.ThreadID != thread.ID || payload.MessageID != string(messages[0].ID) || payload.Message.Role != agui.RoleUser {
+		t.Fatalf("bad uploaded user backfill parts payload: %#v", payload)
+	}
+	if len(payload.Message.Parts) != 1 || payload.Message.Parts[0]["content"] != strings.Repeat("x", backfillTextEventBudgetBytes+1) {
+		t.Fatalf("uploaded user backfill parts lost full content: %#v", payload.Message.Parts)
 	}
 }
 
@@ -745,6 +765,42 @@ func TestPaginateBackfillMessagesBackwardsUsesCursor(t *testing.T) {
 	}
 	if resp.HasMore || resp.Cursor != "" {
 		t.Fatalf("unexpected final page metadata: %#v", resp)
+	}
+}
+
+func TestNewestBackfillEntryWindowUsesNewestEntries(t *testing.T) {
+	entries := []*backfillEntry{
+		{ID: "m1", Timestamp: time.Unix(10, 0)},
+		{ID: "m3", Timestamp: time.Unix(30, 0)},
+		{ID: "m2", Timestamp: time.Unix(20, 0)},
+	}
+	window, overflow := newestBackfillEntryWindow(entries, 2)
+	if !overflow {
+		t.Fatal("expected overflow")
+	}
+	if got := []networkid.MessageID{window[0].ID, window[1].ID}; got[0] != "m2" || got[1] != "m3" {
+		t.Fatalf("unexpected newest window: %#v", got)
+	}
+	if window[1].StreamOrder <= window[0].StreamOrder {
+		t.Fatalf("window stream order was not monotonic: %#v", window)
+	}
+}
+
+func TestBackfillEntryCursorFiltersSameTimestampByID(t *testing.T) {
+	ts := time.Unix(100, 0)
+	cursor := backfillEntryCursorFor(&backfillEntry{ID: "m2", Timestamp: ts})
+	parsed, ok := parseBackfillEntryCursor(cursor)
+	if !ok {
+		t.Fatalf("failed to parse cursor %q", cursor)
+	}
+	if !backfillEntryBeforeCursor(&backfillEntry{ID: "m1", Timestamp: ts}, parsed) {
+		t.Fatal("same-timestamp lower ID should be before cursor")
+	}
+	if backfillEntryBeforeCursor(&backfillEntry{ID: "m2", Timestamp: ts}, parsed) {
+		t.Fatal("cursor entry should not be before itself")
+	}
+	if backfillEntryBeforeCursor(&backfillEntry{ID: "m3", Timestamp: ts}, parsed) {
+		t.Fatal("same-timestamp higher ID should not be before cursor")
 	}
 }
 

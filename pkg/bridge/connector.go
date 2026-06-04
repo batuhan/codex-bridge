@@ -1103,7 +1103,11 @@ func (c *Connector) hasMaterializedNewProjectRoom(ctx context.Context, loginID n
 		return true
 	}
 	for _, portal := range portals {
-		if portal != nil && portal.PortalKey.Receiver == loginID && portal.MXID != "" && strings.HasPrefix(string(portal.ID), newPortalIDPrefix) {
+		if portal == nil || portal.PortalKey.Receiver != loginID || portal.MXID == "" || !strings.HasPrefix(string(portal.ID), newPortalIDPrefix) {
+			continue
+		}
+		meta := portalMetadata(portal.Metadata)
+		if meta.ThreadID == "" && meta.Cwd == "" {
 			return true
 		}
 	}

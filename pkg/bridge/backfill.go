@@ -16,6 +16,7 @@ import (
 
 	agui "github.com/beeper/ai-bridge/pkg/ag-ui"
 	aistream "github.com/beeper/ai-bridge/pkg/ai-stream"
+	aimatrix "github.com/beeper/ai-bridge/pkg/ai-stream/matrix"
 	"github.com/beeper/ai-bridge/pkg/msgconv"
 	"github.com/beeper/codex-bridge/pkg/appserver"
 )
@@ -48,7 +49,7 @@ func (cl *Client) backfillMessagesFromEntries(ctx context.Context, portal *bridg
 		switch entry.Kind {
 		case backfillEntryUser:
 			cl.queueSubagentResyncs(ctx, entry.Thread.ID, entry.Thread.Cwd, subagentRefs(backfillItemData(entry.Item)), seenSubagents)
-			msg, err := cl.backfillUserMessage(ctx, portal, entry.Thread.ID, entry.Turn.ID, entry.Item, entry.Body, entry.Timestamp, entry.StreamOrder)
+			msg, err := cl.backfillUserMessage(ctx, portal, entry.Thread, entry.Turn.ID, entry.Item, entry.Body, entry.Timestamp, entry.StreamOrder)
 			if err != nil {
 				return nil, err
 			}
@@ -312,9 +313,9 @@ func backfillPaginationCursor(start int) networkid.PaginationCursor {
 	return networkid.PaginationCursor(strconv.Itoa(start))
 }
 
-func (cl *Client) backfillUserMessage(ctx context.Context, portal *bridgev2.Portal, threadID, turnID string, item appserver.TurnItem, body string, ts time.Time, streamOrder int64) (*bridgev2.BackfillMessage, error) {
+func (cl *Client) backfillUserMessage(ctx context.Context, portal *bridgev2.Portal, thread appserver.Thread, turnID string, item appserver.TurnItem, body string, ts time.Time, streamOrder int64) (*bridgev2.BackfillMessage, error) {
 	msgID := backfillUserMessageID(turnID, item)
-	content, err := cl.backfillUserMessageContent(ctx, portal, msgID, body)
+	content, extra, err := cl.backfillUserMessageContent(ctx, portal, msgID, thread, body, ts)
 	if err != nil {
 		return nil, err
 	}
@@ -323,7 +324,8 @@ func (cl *Client) backfillUserMessage(ctx context.Context, portal *bridgev2.Port
 			ID:         partID("text"),
 			Type:       event.EventMessage,
 			Content:    content,
-			DBMetadata: backfillUserMetadata(threadID, turnID),
+			Extra:      extra,
+			DBMetadata: backfillUserMetadata(thread.ID, turnID),
 		}}},
 		Sender:      cl.backfillUserSender(),
 		ID:          msgID,
@@ -333,32 +335,54 @@ func (cl *Client) backfillUserMessage(ctx context.Context, portal *bridgev2.Port
 	}, nil
 }
 
-func (cl *Client) backfillUserMessageContent(ctx context.Context, portal *bridgev2.Portal, msgID networkid.MessageID, body string) (*event.MessageEventContent, error) {
+func (cl *Client) backfillUserMessageContent(ctx context.Context, portal *bridgev2.Portal, msgID networkid.MessageID, thread appserver.Thread, body string, ts time.Time) (*event.MessageEventContent, map[string]any, error) {
 	if len([]byte(body)) <= backfillTextEventBudgetBytes {
-		return msgconv.TextContent(body), nil
+		return msgconv.TextContent(body), nil, nil
 	}
 	if portal != nil && portal.MXID != "" {
 		if intent := cl.backfillBotIntent(); intent != nil {
-			filename := string(msgID) + ".txt"
-			url, file, err := intent.UploadMedia(ctx, portal.MXID, []byte(body), filename, "text/plain")
-			if err != nil {
-				return nil, err
-			}
-			content := &event.MessageEventContent{
-				MsgType:  event.MsgFile,
-				Body:     filename,
-				FileName: filename,
-				Info:     &event.FileInfo{MimeType: "text/plain", Size: len([]byte(body))},
-			}
-			if file != nil {
-				content.File = file
-			} else {
-				content.URL = url
-			}
-			return content, nil
+			return backfillUserMessageAIContent(ctx, portal, intent, msgID, thread, body, ts)
 		}
 	}
-	return msgconv.TextContent(utf8PrefixBytes(body, backfillTextEventBudgetBytes-len(backfillOversizedUserMessageNotice)-2) + "\n\n" + backfillOversizedUserMessageNotice), nil
+	return msgconv.TextContent(utf8PrefixBytes(body, backfillTextEventBudgetBytes-len(backfillOversizedUserMessageNotice)-2) + "\n\n" + backfillOversizedUserMessageNotice), nil, nil
+}
+
+func backfillUserMessageAIContent(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, msgID networkid.MessageID, thread appserver.Thread, body string, ts time.Time) (*event.MessageEventContent, map[string]any, error) {
+	messageID := string(msgID)
+	run := aistream.NewRun("user-"+sanitizeID(messageID), thread.ID, backfillRunModel(thread), "codex", "Codex", ts)
+	run.MessageID = messageID
+	run.Status = aistream.Status{State: "complete", FinishReason: agui.FinishReasonStop}
+	message := aistream.UIMessage{
+		ID:        messageID,
+		Role:      agui.RoleUser,
+		CreatedAt: &ts,
+		Parts: []aistream.MessagePart{{
+			"type":      "text",
+			"id":        string(partID("text")),
+			"messageId": messageID,
+			"content":   body,
+			"state":     agui.PartStateDone,
+		}},
+	}
+	partsRef, err := aimatrix.UploadFinalPartsRef(ctx, portal, intent, *run, message)
+	if err != nil {
+		return nil, nil, err
+	}
+	textComplete := false
+	run.Final = aistream.FinalDelivery{
+		Delivery:      "attachment",
+		TextComplete:  &textComplete,
+		PartsComplete: false,
+		PartsRef:      partsRef,
+	}
+	inline := aistream.UIMessage{
+		ID:        messageID,
+		Role:      agui.RoleUser,
+		CreatedAt: &ts,
+		Parts:     []aistream.MessagePart{},
+	}
+	extra := map[string]any{aistream.BeeperAIKey: run.AIWithMessage(aistream.AIKindFinal, inline)}
+	return msgconv.TextContent(aistream.BoundedPreview(body, aistream.PreviewBudgetBytes)), extra, nil
 }
 
 func (cl *Client) backfillUserSender() bridgev2.EventSender {
