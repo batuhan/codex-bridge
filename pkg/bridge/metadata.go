@@ -1,24 +1,25 @@
 package bridge
 
 import (
-	"context"
-	"strings"
-
 	aistream "github.com/beeper/ai-bridge/pkg/ai-stream"
 	"github.com/beeper/ai-bridge/pkg/aiid"
 	"maunium.net/go/mautrix/bridgev2"
-	"maunium.net/go/mautrix/bridgev2/database"
-	"maunium.net/go/mautrix/bridgev2/networkid"
 )
 
 const (
 	codexThreadStateType   = "com.beeper.codex.thread"
 	beeperAIModelStateType = aiid.RoomModelType
+
+	portalKindProject  = "project"
+	portalKindSubagent = "subagent"
 )
 
 type PortalMetadata struct {
 	ThreadID               string `json:"thread_id,omitempty"`
 	Cwd                    string `json:"cwd,omitempty"`
+	Kind                   string `json:"kind,omitempty"`
+	ParentThreadID         string `json:"parent_thread_id,omitempty"`
+	ReadOnly               bool   `json:"read_only,omitempty"`
 	BackfillVersion        int    `json:"backfill_version,omitempty"`
 	NewProjectIntroMessage bool   `json:"new_project_intro_message,omitempty"`
 }
@@ -35,111 +36,126 @@ func (m *MessageMetadata) CopyFrom(other any) {
 	if m == nil || other == nil {
 		return
 	}
-	var src *MessageMetadata
-	switch typed := other.(type) {
-	case *MessageMetadata:
-		src = typed
-	case MessageMetadata:
-		src = &typed
-	default:
+	src, ok := messageMetadata(other)
+	if !ok {
 		return
 	}
-	if src.Role != "" {
-		m.Role = src.Role
+	m.copyScalarFields(src)
+	m.copyApproval(src)
+}
+
+func (m *MessageMetadata) copyApproval(src *MessageMetadata) {
+	if approval := cloneApprovalContext(src.Approval); approval != nil {
+		m.Approval = approval
 	}
-	if src.ThreadID != "" {
-		m.ThreadID = src.ThreadID
+}
+
+func (m *MessageMetadata) copyScalarFields(src *MessageMetadata) {
+	setNonEmptyStringField(&m.Role, src.Role)
+	setNonEmptyStringField(&m.ThreadID, src.ThreadID)
+	setNonEmptyStringField(&m.TurnID, src.TurnID)
+	setNonEmptyStringField(&m.StreamStatus, src.StreamStatus)
+}
+
+func cloneApprovalContext(src *aistream.ApprovalContext) *aistream.ApprovalContext {
+	if src == nil {
+		return nil
 	}
-	if src.TurnID != "" {
-		m.TurnID = src.TurnID
-	}
-	if src.StreamStatus != "" {
-		m.StreamStatus = src.StreamStatus
-	}
-	if src.Approval != nil {
-		approval := *src.Approval
-		m.Approval = &approval
+	approval := *src
+	return &approval
+}
+
+func messageMetadata(meta any) (*MessageMetadata, bool) {
+	switch typed := meta.(type) {
+	case *MessageMetadata:
+		return typed, typed != nil
+	case MessageMetadata:
+		return &typed, true
+	default:
+		return nil, false
 	}
 }
 
 func portalMetadata(meta any) *PortalMetadata {
-	if typed, ok := meta.(*PortalMetadata); ok && typed != nil {
-		return typed
+	typed, _ := meta.(*PortalMetadata)
+	if typed == nil {
+		return &PortalMetadata{}
 	}
-	return &PortalMetadata{}
+	return typed
 }
 
-func codexPortalMetadataUpdater(cwd, threadID string) bridgev2.ExtraUpdater[*bridgev2.Portal] {
-	return func(ctx context.Context, portal *bridgev2.Portal) bool {
-		if portal == nil {
-			return false
-		}
-		meta := portalMetadata(portal.Metadata)
-		changed := false
-		if cwd != "" && meta.Cwd != cwd {
-			meta.Cwd = cwd
-			changed = true
-		}
-		if threadID != "" && meta.ThreadID != threadID {
-			meta.ThreadID = threadID
-			changed = true
-		}
-		if changed {
-			portal.Metadata = meta
-		}
-		return changed
-	}
-}
-
-func normalizeStoredMessageMetadata(msg *database.Message) bool {
-	if msg == nil {
+func (m *PortalMetadata) applyProject(cwd, threadID string) bool {
+	if !m.canApplyProject(cwd, threadID) {
 		return false
 	}
-	meta, ok := msg.Metadata.(*MessageMetadata)
-	if !ok || meta == nil {
-		meta = &MessageMetadata{}
-	}
 	changed := false
-	if meta.Role == "" {
-		switch {
-		case msg.SenderID == codexUserID:
-			meta.Role = "assistant"
-			changed = true
-		case strings.HasPrefix(string(msg.SenderID), "login:"):
-			meta.Role = "user"
-			changed = true
-		}
-	}
-	if meta.Role == "assistant" && meta.TurnID == "" {
-		if turnID := turnIDFromMessageID(msg.ID); turnID != "" {
-			meta.TurnID = turnID
-			changed = true
-		}
-	}
-	if meta.StreamStatus == "" {
-		switch meta.Role {
-		case "assistant":
-			meta.StreamStatus = "complete"
-			changed = true
-		case "user":
-			meta.StreamStatus = "done"
-			changed = true
-		}
-	}
-	if changed {
-		msg.Metadata = meta
-	}
+	m.applyProjectDefaults(&changed)
+	m.applyProjectSession(cwd, threadID, &changed)
 	return changed
 }
 
-func turnIDFromMessageID(messageID networkid.MessageID) string {
-	raw := string(messageID)
-	if strings.HasPrefix(raw, "msg-") {
-		return strings.TrimPrefix(raw, "msg-")
+func (m *PortalMetadata) applyProjectDefaults(changed *bool) {
+	setMetadataField(&m.Kind, portalKindProject, changed)
+	setMetadataField(&m.ReadOnly, false, changed)
+	setMetadataField(&m.ParentThreadID, "", changed)
+}
+
+func (m *PortalMetadata) applyProjectSession(cwd, threadID string, changed *bool) {
+	setNonEmptyMetadataString(&m.Cwd, cwd, changed)
+	setNonEmptyMetadataString(&m.ThreadID, threadID, changed)
+}
+
+func (m *PortalMetadata) canApplyProject(cwd, threadID string) bool {
+	return m != nil && (cwd != "" || threadID != "")
+}
+
+func (m *PortalMetadata) applySubagent(parentThreadID, threadID, cwd string) bool {
+	if !m.canApplySubagent(threadID) {
+		return false
 	}
-	if before, turnID, ok := strings.Cut(raw, ":"); ok && before == "codex" {
-		turnID, _, _ = strings.Cut(turnID, ":")
-		return turnID
+	changed := false
+	m.applySubagentFields(parentThreadID, threadID, cwd, &changed)
+	return changed
+}
+
+func (m *PortalMetadata) applySubagentFields(parentThreadID, threadID, cwd string, changed *bool) {
+	setMetadataField(&m.Kind, portalKindSubagent, changed)
+	setMetadataField(&m.ThreadID, threadID, changed)
+	setMetadataField(&m.ParentThreadID, parentThreadID, changed)
+	setMetadataField(&m.Cwd, cwd, changed)
+	setMetadataField(&m.ReadOnly, true, changed)
+}
+
+func (m *PortalMetadata) canApplySubagent(threadID string) bool {
+	return m != nil && threadID != ""
+}
+
+func setMetadataField[T comparable](field *T, value T, changed *bool) {
+	if *field == value {
+		return
 	}
-	return ""
+	*field = value
+	*changed = true
+}
+
+func setNonEmptyMetadataString(field *string, value string, changed *bool) {
+	if value == "" {
+		return
+	}
+	setMetadataField(field, value, changed)
+}
+
+func setNonEmptyStringField(field *string, value string) {
+	if value == "" {
+		return
+	}
+	*field = value
+}
+
+func isReadOnlyPortal(portal *bridgev2.Portal) bool {
+	if portal == nil {
+		return false
+	}
+	meta := portalMetadata(portal.Metadata)
+	return meta.ReadOnly || meta.Kind == portalKindSubagent
 }

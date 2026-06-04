@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/rs/zerolog"
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
-	"maunium.net/go/mautrix/bridgev2/status"
 	"maunium.net/go/mautrix/id"
 
 	"github.com/beeper/codex-bridge/pkg/appserver"
@@ -16,9 +16,12 @@ import (
 
 const (
 	loginFlowCodex    = "codex"
-	loginStepCodex    = "com.beeper.codex.login"
 	loginStepComplete = "com.beeper.codex.login.complete"
 )
+
+func loginUserID(loginID networkid.UserLoginID) networkid.UserID {
+	return networkid.UserID("login:" + string(loginID))
+}
 
 func (c *Connector) GetLoginFlows() []bridgev2.LoginFlow {
 	return []bridgev2.LoginFlow{{
@@ -84,11 +87,11 @@ func (c *Connector) seedConfiguredLogins(ctx context.Context) {
 		return
 	}
 	for rawUserID, permissions := range c.Bridge.Config.Permissions {
-		if permissions == nil || !permissions.Login || !strings.HasPrefix(rawUserID, "@") {
+		if permissions == nil || !permissions.Login {
 			continue
 		}
-		userID := id.UserID(rawUserID)
-		if _, _, err = userID.Parse(); err != nil {
+		userID, ok := configuredLoginUserID(rawUserID)
+		if !ok {
 			continue
 		}
 		user, err := c.Bridge.GetUserByMXID(ctx, userID)
@@ -99,72 +102,80 @@ func (c *Connector) seedConfiguredLogins(ctx context.Context) {
 	}
 }
 
+func configuredLoginUserID(raw string) (id.UserID, bool) {
+	if !isConfiguredLoginUserID(raw) {
+		return "", false
+	}
+	userID := id.UserID(raw)
+	_, _, err := userID.Parse()
+	return userID, err == nil
+}
+
+func isConfiguredLoginUserID(raw string) bool {
+	return strings.HasPrefix(raw, "@")
+}
+
 func (c *Connector) ensureLogin(ctx context.Context, user *bridgev2.User, displayName string) (*bridgev2.UserLogin, error) {
 	if c == nil || c.Bridge == nil || user == nil {
 		return nil, fmt.Errorf("Codex login requires a bridge and user")
 	}
-	var primary *bridgev2.UserLogin
-	for _, loginID := range c.loginIDsForUser(user.MXID) {
-		login, err := c.ensureLoginID(ctx, user, loginID, displayName)
-		if err != nil {
-			return nil, err
-		}
-		if primary == nil {
-			primary = login
-		}
-	}
-	return primary, nil
+	return c.ensureLoginID(ctx, user, c.loginIDForUser(), displayName)
 }
 
 func (c *Connector) ensureLoginID(ctx context.Context, user *bridgev2.User, loginID networkid.UserLoginID, displayName string) (*bridgev2.UserLogin, error) {
 	if cached := c.Bridge.GetCachedUserLoginByID(loginID); cached != nil {
-		if cached.UserMXID != user.MXID {
-			return nil, fmt.Errorf("Codex login %s belongs to %s", loginID, cached.UserMXID)
-		}
-		cached.RemoteName = displayName
-		cached.RemoteProfile.Name = displayName
-		if err := cached.Save(ctx); err != nil {
-			return nil, err
-		}
-		if cached.Client != nil {
-			cached.Client.Connect(ctx)
-		}
-		c.syncLoginGhost(ctx, loginID)
-		return cached, nil
+		return c.refreshCachedLogin(ctx, user, cached, loginID, displayName)
 	}
-	login, err := user.NewLogin(ctx, &database.UserLogin{
-		ID:         loginID,
-		RemoteName: displayName,
-		RemoteProfile: status.RemoteProfile{
-			Name: displayName,
-		},
-	}, &bridgev2.NewLoginParams{})
+	login, err := user.NewLogin(ctx, codexUserLoginRecord(loginID, displayName), &bridgev2.NewLoginParams{})
 	if err != nil {
 		return nil, err
 	}
+	return c.finishLogin(ctx, login, loginID), nil
+}
+
+func (c *Connector) refreshCachedLogin(ctx context.Context, user *bridgev2.User, login *bridgev2.UserLogin, loginID networkid.UserLoginID, displayName string) (*bridgev2.UserLogin, error) {
+	if login.UserMXID != user.MXID {
+		return nil, fmt.Errorf("Codex login %s belongs to %s", loginID, login.UserMXID)
+	}
+	updateLoginRemoteProfile(login, displayName, loginID)
+	if err := login.Save(ctx); err != nil {
+		return nil, err
+	}
+	return c.finishLogin(ctx, login, loginID), nil
+}
+
+func codexUserLoginRecord(loginID networkid.UserLoginID, displayName string) *database.UserLogin {
+	remoteProfile := loginRemoteProfile(displayName, loginID)
+	return &database.UserLogin{
+		ID:            loginID,
+		RemoteName:    remoteProfile.Name,
+		RemoteProfile: remoteProfile,
+	}
+}
+
+func updateLoginRemoteProfile(login *bridgev2.UserLogin, displayName string, loginID networkid.UserLoginID) {
+	remoteProfile := loginRemoteProfile(displayName, loginID)
+	login.RemoteName = remoteProfile.Name
+	login.RemoteProfile = remoteProfile
+}
+
+func (c *Connector) finishLogin(ctx context.Context, login *bridgev2.UserLogin, loginID networkid.UserLoginID) *bridgev2.UserLogin {
 	if login.Client != nil {
 		login.Client.Connect(ctx)
 	}
 	c.syncLoginGhost(ctx, loginID)
-	return login, nil
+	return login
 }
 
 func (c *Connector) syncLoginGhost(ctx context.Context, loginID networkid.UserLoginID) {
 	if c == nil || c.Bridge == nil || loginID == "" {
 		return
 	}
-	userID := networkid.UserID("login:" + string(loginID))
+	userID := loginUserID(loginID)
 	ghost, err := c.Bridge.GetGhostByID(ctx, userID)
 	if err != nil {
-		logFromContext(ctx).Warn().Err(err).Str("user_id", string(userID)).Msg("Failed to load Codex login ghost")
+		zerolog.Ctx(ctx).Warn().Err(err).Str("user_id", string(userID)).Msg("Failed to load Codex login ghost")
 		return
 	}
 	ghost.UpdateInfo(ctx, loginUserInfo())
-}
-
-func (c *Connector) defaultLoginIDForUser(user *bridgev2.User) networkid.UserLoginID {
-	if user == nil {
-		return defaultLoginID
-	}
-	return c.loginIDForUser(user.MXID)
 }

@@ -42,6 +42,110 @@ func TestTurnTextInput(t *testing.T) {
 	}
 }
 
+func TestThreadRollbackParams(t *testing.T) {
+	got := threadRollbackParams("thread-1", 2)
+	want := map[string]any{"threadId": "thread-1", "numTurns": 2}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected rollback params:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestThreadReadParams(t *testing.T) {
+	got := threadReadParams("thread-1", true)
+	want := map[string]any{"threadId": "thread-1", "includeTurns": true}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected thread read params:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestThreadIDParams(t *testing.T) {
+	got := threadIDParams("thread-1")
+	got["turnId"] = "turn-1"
+	want := map[string]any{"threadId": "thread-1", "turnId": "turn-1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected thread ID params:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestThreadOpenParams(t *testing.T) {
+	start := threadStartParams("/tmp/project")
+	wantStart := map[string]any{
+		"cwd":            "/tmp/project",
+		"approvalPolicy": codexApprovalPolicyOnRequest,
+		"threadSource":   "user",
+	}
+	if !reflect.DeepEqual(start, wantStart) {
+		t.Fatalf("unexpected thread start params:\n got: %#v\nwant: %#v", start, wantStart)
+	}
+
+	resume := threadResumeParams("thread-1")
+	wantResume := map[string]any{
+		"threadId":       "thread-1",
+		"approvalPolicy": codexApprovalPolicyOnRequest,
+		"excludeTurns":   true,
+	}
+	if !reflect.DeepEqual(resume, wantResume) {
+		t.Fatalf("unexpected thread resume params:\n got: %#v\nwant: %#v", resume, wantResume)
+	}
+}
+
+func TestRequestLimitParams(t *testing.T) {
+	got := requestLimitParams(100, "next")
+	want := map[string]any{"limit": 100, "cursor": "next"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected limit params:\n got: %#v\nwant: %#v", got, want)
+	}
+
+	got = requestLimitParams(100, "")
+	want = map[string]any{"limit": 100}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected limit params without cursor:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestThreadListParams(t *testing.T) {
+	got := threadListParams("next", 20)
+	want := map[string]any{
+		"limit":         20,
+		"cursor":        "next",
+		"sortKey":       threadListSortKey,
+		"sortDirection": sortDirectionDescending,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected thread list params:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestThreadTurnsListParams(t *testing.T) {
+	got := threadTurnsListParams("thread-1", "next")
+	want := map[string]any{
+		"limit":         threadTurnsListLimit,
+		"cursor":        "next",
+		"threadId":      "thread-1",
+		"sortDirection": sortDirectionAscending,
+		"itemsView":     threadTurnsItemsView,
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected thread turns list params:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestModelListParams(t *testing.T) {
+	got := modelListParams("next")
+	want := map[string]any{"limit": modelListLimit, "cursor": "next", "includeHidden": true}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected model list params:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestCodexClientTurnRequestStateOmitsEmptyOptionalFields(t *testing.T) {
+	got := codexClientTurnRequestState("thread-1", "", "turn-1", "")
+	want := map[string]any{"threadId": "thread-1", "expectedTurnId": "turn-1"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected client turn request state:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
 func TestCleanProjectDirExpandsHome(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -69,9 +173,9 @@ func TestCreateChatWithGhostMapsProjectGhosts(t *testing.T) {
 	}
 }
 
-func TestCreateChatWithGhostMapsNewProjectGhost(t *testing.T) {
+func TestCreateChatWithGhostMapsCodexGhostToNewProjectChat(t *testing.T) {
 	client := &Client{UserLogin: testUserLogin("login-1")}
-	resp, err := client.CreateChatWithGhost(context.Background(), testGhost(newProjectUserID))
+	resp, err := client.CreateChatWithGhost(context.Background(), testGhost(codexUserID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -84,7 +188,7 @@ func TestCreateChatWithGhostMapsNewProjectGhost(t *testing.T) {
 	if resp.PortalInfo == nil || resp.PortalInfo.Topic == nil || *resp.PortalInfo.Topic != newProjectPrompt {
 		t.Fatalf("new project chat should ask for a directory in topic: %#v", resp.PortalInfo)
 	}
-	second, err := client.CreateChatWithGhost(context.Background(), testGhost(newProjectUserID))
+	second, err := client.CreateChatWithGhost(context.Background(), testGhost(codexUserID))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,6 +201,39 @@ func TestCreateChatWithGhostRejectsUnknownGhost(t *testing.T) {
 	client := &Client{UserLogin: testUserLogin(defaultLoginID)}
 	if _, err := client.CreateChatWithGhost(context.Background(), testGhost("other")); err == nil {
 		t.Fatal("expected unknown ghost error")
+	}
+}
+
+func TestProjectIDRoundTripsTrimmedCWD(t *testing.T) {
+	projectID := projectID(" /tmp/project ")
+	cwd, ok := parseProjectID(projectID)
+	if !ok || cwd != "/tmp/project" {
+		t.Fatalf("project ID did not round trip: cwd=%q ok=%v id=%q", cwd, ok, projectID)
+	}
+}
+
+func TestProjectIDPayload(t *testing.T) {
+	id := projectID("/tmp/project")
+	payload, ok := projectIDPayload(id)
+	if !ok || payload == "" {
+		t.Fatalf("project ID payload was not extracted: payload=%q ok=%v", payload, ok)
+	}
+	if _, ok := projectIDPayload("subagent:thread-1"); ok {
+		t.Fatal("non-project ID should not expose a project payload")
+	}
+	if _, ok := projectIDPayload(projectIDPrefix); ok {
+		t.Fatal("empty project ID payload should be rejected")
+	}
+}
+
+func TestRawURLDecoded(t *testing.T) {
+	encoded := rawURLEncoded([]byte("/tmp/project"))
+	decoded, err := rawURLDecoded(encoded)
+	if err != nil || string(decoded) != "/tmp/project" {
+		t.Fatalf("unexpected raw URL decode: decoded=%q err=%v", decoded, err)
+	}
+	if _, err := rawURLDecoded("***"); err == nil {
+		t.Fatal("invalid raw URL payload should fail")
 	}
 }
 
@@ -158,7 +295,7 @@ func TestHandleMatrixRoomStateUpdatesAIModelCache(t *testing.T) {
 	connector.Init(&bridgev2.Bridge{})
 	login := testUserLogin("sh-codex")
 	client := &Client{Main: connector, UserLogin: login}
-	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project", "openai", "gpt-5", "low")
+	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-5", "reasoningEffort": "low"})
 	run := newActiveRun(client, key, "thread-1", "turn-1")
 	connector.setActive("thread-1", run)
 	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: key}}
@@ -237,7 +374,7 @@ func TestHandleMatrixRoomStateIgnoresBridgeOwnedCodexThreadMetadata(t *testing.T
 		PortalKey: key,
 		Metadata:  &PortalMetadata{ThreadID: "old-thread", Cwd: "/old/project"},
 	}}
-	connector.rememberThreadRoom("old-thread", &Client{Main: connector, UserLogin: login}, key, "/old/project", "openai", "gpt-4.1", "low")
+	connector.rememberThreadRoom("old-thread", &Client{Main: connector, UserLogin: login}, key, "/old/project", map[string]any{"modelProvider": "openai", "model": "gpt-4.1", "reasoningEffort": "low"})
 
 	ok, err := (&Client{Main: connector, UserLogin: login}).HandleMatrixRoomState(context.Background(), &bridgev2.MatrixRoomState{
 		MatrixEventBase: bridgev2.MatrixEventBase[map[string]any]{
@@ -583,7 +720,7 @@ func TestNewProjectChatInfoQueuesIntroOnRoomCreate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	info := client.newProjectChatInfo("New Project")
+	info := client.newProjectChatInfo()
 	if info.ExtraUpdates == nil || !info.ExtraUpdates(ctx, portal) {
 		t.Fatal("expected new project room creation to queue the intro message")
 	}
@@ -661,7 +798,7 @@ func TestGetChatInfoClearsMissingThreadMetadataAndState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	connector.rememberThreadRoom("missing-thread", client, key, "/tmp/project", "openai", "gpt-5")
+	connector.rememberThreadRoom("missing-thread", client, key, "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-5"})
 
 	info, err := client.GetChatInfo(ctx, portal)
 	if err != nil {
@@ -750,7 +887,7 @@ func TestRoomModelReadsBeeperAIModelState(t *testing.T) {
 	}}}
 	client := &Client{Main: &Connector{Bridge: &bridgev2.Bridge{Matrix: matrix}}}
 	portal := &bridgev2.Portal{Portal: &database.Portal{MXID: "!room:example.com"}}
-	if got := client.roomModel(context.Background(), portal); got != "openai/gpt-5" {
+	if got := firstString(client.roomAIModelState(context.Background(), portal), "model"); got != "openai/gpt-5" {
 		t.Fatalf("unexpected room model: %q", got)
 	}
 	if matrix.roomID != portal.MXID || matrix.stateType.Type != beeperAIModelStateType || matrix.stateKey != "" {
@@ -762,10 +899,10 @@ func TestRoomModelUsesCachedThreadStateBeforeRoomStateRoundtrip(t *testing.T) {
 	connector := &Connector{threadRooms: map[string]threadRoom{}}
 	client := &Client{Main: connector, UserLogin: testUserLogin("sh-codex")}
 	key := projectPortalKey("/tmp/project", "sh-codex")
-	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project", "openai", "gpt-5", "high", "GPT-5", "adaptive")
+	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-5", "reasoningEffort": "high", "modelName": "GPT-5", "reasoningMode": "adaptive"})
 
 	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: key}}
-	if got := client.roomModel(context.Background(), portal); got != "openai/gpt-5" {
+	if got := firstString(client.roomAIModelState(context.Background(), portal), "model"); got != "openai/gpt-5" {
 		t.Fatalf("unexpected cached room model: %q", got)
 	}
 	state := client.roomAIModelStateForPortalKey(context.Background(), key)
@@ -781,7 +918,7 @@ func TestRoomModelStateOverridesCachedThreadState(t *testing.T) {
 	connector := &Connector{Bridge: &bridgev2.Bridge{Matrix: matrix}, threadRooms: map[string]threadRoom{}}
 	client := &Client{Main: connector, UserLogin: testUserLogin("sh-codex")}
 	key := projectPortalKey("/tmp/project", "sh-codex")
-	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project", "openai", "gpt-5")
+	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-5"})
 
 	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: key, MXID: "!room:example.com"}}
 	state := client.roomAIModelState(context.Background(), portal)
@@ -799,7 +936,7 @@ func TestRoomModelReadsParsedBeeperAIModelState(t *testing.T) {
 		}}},
 	}}}}
 	portal := &bridgev2.Portal{Portal: &database.Portal{MXID: "!room:example.com"}}
-	if got := client.roomModel(context.Background(), portal); got != "anthropic/claude-sonnet-4.5" {
+	if got := firstString(client.roomAIModelState(context.Background(), portal), "model"); got != "anthropic/claude-sonnet-4.5" {
 		t.Fatalf("unexpected parsed room model: %q", got)
 	}
 	state := client.roomAIModelState(context.Background(), portal)
@@ -811,7 +948,7 @@ func TestRoomModelReadsParsedBeeperAIModelState(t *testing.T) {
 func TestRoomModelIgnoresMissingState(t *testing.T) {
 	client := &Client{Main: &Connector{Bridge: &bridgev2.Bridge{Matrix: &fakeArbitraryRoomState{err: mautrix.MNotFound}}}}
 	portal := &bridgev2.Portal{Portal: &database.Portal{MXID: "!room:example.com"}}
-	if got := client.roomModel(context.Background(), portal); got != "" {
+	if got := firstString(client.roomAIModelState(context.Background(), portal), "model"); got != "" {
 		t.Fatalf("missing model state should be ignored, got %q", got)
 	}
 }
@@ -840,6 +977,32 @@ func TestCodexRequestModelStripsOpenAIProviderPrefix(t *testing.T) {
 	}
 	if got := codexRequestModel("anthropic/claude-sonnet-4.5"); got != "anthropic/claude-sonnet-4.5" {
 		t.Fatalf("non-OpenAI model should be preserved: %q", got)
+	}
+}
+
+func TestRequestModelCandidatePrefersRoomModel(t *testing.T) {
+	roomModel, model, fromRoomState := requestModelCandidate(map[string]any{"provider": "openai", "model": "gpt-5"}, "openai/gpt-4")
+	if roomModel != "openai/gpt-5" || model != "gpt-5" || !fromRoomState {
+		t.Fatalf("unexpected room model candidate: room=%q model=%q fromRoom=%v", roomModel, model, fromRoomState)
+	}
+
+	roomModel, model, fromRoomState = requestModelCandidate(nil, "openai/gpt-4")
+	if roomModel != "" || model != "gpt-4" || fromRoomState {
+		t.Fatalf("unexpected default model candidate: room=%q model=%q fromRoom=%v", roomModel, model, fromRoomState)
+	}
+}
+
+func TestAdvanceCursorStopsOnEmptyAndRepeatedCursor(t *testing.T) {
+	seen := map[string]bool{}
+	cursor := "start"
+	if !advanceCursor(seen, &cursor, "next") || cursor != "next" {
+		t.Fatalf("cursor did not advance: cursor=%q seen=%#v", cursor, seen)
+	}
+	if advanceCursor(seen, &cursor, "next") {
+		t.Fatalf("repeated cursor should stop pagination: cursor=%q seen=%#v", cursor, seen)
+	}
+	if advanceCursor(seen, &cursor, "") {
+		t.Fatalf("empty cursor should stop pagination: cursor=%q seen=%#v", cursor, seen)
 	}
 }
 
@@ -884,14 +1047,14 @@ func TestValidatedRoomTurnSettingsUsesProviderQualifiedRoomModel(t *testing.T) {
 	}
 }
 
-func TestContactsIncludeCodexAndNewProject(t *testing.T) {
+func TestContactsIncludeOneCodexGhost(t *testing.T) {
 	client := &Client{UserLogin: testUserLogin("sh-codex")}
 	contacts := client.contactsForThreads(context.Background(), nil)
 	got := make([]networkid.UserID, 0, len(contacts))
 	for _, contact := range contacts {
 		got = append(got, contact.UserID)
 	}
-	want := []networkid.UserID{codexUserID, newProjectUserID}
+	want := []networkid.UserID{codexUserID}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected contacts:\n got: %#v\nwant: %#v", got, want)
 	}
@@ -902,9 +1065,6 @@ func TestContactsIncludeCodexAndNewProject(t *testing.T) {
 	}
 	if contacts[0].UserInfo == nil || contacts[0].UserInfo.IsBot == nil || *contacts[0].UserInfo.IsBot {
 		t.Fatalf("Codex contact should not be marked as a network bot: %#v", contacts[0].UserInfo)
-	}
-	if contacts[1].UserInfo == nil || contacts[1].UserInfo.IsBot == nil || *contacts[1].UserInfo.IsBot {
-		t.Fatalf("New Project contact should not be marked as a network bot: %#v", contacts[1].UserInfo)
 	}
 }
 
@@ -917,7 +1077,7 @@ func TestContactsUseConcreteGhostsWhenBridgeIsAvailable(t *testing.T) {
 	contacts := client.contactsForThreads(context.Background(), []appserver.Thread{
 		{ID: "thread-1", Cwd: "/tmp/project", UpdatedAt: 20},
 	})
-	if len(contacts) != 3 {
+	if len(contacts) != 2 {
 		t.Fatalf("unexpected contacts: %#v", contacts)
 	}
 	for _, contact := range contacts {
@@ -931,26 +1091,26 @@ func TestContactsUseConcreteGhostsWhenBridgeIsAvailable(t *testing.T) {
 			t.Fatalf("contact list should not eagerly sync ghost profile info: %#v", contact.Ghost.Ghost)
 		}
 	}
-	if contacts[0].Ghost.ID != codexUserID || contacts[1].Ghost.ID != newProjectUserID {
-		t.Fatalf("unexpected base contact ghosts: %#v %#v", contacts[0].Ghost.ID, contacts[1].Ghost.ID)
+	if contacts[0].Ghost.ID != codexUserID {
+		t.Fatalf("unexpected base contact ghost: %#v", contacts[0].Ghost.ID)
 	}
-	if contacts[2].Ghost.ID != projectUserID("/tmp/project") {
-		t.Fatalf("unexpected project contact ghost: %#v", contacts[2].Ghost.ID)
+	if contacts[1].Ghost.ID != projectUserID("/tmp/project") {
+		t.Fatalf("unexpected project contact ghost: %#v", contacts[1].Ghost.ID)
 	}
 
 	listed, err := provisionutil.GetContactList(context.Background(), login)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(listed.Contacts) < 2 || listed.Contacts[0].MXID == "" || listed.Contacts[1].MXID == "" {
-		t.Fatalf("provisioned base contacts should include ghost MXIDs: %#v", listed.Contacts)
+	if len(listed.Contacts) < 1 || listed.Contacts[0].MXID == "" {
+		t.Fatalf("provisioned base contact should include ghost MXID: %#v", listed.Contacts)
 	}
-	searched, err := provisionutil.SearchUsers(context.Background(), login, "new project")
+	searched, err := provisionutil.SearchUsers(context.Background(), login, "codex")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(searched.Results) != 1 || searched.Results[0].ID != newProjectUserID || searched.Results[0].MXID == "" {
-		t.Fatalf("provisioned search should find New Project ghost: %#v", searched.Results)
+	if len(searched.Results) != 1 || searched.Results[0].ID != codexUserID || searched.Results[0].MXID == "" {
+		t.Fatalf("provisioned search should find Codex ghost: %#v", searched.Results)
 	}
 	projectDir := t.TempDir()
 	resolved, err := provisionutil.ResolveIdentifier(context.Background(), login, projectDir, false)
@@ -964,17 +1124,15 @@ func TestContactsUseConcreteGhostsWhenBridgeIsAvailable(t *testing.T) {
 
 func TestSearchUsersFindsBaseContactsWithoutAllocatingChats(t *testing.T) {
 	client := &Client{UserLogin: testUserLogin("sh-codex")}
-	for _, query := range []string{"codex", "new project"} {
-		results, err := client.SearchUsers(context.Background(), query)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if len(results) != 1 {
-			t.Fatalf("expected one result for %q, got %#v", query, results)
-		}
-		if results[0].Chat != nil {
-			t.Fatalf("base search result %q should not allocate random chat portals: %#v", query, results[0].Chat)
-		}
+	results, err := client.SearchUsers(context.Background(), "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected one result, got %#v", results)
+	}
+	if results[0].Chat != nil {
+		t.Fatalf("base search result should not allocate random chat portals: %#v", results[0].Chat)
 	}
 }
 
@@ -982,16 +1140,16 @@ func TestGetContactListFallsBackToCachedThreadRooms(t *testing.T) {
 	connector := &Connector{threadRooms: map[string]threadRoom{}}
 	login := testUserLogin("sh-codex")
 	client := &Client{Main: connector, UserLogin: login}
-	connector.rememberThreadRoom("thread-1", client, projectPortalKey("/tmp/project", "sh-codex"), "/tmp/project", "openai", "gpt-5", "high", "GPT-5")
+	connector.rememberThreadRoom("thread-1", client, projectPortalKey("/tmp/project", "sh-codex"), "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-5", "reasoningEffort": "high", "modelName": "GPT-5"})
 
 	contacts, err := client.GetContactList(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(contacts) != 3 {
-		t.Fatalf("cached contact fallback should include base contacts and project, got %#v", contacts)
+	if len(contacts) != 2 {
+		t.Fatalf("cached contact fallback should include base contact and project, got %#v", contacts)
 	}
-	project := contacts[2]
+	project := contacts[1]
 	if project.UserID != projectUserID("/tmp/project") {
 		t.Fatalf("unexpected cached project contact: %#v", project)
 	}
@@ -1004,6 +1162,22 @@ func TestGetContactListFallsBackToCachedThreadRooms(t *testing.T) {
 	}
 	if room.modelProvider != "openai" || room.model != "openai/gpt-5" || room.reasoningEffort != "high" || room.modelName != "GPT-5" {
 		t.Fatalf("cached contact fallback lost model state: %#v", room)
+	}
+}
+
+func TestContactsIgnoreDetachedThreads(t *testing.T) {
+	client := &Client{}
+	contacts := client.contactsForThreads(context.Background(), []appserver.Thread{
+		{ID: "active-thread", Cwd: "/tmp/project", UpdatedAt: 10},
+		{ID: "archived-thread", Cwd: "/tmp/project", UpdatedAt: 20, Raw: map[string]any{"archived": true}},
+		{ID: "closed-thread", Cwd: "/tmp/closed", UpdatedAt: 30, Raw: map[string]any{"closed": true}},
+	})
+	if len(contacts) != 2 {
+		t.Fatalf("expected base contact plus one active project, got %#v", contacts)
+	}
+	project := contacts[1]
+	if project.UserID != projectUserID("/tmp/project") || !identifiersContain(project.UserInfo, "active-thread") || identifiersContain(project.UserInfo, "archived-thread") {
+		t.Fatalf("contacts should use the active project thread only: %#v", project)
 	}
 }
 
@@ -1212,13 +1386,13 @@ func TestContactsIncludeRecentDirectoriesWithLatestThread(t *testing.T) {
 		{ID: "old-thread", Cwd: "/tmp/project", UpdatedAt: 10},
 		{ID: "new-thread", Cwd: "/tmp/project", UpdatedAt: 20},
 	})
-	if len(contacts) != 3 {
+	if len(contacts) != 2 {
 		t.Fatalf("unexpected contacts: %#v", contacts)
 	}
-	if contacts[0].Chat != nil || contacts[1].Chat != nil {
-		t.Fatalf("base contacts should not include random chats: %#v", contacts[:2])
+	if contacts[0].Chat != nil {
+		t.Fatalf("base contact should not include random chats: %#v", contacts[0])
 	}
-	project := contacts[2]
+	project := contacts[1]
 	if project.UserID != projectUserID("/tmp/project") {
 		t.Fatalf("unexpected project contact: %#v", project)
 	}
@@ -1231,7 +1405,7 @@ func TestContactsIncludeRecentDirectoriesWithLatestThread(t *testing.T) {
 	if project.Chat != nil {
 		t.Fatalf("project contact should not allocate a chat before opening it: %#v", project.Chat)
 	}
-	chat := client.chatForProject(context.Background(), "/tmp/project", "/tmp/project", "new-thread", nil)
+	chat := client.chatForProject(context.Background(), "/tmp/project", "new-thread", nil)
 	if chat == nil || chat.PortalKey != projectPortalKey("/tmp/project", "sh-codex") {
 		t.Fatalf("project chat has unexpected key: %#v", chat)
 	}
@@ -1256,10 +1430,10 @@ func TestRecentDirectoryContactsAreSearchable(t *testing.T) {
 	contacts := client.contactsForThreads(context.Background(), []appserver.Thread{
 		{ID: "thread-1", Cwd: "/tmp/codex-bridge", Name: "Fix streaming", UpdatedAt: 20},
 	})
-	if len(contacts) != 3 {
+	if len(contacts) != 2 {
 		t.Fatalf("unexpected contacts: %#v", contacts)
 	}
-	project := contacts[2]
+	project := contacts[1]
 	for _, query := range []string{"codex-bridge", "/tmp/codex-bridge", "thread-1", "fix streaming"} {
 		name := ""
 		if project.UserInfo != nil && project.UserInfo.Name != nil {
@@ -1269,6 +1443,27 @@ func TestRecentDirectoryContactsAreSearchable(t *testing.T) {
 		if !strings.Contains(name, query) && !strings.Contains(strings.ToLower(string(project.UserID)), query) && !identifiersContain(project.UserInfo, query) {
 			t.Fatalf("project contact should match query %q: %#v", query, project.UserInfo)
 		}
+	}
+}
+
+func TestUniqueIdentifiersTrimsAndDeduplicatesCaseInsensitive(t *testing.T) {
+	got := uniqueIdentifiers(" Codex ", "codex", "", "Thread-1", "thread-1", "/tmp/project")
+	want := []string{"Codex", "Thread-1", "/tmp/project"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("got %#v want %#v", got, want)
+	}
+}
+
+func TestSortedRecentDirectoriesKeepsNewestAttachedThreadPerDirectory(t *testing.T) {
+	threads := sortedRecentDirectories([]appserver.Thread{
+		{ID: "old-project", Cwd: "/tmp/project", UpdatedAt: 10},
+		{ID: "new-project", Cwd: "/tmp/project", UpdatedAt: 30},
+		{ID: "archived-project", Cwd: "/tmp/archive", UpdatedAt: 40, Raw: map[string]any{"archived": true}},
+		{ID: "other-project", Cwd: "/tmp/other", UpdatedAt: 20},
+		{ID: "missing-cwd", UpdatedAt: 50},
+	})
+	if len(threads) != 2 || threads[0].ID != "new-project" || threads[1].ID != "other-project" {
+		t.Fatalf("unexpected recent directories: %#v", threads)
 	}
 }
 
@@ -1309,7 +1504,7 @@ func TestSyncContactGhostsCreatesBaseAndRecentDirectoryGhosts(t *testing.T) {
 		{ID: "new-thread", Cwd: "/tmp/project", Name: "Build bridge", Preview: strings.Repeat("preview ", 100), UpdatedAt: 20},
 	})
 
-	for _, userID := range []networkid.UserID{codexUserID, newProjectUserID, projectUserID("/tmp/project")} {
+	for _, userID := range []networkid.UserID{codexUserID, projectUserID("/tmp/project")} {
 		ghost, err := br.GetExistingGhostByID(ctx, userID)
 		if err != nil {
 			t.Fatal(err)
@@ -1352,7 +1547,7 @@ func TestSyncRecentContactGhostsFallsBackToCachedThreadRooms(t *testing.T) {
 	login := &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "sh-codex"}, Bridge: br}
 	client := &Client{Main: connector, UserLogin: login}
 	login.Client = client
-	connector.rememberThreadRoom("thread-1", client, projectPortalKey("/tmp/project", login.ID), "/tmp/project")
+	connector.rememberThreadRoom("thread-1", client, projectPortalKey("/tmp/project", login.ID), "/tmp/project", nil)
 
 	connector.syncRecentContactGhosts(ctx)
 
@@ -1406,15 +1601,15 @@ func TestRecentDirectoryContactUsesCanonicalProjectRoom(t *testing.T) {
 	connector := &Connector{threadRooms: map[string]threadRoom{}}
 	client := &Client{Main: connector, UserLogin: testUserLogin("sh-codex")}
 	newProjectKey := projectPortalKey("", "sh-codex")
-	connector.rememberThreadRoom("thread-1", client, newProjectKey, "/tmp/project")
+	connector.rememberThreadRoom("thread-1", client, newProjectKey, "/tmp/project", nil)
 
 	contacts := client.contactsForThreads(context.Background(), []appserver.Thread{
 		{ID: "thread-1", Cwd: "/tmp/project", UpdatedAt: 20},
 	})
-	if len(contacts) != 3 {
+	if len(contacts) != 2 {
 		t.Fatalf("unexpected contacts: %#v", contacts)
 	}
-	project := contacts[2]
+	project := contacts[1]
 	if project.Chat != nil {
 		t.Fatalf("project contact should not expose a starter chat: %#v", project.Chat)
 	}
@@ -1425,7 +1620,7 @@ func TestRecentDirectoryContactUsesCanonicalProjectRoom(t *testing.T) {
 	if room.portalKey != projectPortalKey("/tmp/project", "sh-codex") {
 		t.Fatalf("project contact cached non-canonical room: %#v", room)
 	}
-	chat := client.chatForProject(context.Background(), "/tmp/project", "project", "thread-1", nil)
+	chat := client.chatForProject(context.Background(), "/tmp/project", "thread-1", nil)
 	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: chat.PortalKey}}
 	if !chat.PortalInfo.ExtraUpdates(context.Background(), portal) {
 		t.Fatal("expected portal metadata updater to report a change")
@@ -1446,7 +1641,7 @@ func TestRecentDirectoryContactCachesThreadModel(t *testing.T) {
 		Raw:           map[string]any{"model": "gpt-5", "modelProvider": "openai"},
 		UpdatedAt:     20,
 	}})
-	if len(contacts) != 3 || contacts[2].Chat != nil {
+	if len(contacts) != 2 || contacts[1].Chat != nil {
 		t.Fatalf("unexpected contacts: %#v", contacts)
 	}
 	room, ok := connector.threadRoom("thread-1")
@@ -1463,8 +1658,8 @@ func TestRememberThreadRoomTracksModel(t *testing.T) {
 	client := &Client{Main: connector, UserLogin: testUserLogin("sh-codex")}
 	key := projectPortalKey("/tmp/project", "sh-codex")
 
-	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project", "openai", "gpt-5")
-	connector.rememberThreadRoom("thread-1", client, key, "", "")
+	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-5"})
+	connector.rememberThreadRoom("thread-1", client, key, "", nil)
 
 	room, ok := connector.threadRoom("thread-1")
 	if !ok {
@@ -1475,13 +1670,46 @@ func TestRememberThreadRoomTracksModel(t *testing.T) {
 	}
 }
 
+func TestThreadRoomFillStatePreservesModelAliases(t *testing.T) {
+	room := threadRoom{
+		model:           "openai/gpt-5",
+		modelProvider:   "openai",
+		modelName:       "GPT-5",
+		reasoningEffort: "high",
+		reasoningMode:   "adaptive",
+	}
+
+	state := map[string]any{"cwd": "/tmp/project"}
+	room.fillState(state)
+	if state["model"] != "openai/gpt-5" || state["modelProvider"] != "openai" || state["modelName"] != "GPT-5" || state["reasoningEffort"] != "high" || state["reasoning_mode"] != "adaptive" {
+		t.Fatalf("thread room did not fill missing model fields: %#v", state)
+	}
+
+	aliasState := map[string]any{
+		"toModel":       "anthropic/claude-sonnet-4.5",
+		"provider":      "anthropic",
+		"reasoning":     "medium",
+		"modelName":     "Claude",
+		"reasoningMode": "manual",
+	}
+	room.fillState(aliasState)
+	for _, key := range []string{"model", "modelProvider", "reasoningEffort", "reasoning_mode"} {
+		if _, exists := aliasState[key]; exists {
+			t.Fatalf("thread room overwrote existing alias for %q: %#v", key, aliasState)
+		}
+	}
+	if aliasState["modelName"] != "Claude" {
+		t.Fatalf("thread room overwrote model name: %#v", aliasState)
+	}
+}
+
 func TestRememberThreadRoomKeepsOneThreadPerPortal(t *testing.T) {
 	connector := &Connector{threadRooms: map[string]threadRoom{}}
 	client := &Client{Main: connector, UserLogin: testUserLogin("sh-codex")}
 	key := projectPortalKey("/tmp/project", "sh-codex")
 
-	connector.rememberThreadRoom("old-thread", client, key, "/tmp/project", "openai", "gpt-4")
-	connector.rememberThreadRoom("new-thread", client, key, "/tmp/project", "openai", "gpt-5")
+	connector.rememberThreadRoom("old-thread", client, key, "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-4"})
+	connector.rememberThreadRoom("new-thread", client, key, "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-5"})
 
 	if _, ok := connector.threadRoom("old-thread"); ok {
 		t.Fatal("old thread should not remain mapped to the same portal")
@@ -1573,6 +1801,28 @@ func TestHandleMatrixMessageRejectsUnsupportedPromptContent(t *testing.T) {
 	}
 }
 
+func TestHandleMatrixMessageRejectsReadOnlySubagentPortal(t *testing.T) {
+	connector := &Connector{}
+	connector.Init(nil)
+	client := &Client{Main: connector, UserLogin: testUserLogin("codex")}
+	msg := testMatrixMessage("thread-2", "hello")
+	msg.Portal.Metadata = &PortalMetadata{
+		Kind:           portalKindSubagent,
+		ThreadID:       "thread-2",
+		ParentThreadID: "thread-1",
+		ReadOnly:       true,
+	}
+
+	_, err := client.HandleMatrixMessage(context.Background(), msg)
+	if err == nil {
+		t.Fatal("expected read-only subagent prompt to be rejected")
+	}
+	var status bridgev2.MessageStatus
+	if !errors.As(err, &status) || status.ErrorReason != event.MessageStatusUnsupported {
+		t.Fatalf("expected unsupported message status, got %T: %v", err, err)
+	}
+}
+
 func TestMatrixMessageStatusForCodexErrorIsUserVisible(t *testing.T) {
 	err := &appserver.RPCError{
 		Method: "turn/start",
@@ -1586,6 +1836,76 @@ func TestMatrixMessageStatusForCodexErrorIsUserVisible(t *testing.T) {
 	}
 	if !strings.Contains(status.Message, "gpt-5.5") || status.InternalError != err {
 		t.Fatalf("unsupported Codex error lost user-facing detail: %#v", status)
+	}
+}
+
+func TestMatrixMessageStatusForCodexErrorMapsBridgeUnavailable(t *testing.T) {
+	err := errors.New("Codex app-server is not running")
+
+	status := matrixMessageStatusForCodexError(err)
+	if status.Status != event.MessageStatusFail || status.ErrorReason != event.MessageStatusBridgeUnavailable || status.Message != "Codex bridge is not ready" || !status.IsCertain {
+		t.Fatalf("unexpected bridge unavailable status: %#v", status)
+	}
+}
+
+func TestMatrixMessageStatusForCodexErrorMapsCanceled(t *testing.T) {
+	status := matrixMessageStatusForCodexError(context.Canceled)
+	if status.Status != event.MessageStatusFail || status.ErrorReason != event.MessageStatusBridgeUnavailable || status.Message != "Codex request was cancelled" || !status.IsCertain {
+		t.Fatalf("unexpected canceled status: %#v", status)
+	}
+}
+
+func TestIsCodexCanceledError(t *testing.T) {
+	if !isCodexCanceledError(context.Canceled) {
+		t.Fatal("context cancellation should match")
+	}
+	if isCodexCanceledError(context.DeadlineExceeded) {
+		t.Fatal("deadline exceeded should not match cancellation")
+	}
+}
+
+func TestIsCodexBridgeUnavailableError(t *testing.T) {
+	if !isCodexBridgeUnavailableError("codex app-server is not running") {
+		t.Fatal("expected bridge-unavailable hint to match")
+	}
+	if isCodexBridgeUnavailableError("permission denied") {
+		t.Fatal("permission errors should not match bridge-unavailable hints")
+	}
+}
+
+func TestMatrixMessageStatusForCodexErrorMapsPermission(t *testing.T) {
+	err := errors.New("permission denied while starting Codex")
+
+	status := matrixMessageStatusForCodexError(err)
+	if status.Status != event.MessageStatusFail || status.ErrorReason != event.MessageStatusNoPermission || status.Message != err.Error() || !status.IsCertain {
+		t.Fatalf("unexpected permission status: %#v", status)
+	}
+}
+
+func TestIsCodexPermissionError(t *testing.T) {
+	if !isCodexPermissionError("unauthorized request") {
+		t.Fatal("expected permission hint to match")
+	}
+	if isCodexPermissionError("codex app-server is not running") {
+		t.Fatal("bridge-unavailable errors should not match permission hints")
+	}
+}
+
+func TestIsCodexUnsupportedError(t *testing.T) {
+	if !isCodexUnsupportedError("invalid project directory") {
+		t.Fatal("expected unsupported hint to match")
+	}
+	if isCodexUnsupportedError("permission denied") {
+		t.Fatal("permission errors should not match unsupported hints")
+	}
+}
+
+func TestMatrixMessageStatusForCodexErrorMapsTimeout(t *testing.T) {
+	err := context.DeadlineExceeded
+
+	status := matrixMessageStatusForCodexError(err)
+	if status.Status != event.MessageStatusRetriable || status.ErrorReason != event.MessageStatusNetworkError || status.Message != "Codex request timed out" || !status.SendNotice {
+		t.Fatalf("unexpected timeout status: %#v", status)
 	}
 }
 
@@ -1710,7 +2030,7 @@ func TestHandleMatrixMessageDefersTurnStartUntilMessageSave(t *testing.T) {
 	login.Client = client
 	cwd := t.TempDir()
 	key := projectPortalKey(cwd, login.ID)
-	connector.rememberThreadRoom("thread-1", client, key, cwd)
+	connector.rememberThreadRoom("thread-1", client, key, cwd, nil)
 	connector.rememberWarmThread("thread-1")
 	if err = br.DB.Portal.Insert(ctx, &database.Portal{
 		PortalKey: key,
@@ -1959,8 +2279,14 @@ func TestHandleMatrixEditRollsBackDeletesFollowingMessagesAndStartsReplacementTu
 	if start.Params["clientUserMessageId"] != "$edit-1" || fakeAppServerInputText(start.Params) != "edited prompt" {
 		t.Fatalf("replacement turn/start used wrong edit input: %#v", start.Params)
 	}
-	if got := countRedactions(matrixAPI.messages); got != len(following) {
-		t.Fatalf("expected stale messages to be redacted, got %d events=%#v", got, matrixAPI.messages)
+	redactions := 0
+	for _, sent := range matrixAPI.messages {
+		if sent.Type == event.EventRedaction {
+			redactions++
+		}
+	}
+	if redactions != len(following) {
+		t.Fatalf("expected stale messages to be redacted, got %d events=%#v", redactions, matrixAPI.messages)
 	}
 	for _, msg := range following {
 		got, err := br.DB.Message.GetPartByID(ctx, key.Receiver, msg.ID, msg.PartID)
@@ -2078,8 +2404,14 @@ func TestHandleMatrixEditRejectsWhenCodexRollbackFails(t *testing.T) {
 	if _, ok := findFakeAppServerRequest(requests, "turn/start"); ok {
 		t.Fatalf("rejected edit should not start replacement turn: %#v", requests)
 	}
-	if got := countRedactions(matrixAPI.messages); got != 0 {
-		t.Fatalf("rejected edit should not redact stale messages, got %d events=%#v", got, matrixAPI.messages)
+	redactions := 0
+	for _, sent := range matrixAPI.messages {
+		if sent.Type == event.EventRedaction {
+			redactions++
+		}
+	}
+	if redactions != 0 {
+		t.Fatalf("rejected edit should not redact stale messages, got %d events=%#v", redactions, matrixAPI.messages)
 	}
 	got, err := br.DB.Message.GetPartByID(ctx, key.Receiver, following.ID, following.PartID)
 	if err != nil {
@@ -2103,7 +2435,7 @@ func TestHandleMatrixDeleteChatDetachesWithoutDeletingCodexSession(t *testing.T)
 	key := projectPortalKey("/tmp/project", login.ID)
 	run := newActiveRun(client, key, "thread-1", "turn-1")
 	connector.setActive("thread-1", run)
-	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project")
+	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project", nil)
 	connector.rememberProcess("proc-1", run)
 
 	err := client.HandleMatrixDeleteChat(ctx, &bridgev2.MatrixDeleteChat{
@@ -2259,7 +2591,7 @@ func TestHandleMatrixMessageStartsTurnThroughAppServerTransport(t *testing.T) {
 	login.Client = client
 	cwd := t.TempDir()
 	key := projectPortalKey(cwd, login.ID)
-	connector.rememberThreadRoom("thread-1", client, key, cwd, "openai", "gpt-5.5", "high")
+	connector.rememberThreadRoom("thread-1", client, key, cwd, map[string]any{"modelProvider": "openai", "model": "gpt-5.5", "reasoningEffort": "high"})
 	if err = br.DB.Portal.Insert(ctx, &database.Portal{
 		PortalKey: key,
 		MXID:      "!room:example.com",
@@ -2384,7 +2716,7 @@ func TestHandleMatrixMessageSkipsResumeForWarmThread(t *testing.T) {
 	login.Client = client
 	cwd := t.TempDir()
 	key := projectPortalKey(cwd, login.ID)
-	connector.rememberThreadRoom("thread-1", client, key, cwd)
+	connector.rememberThreadRoom("thread-1", client, key, cwd, nil)
 	connector.rememberWarmThread("thread-1")
 	if err = br.DB.Portal.Insert(ctx, &database.Portal{
 		PortalKey: key,
@@ -2467,7 +2799,7 @@ func TestHandleMatrixMessageDeduplicatesRetryWhileTurnStartInFlight(t *testing.T
 	login.Client = client
 	cwd := t.TempDir()
 	key := projectPortalKey(cwd, login.ID)
-	connector.rememberThreadRoom("thread-1", client, key, cwd)
+	connector.rememberThreadRoom("thread-1", client, key, cwd, nil)
 	if err = br.DB.Portal.Insert(ctx, &database.Portal{
 		PortalKey: key,
 		MXID:      "!room:example.com",
@@ -2788,6 +3120,66 @@ func TestHydrateThreadRoomsReadsMaterializedRoomState(t *testing.T) {
 	}
 }
 
+func TestClientConnectReconcilesOnlyItsLoginPortals(t *testing.T) {
+	ctx := context.Background()
+	matrix := &fakeMatrixConnector{evt: &event.Event{Content: event.Content{
+		Raw: map[string]any{
+			"threadId":      "thread-1",
+			"sessionId":     "session-1",
+			"cwd":           "/tmp/project",
+			"model":         "gpt-5",
+			"modelProvider": "openai",
+		},
+	}}}
+	connector, br := testBridgeWithDB(t, matrix)
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := login.Client.(*Client)
+	t.Cleanup(client.Disconnect)
+
+	starterKey := networkid.PortalKey{ID: "project:", Receiver: login.ID}
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: starterKey,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	otherKey := projectPortalKey("/tmp/other", "other-login")
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{PortalKey: otherKey}); err != nil {
+		t.Fatal(err)
+	}
+
+	client.Connect(ctx)
+
+	targetKey := projectPortalKey("/tmp/project", login.ID)
+	if portal, err := br.GetExistingPortalByKey(ctx, targetKey); err != nil {
+		t.Fatal(err)
+	} else if portal == nil || portal.MXID != "!room:example.com" {
+		t.Fatalf("login reconnect did not canonicalize its portal: %#v", portal)
+	}
+	if portal, err := br.GetExistingPortalByKey(ctx, otherKey); err != nil {
+		t.Fatal(err)
+	} else if portal == nil {
+		t.Fatal("login reconnect should not reconcile another login's portal")
+	}
+	task, err := br.DB.BackfillTask.GetNextForPortal(ctx, targetKey, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task == nil || task.BatchCount != -1 || task.IsDone || task.QueueDone {
+		t.Fatalf("login reconnect should reset backfill for reconciled portal: %#v", task)
+	}
+}
+
 func TestHydrateThreadRoomsCanonicalizesKnownMaterializedRoom(t *testing.T) {
 	ctx := context.Background()
 	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
@@ -2829,6 +3221,191 @@ func TestHydrateThreadRoomsCanonicalizesKnownMaterializedRoom(t *testing.T) {
 		t.Fatal(err)
 	} else if portal == nil || portal.MXID != "!room:example.com" {
 		t.Fatalf("canonical portal missing after hydrate: %#v", portal)
+	}
+}
+
+func TestHydrateThreadRoomsDetachesArchivedCodexThread(t *testing.T) {
+	ctx := context.Background()
+	oldPortalEventBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	t.Cleanup(func() { bridgev2.PortalEventBuffer = oldPortalEventBuffer })
+
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
+	logPath := filepath.Join(t.TempDir(), "fake-appserver.jsonl")
+	app := startTestFakeAppServer(t, ctx, connector, logPath)
+	defer app.Close()
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "archived-thread", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	connector.hydrateThreadRooms(ctx)
+
+	requireEventually(t, time.Second, func() bool {
+		portal, err := br.GetExistingPortalByKey(ctx, key)
+		return err == nil && portal == nil
+	})
+	if _, ok := connector.threadRoom("archived-thread"); ok {
+		t.Fatal("archived thread should not remain cached after startup reconciliation")
+	}
+	requests := readFakeAppServerRequests(t, logPath)
+	if read, ok := findFakeAppServerRequest(requests, "thread/read"); !ok || read.Params["threadId"] != "archived-thread" {
+		t.Fatalf("startup should read Codex thread before detaching: req=%#v requests=%#v", read, requests)
+	}
+}
+
+func TestHydrateThreadRoomsKeepsSubagentPortalReadOnly(t *testing.T) {
+	ctx := context.Background()
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
+	logPath := filepath.Join(t.TempDir(), "fake-appserver.jsonl")
+	app := startTestFakeAppServer(t, ctx, connector, logPath)
+	defer app.Close()
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd := os.TempDir()
+	key := subagentPortalKey("thread-2", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!subagent:example.com",
+		Name:      "Subagent thread-2",
+		RoomType:  database.RoomTypeDM,
+		Metadata: &PortalMetadata{
+			Kind:           portalKindSubagent,
+			ThreadID:       "thread-2",
+			ParentThreadID: "thread-1",
+			Cwd:            cwd,
+			ReadOnly:       true,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	connector.hydrateThreadRooms(ctx)
+
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if portal == nil || portal.PortalKey != key {
+		t.Fatalf("subagent portal should not be canonicalized into a project portal: %#v", portal)
+	}
+	meta := portalMetadata(portal.Metadata)
+	if meta.Kind != portalKindSubagent || meta.ThreadID != "thread-2" || meta.ParentThreadID != "thread-1" || !meta.ReadOnly {
+		t.Fatalf("subagent metadata was not preserved: %#v", meta)
+	}
+	if _, ok := connector.threadRoom("thread-2"); !ok {
+		t.Fatal("subagent thread should be cached after startup reconciliation")
+	}
+}
+
+func TestHydrateThreadRoomsDetachesMissingSubagentPortal(t *testing.T) {
+	ctx := context.Background()
+	oldPortalEventBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	t.Cleanup(func() { bridgev2.PortalEventBuffer = oldPortalEventBuffer })
+
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
+	logPath := filepath.Join(t.TempDir(), "fake-appserver.jsonl")
+	app := startTestFakeAppServer(t, ctx, connector, logPath)
+	defer app.Close()
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := subagentPortalKey("missing-thread", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!subagent:example.com",
+		Name:      "Subagent missing-thread",
+		RoomType:  database.RoomTypeDM,
+		Metadata: &PortalMetadata{
+			Kind:           portalKindSubagent,
+			ThreadID:       "missing-thread",
+			ParentThreadID: "thread-1",
+			Cwd:            "/tmp/project",
+			ReadOnly:       true,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	connector.hydrateThreadRooms(ctx)
+
+	requireEventually(t, time.Second, func() bool {
+		portal, err := br.GetExistingPortalByKey(ctx, key)
+		return err == nil && portal == nil
+	})
+}
+
+func TestFetchMessagesBackfillsSubagentThreadOnly(t *testing.T) {
+	ctx := context.Background()
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
+	logPath := filepath.Join(t.TempDir(), "fake-appserver.jsonl")
+	app := startTestFakeAppServer(t, ctx, connector, logPath)
+	defer app.Close()
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := subagentPortalKey("thread-2", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!subagent:example.com",
+		RoomType:  database.RoomTypeDM,
+		Metadata: &PortalMetadata{
+			Kind:           portalKindSubagent,
+			ThreadID:       "thread-2",
+			ParentThreadID: "thread-1",
+			Cwd:            "/tmp/project",
+			ReadOnly:       true,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = login.Client.(*Client).FetchMessages(ctx, bridgev2.FetchMessagesParams{Portal: portal, Count: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	requests := readFakeAppServerRequests(t, logPath)
+	if _, ok := findFakeAppServerRequest(requests, "thread/list"); ok {
+		t.Fatalf("subagent backfill should not list/backfill the entire cwd: %#v", requests)
+	}
+	if read, ok := findFakeAppServerRequest(requests, "thread/read"); !ok || read.Params["threadId"] != "thread-2" {
+		t.Fatalf("subagent backfill should read its own thread: req=%#v requests=%#v", read, requests)
 	}
 }
 
@@ -3027,7 +3604,7 @@ func TestClearMissingThreadForgetsRuntimeMapping(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project", "openai", "gpt-5")
+	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-5"})
 	connector.setActive("thread-1", newActiveRun(client, key, "thread-1", "turn-1"))
 
 	client.clearMissingThread(ctx, portal, portalMetadata(portal.Metadata))
@@ -3064,7 +3641,7 @@ func TestForgetThreadRemovesStaleProcessMappingWithoutActiveRun(t *testing.T) {
 	}
 }
 
-func TestEnsureBackfillVersionResetsOldCompletedTask(t *testing.T) {
+func TestSyncPortalBackfillResetsOldCompletedTask(t *testing.T) {
 	ctx := context.Background()
 	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
 	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
@@ -3099,7 +3676,7 @@ func TestEnsureBackfillVersionResetsOldCompletedTask(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	(&Client{Main: connector, UserLogin: login}).ensureBackfillVersion(ctx, portal)
+	(&Client{Main: connector, UserLogin: login}).syncPortalBackfill(ctx, portal, "thread-1")
 
 	meta := portalMetadata(portal.Metadata)
 	if meta.BackfillVersion != codexBackfillVersion {
@@ -3114,6 +3691,49 @@ func TestEnsureBackfillVersionResetsOldCompletedTask(t *testing.T) {
 	}
 }
 
+func TestSyncPortalBackfillKeepsCurrentTask(t *testing.T) {
+	ctx := context.Background()
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project", BackfillVersion: codexBackfillVersion},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err = br.DB.BackfillTask.Upsert(ctx, &database.BackfillTask{
+		PortalKey:   key,
+		UserLoginID: login.ID,
+		BatchCount:  3,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	(&Client{Main: connector, UserLogin: login}).syncPortalBackfill(ctx, portal, "thread-1")
+
+	task, err := br.DB.BackfillTask.GetNextForPortal(ctx, key, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task == nil || task.BatchCount != 3 {
+		t.Fatalf("current backfill task should not be reset: %#v", task)
+	}
+}
+
 func TestLoginIDsUseConfiguredBridgeAlias(t *testing.T) {
 	connector := &Connector{Bridge: &bridgev2.Bridge{
 		ID: "codex",
@@ -3124,19 +3744,129 @@ func TestLoginIDsUseConfiguredBridgeAlias(t *testing.T) {
 			},
 		}},
 	}}
-	got := connector.loginIDsForUser("")
-	want := []networkid.UserLoginID{"sh-codex"}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("unexpected login IDs:\n got: %#v\nwant: %#v", got, want)
+	if got := connector.loginIDForUser(); got != "sh-codex" {
+		t.Fatalf("unexpected login ID: got %q, want sh-codex", got)
+	}
+}
+
+func TestLoginRemoteProfileIncludesHostAndBridgeAlias(t *testing.T) {
+	host := codexHostname()
+	if host == "" {
+		t.Skip("hostname unavailable")
+	}
+	profile := loginRemoteProfile("alice@example.com", "sh-codex-2")
+	wantName := "alice@example.com on " + host
+	if profile.Name != wantName || profile.Email != "alice@example.com" || profile.Username != "sh-codex-2" || string(profile.Avatar) != defaultCodexAvatarMXC {
+		t.Fatalf("unexpected remote profile: %#v", profile)
+	}
+}
+
+func TestApplyRemoteProfileEmail(t *testing.T) {
+	profile := bridgestatus.RemoteProfile{}
+	applyRemoteProfileEmail(&profile, "alice@example.com")
+	if profile.Email != "alice@example.com" {
+		t.Fatalf("email display name should populate profile email: %#v", profile)
+	}
+	applyRemoteProfileEmail(&profile, "Alice Example")
+	if profile.Email != "alice@example.com" {
+		t.Fatalf("non-email display name should not replace profile email: %#v", profile)
+	}
+}
+
+func TestShouldAppendHost(t *testing.T) {
+	if !shouldAppendHost("alice@example.com", "workstation") {
+		t.Fatal("display name without host should append host")
+	}
+	if shouldAppendHost("alice@example.com on workstation", "workstation") {
+		t.Fatal("display name with host suffix should not append host")
+	}
+	if shouldAppendHost("alice@example.com", "") {
+		t.Fatal("empty host should not be appended")
+	}
+}
+
+func TestCodexUserLoginRecordUsesRemoteProfile(t *testing.T) {
+	record := codexUserLoginRecord("sh-codex-2", "alice@example.com")
+	if record.ID != "sh-codex-2" || record.RemoteName == "" || record.RemoteName != record.RemoteProfile.Name || record.RemoteProfile.Username != "sh-codex-2" {
+		t.Fatalf("unexpected login record: %#v", record)
+	}
+}
+
+func TestConfiguredLoginUserID(t *testing.T) {
+	userID, ok := configuredLoginUserID("@alice:example.com")
+	if !ok || userID != "@alice:example.com" {
+		t.Fatalf("unexpected configured login user ID: %q ok=%v", userID, ok)
+	}
+	if isConfiguredLoginUserID("example.com") {
+		t.Fatal("non-Matrix user IDs should not pass the prefix check")
+	}
+	if _, ok := configuredLoginUserID("@invalid"); ok {
+		t.Fatal("malformed Matrix user ID should not parse")
+	}
+}
+
+func TestGlobalBridgeInfoIncludesInstallIdentity(t *testing.T) {
+	connector := &Connector{Bridge: &bridgev2.Bridge{
+		ID: "codex",
+		Matrix: &matrixconnector.Connector{Config: &bridgeconfig.Config{
+			AppService: bridgeconfig.AppserviceConfig{
+				Bot:              bridgeconfig.BotUserConfig{Username: "sh-codex-2bot"},
+				UsernameTemplate: "sh-codex-2_{{.}}",
+			},
+		}},
+	}}
+	info := connector.globalBridgeInfo()
+	if info["bridge_name"] != "sh-codex-2" {
+		t.Fatalf("bridge_name = %#v, want sh-codex-2: %#v", info["bridge_name"], info)
+	}
+	if codexHostname() != "" && info["hostname"] == "" {
+		t.Fatalf("missing hostname in install info: %#v", info)
+	}
+}
+
+func TestAccountGlobalStateIncludesInstallIdentity(t *testing.T) {
+	connector := &Connector{Bridge: &bridgev2.Bridge{
+		ID: "codex",
+		Matrix: &matrixconnector.Connector{Config: &bridgeconfig.Config{
+			AppService: bridgeconfig.AppserviceConfig{
+				Bot: bridgeconfig.BotUserConfig{Username: "sh-codex-2bot"},
+			},
+		}},
+	}}
+	state := connector.accountGlobalState(&appserver.Account{Type: "chatgpt", Email: "alice@example.com"})
+	if state["type"] != "chatgpt" || state["email"] != "alice@example.com" || state["bridge_name"] != "sh-codex-2" {
+		t.Fatalf("unexpected account global state: %#v", state)
+	}
+	if codexHostname() != "" && state["hostname"] == "" {
+		t.Fatalf("missing hostname in account state: %#v", state)
+	}
+	state = connector.accountGlobalState(nil)
+	if _, ok := state["type"]; ok {
+		t.Fatalf("nil account should not set type: %#v", state)
+	}
+	if _, ok := state["email"]; ok {
+		t.Fatalf("nil account should not set email: %#v", state)
+	}
+}
+
+func TestAccountName(t *testing.T) {
+	if got := accountName(nil); got != "Codex" {
+		t.Fatalf("accountName(nil) = %q, want Codex", got)
+	}
+	account := &appserver.Account{Email: "alice@example.com", Type: "chatgpt"}
+	if got := accountName(account); got != "alice@example.com" {
+		t.Fatalf("accountName(email account) = %q, want alice@example.com", got)
+	}
+	account.Email = ""
+	if got := accountName(account); got != "Codex chatgpt" {
+		t.Fatalf("accountName(type account) = %q, want Codex chatgpt", got)
 	}
 }
 
 func TestLoginIDsFallBackToBridgeID(t *testing.T) {
 	connector := &Connector{Bridge: &bridgev2.Bridge{ID: "codex"}}
-	got := connector.loginIDsForUser("")
-	want := []networkid.UserLoginID{defaultLoginID}
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("unexpected login IDs:\n got: %#v\nwant: %#v", got, want)
+	if got := connector.loginIDForUser(); got != defaultLoginID {
+		t.Fatalf("unexpected login ID: got %q, want %q", got, defaultLoginID)
 	}
 }
 
@@ -3207,6 +3937,18 @@ func testMatrixMessage(threadID, body string) *bridgev2.MatrixMessage {
 			}},
 		},
 	}
+}
+
+func identifiersContain(info *bridgev2.UserInfo, query string) bool {
+	if info == nil {
+		return false
+	}
+	for _, identifier := range info.Identifiers {
+		if strings.Contains(strings.ToLower(identifier), query) {
+			return true
+		}
+	}
+	return false
 }
 
 type fakeArbitraryRoomState struct {
@@ -3399,14 +4141,4 @@ type fakeMessageEvent struct {
 	Type    event.Type
 	Content *event.Content
 	Extra   *bridgev2.MatrixSendExtra
-}
-
-func countRedactions(events []fakeMessageEvent) int {
-	count := 0
-	for _, evt := range events {
-		if evt.Type == event.EventRedaction {
-			count++
-		}
-	}
-	return count
 }

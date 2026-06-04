@@ -7,6 +7,7 @@ import (
 
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/bridgeconfig"
+	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/event"
 )
 
@@ -80,6 +81,22 @@ func TestRoomCapabilitiesMatchImplementedHandlers(t *testing.T) {
 	}
 }
 
+func TestSubagentRoomCapabilitiesAreReadOnly(t *testing.T) {
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		Metadata: &PortalMetadata{Kind: portalKindSubagent, ThreadID: "thread-2", ParentThreadID: "thread-1", ReadOnly: true},
+	}}
+	caps := (&Client{}).GetCapabilities(context.Background(), portal)
+	if caps.Edit != event.CapLevelUnsupported {
+		t.Fatalf("subagent prompt edits should not be advertised, got %v", caps.Edit)
+	}
+	if caps.TypingNotifications {
+		t.Fatalf("subagent rooms should not advertise user typing support: %#v", caps)
+	}
+	if !caps.DeleteChat {
+		t.Fatalf("subagent rooms should still support local detach: %#v", caps)
+	}
+}
+
 func TestCodexMembersAllowUserEditableRoomState(t *testing.T) {
 	members := (&Client{}).codexMembers()
 	if members.PowerLevels == nil {
@@ -128,6 +145,22 @@ func TestCodexMembersRemoveStaleBridgeOwnedPowerLevels(t *testing.T) {
 	}
 	if content.Events[event.StateRoomName.Type] != 0 {
 		t.Fatalf("room name power level should be preserved: %#v", content.Events)
+	}
+}
+
+func TestBridgeOwnedPowerLevelEvents(t *testing.T) {
+	seen := map[string]bool{}
+	for _, eventType := range bridgeOwnedPowerLevelEvents() {
+		seen[eventType.Type] = true
+	}
+	for _, want := range []event.Type{
+		event.StateBeeperDisappearingTimer,
+		event.StateMSC4391BotCommand,
+		roomStateEventType(codexThreadStateType),
+	} {
+		if !seen[want.Type] {
+			t.Fatalf("missing bridge-owned power level event %s: %#v", want.Type, seen)
+		}
 	}
 }
 

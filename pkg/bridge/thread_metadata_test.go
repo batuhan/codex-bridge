@@ -55,9 +55,12 @@ func TestCodexThreadState(t *testing.T) {
 		t.Fatalf("unexpected closed state: %#v", state)
 	}
 
-	state = codexThreadState("thread/started", "thread-2", "", []byte(`{"thread":{"id":"thread-2","sessionId":"session-1","cwd":"/tmp/project","name":"Bridge","status":"running","model":"gpt-5","modelName":"GPT-5","modelProvider":"openai","serviceTier":"priority","effort":"high"}}`))
+	state = codexThreadState("thread/started", "thread-2", "", []byte(`{"thread":{"id":"thread-2","sessionId":"session-1","cwd":"/tmp/project","name":"Bridge","status":"running","model":"gpt-5","modelName":"GPT-5","modelProvider":"openai","serviceTier":"priority","effort":"high","turns":[{"id":"turn-1"}]}}`))
 	if state["threadId"] != "thread-2" || state["sessionId"] != "session-1" || state["cwd"] != "/tmp/project" || state["name"] != "Bridge" || state["status"] != "running" || state["model"] != "gpt-5" || state["modelName"] != "GPT-5" || state["modelProvider"] != "openai" || state["serviceTier"] != "priority" || state["effort"] != "high" {
 		t.Fatalf("thread fields were not normalized: %#v", state)
+	}
+	if _, ok := state["turns"]; ok {
+		t.Fatalf("thread turns should not be copied into room state: %#v", state)
 	}
 
 	state = codexThreadState("thread/status/changed", "thread-1", "", []byte(`{"threadId":"thread-1","status":{"type":"active","activeFlags":["agent"]}}`))
@@ -88,8 +91,8 @@ func TestCodexThreadState(t *testing.T) {
 		t.Fatalf("token usage was not normalized: %#v", state)
 	}
 
-	state = codexThreadState("thread/settings/updated", "thread-1", "", []byte(`{"threadId":"thread-1","threadSettings":{"cwd":"/tmp/project","model":"gpt-5","modelProvider":"openai","approvalPolicy":"on-request","collaborationMode":"default"}}`))
-	if state["cwd"] != "/tmp/project" || state["settings.cwd"] != "/tmp/project" || state["model"] != "gpt-5" || state["modelProvider"] != "openai" || state["approvalPolicy"] != "on-request" || state["collaborationMode"] != "default" {
+	state = codexThreadState("thread/settings/updated", "thread-1", "", []byte(`{"threadId":"thread-1","threadSettings":{"cwd":"/tmp/project","model":"gpt-5","modelProvider":"openai","approvalPolicy":"on-request","collaborationMode":"default","personality":"concise"}}`))
+	if state["cwd"] != "/tmp/project" || state["settings.cwd"] != "/tmp/project" || state["model"] != "gpt-5" || state["modelProvider"] != "openai" || state["approvalPolicy"] != "on-request" || state["collaborationMode"] != "default" || state["personality"] != "concise" || state["settings.personality"] != "concise" {
 		t.Fatalf("thread settings were not normalized: %#v", state)
 	}
 
@@ -143,6 +146,21 @@ func TestCodexAIModelStateContent(t *testing.T) {
 
 	if content = codexAIModelStateContent(map[string]any{"modelProvider": "openai"}); len(content) != 0 {
 		t.Fatalf("blank model should not write AI model state: %#v", content)
+	}
+}
+
+func TestApplyAIModelStateOptionalFields(t *testing.T) {
+	content := map[string]any{"model": "openai/gpt-b"}
+	state := map[string]any{
+		"model":           "gpt-b",
+		"modelProvider":   "openai",
+		"modelName":       "GPT-B",
+		"reasoningEffort": "medium",
+		"reasoning_mode":  "adaptive",
+	}
+	applyAIModelStateOptionalFields(content, state)
+	if content["reasoning"] != "medium" || content["reasoning_mode"] != "adaptive" || content["name"] != "GPT-B" {
+		t.Fatalf("optional AI model fields not applied: %#v", content)
 	}
 }
 
@@ -206,17 +224,17 @@ func TestInitialThreadStateHydratesModelFromSessionFile(t *testing.T) {
 	}
 }
 
-func TestChatNameFromThreadState(t *testing.T) {
+func TestCodexThreadChatInfoName(t *testing.T) {
 	state := codexThreadState("thread/name/updated", "thread-1", "", []byte(`{"threadId":"thread-1","threadName":"Build bridge"}`))
-	if got := chatNameFromThreadState(state, ""); got != "Build bridge" {
-		t.Fatalf("unexpected name %q", got)
+	if info := codexThreadChatInfo("", "thread-1", state); info.Name == nil || *info.Name != "Build bridge" {
+		t.Fatalf("unexpected name %#v", info.Name)
 	}
 	state = codexThreadState("thread/name/updated", "thread-1", "", []byte(`{"threadId":"thread-1","threadName":null}`))
-	if got := chatNameFromThreadState(state, ""); got != "" {
-		t.Fatalf("unexpected null name %q", got)
+	if info := codexThreadChatInfo("", "thread-1", state); info.Name != nil {
+		t.Fatalf("unexpected null name %#v", info.Name)
 	}
-	if got := chatNameFromThreadState(map[string]any{}, "/tmp/project"); got != "project" {
-		t.Fatalf("unexpected cwd fallback name %q", got)
+	if info := codexThreadChatInfo("/tmp/project", "thread-1", map[string]any{}); info.Name == nil || *info.Name != "project" {
+		t.Fatalf("unexpected cwd fallback name %#v", info.Name)
 	}
 }
 
@@ -246,7 +264,7 @@ func TestCodexThreadChatInfoSyncsMetadataNameAndBackfill(t *testing.T) {
 		t.Fatal("expected chat info extra updater to persist changed metadata")
 	}
 	meta := portalMetadata(portal.Metadata)
-	if meta.ThreadID != "thread-1" || meta.Cwd != "/new/project" {
+	if meta.Kind != portalKindProject || meta.ThreadID != "thread-1" || meta.Cwd != "/new/project" || meta.ReadOnly || meta.ParentThreadID != "" {
 		t.Fatalf("unexpected portal metadata: %#v", meta)
 	}
 
@@ -273,7 +291,7 @@ func TestThreadMetadataUpdaterPersistsPortalMetadata(t *testing.T) {
 		t.Fatal("expected metadata updater to report a change")
 	}
 	meta := portalMetadata(portal.Metadata)
-	if meta.ThreadID != "thread-1" || meta.Cwd != "/new/project" {
+	if meta.Kind != portalKindProject || meta.ThreadID != "thread-1" || meta.Cwd != "/new/project" || meta.ReadOnly || meta.ParentThreadID != "" {
 		t.Fatalf("unexpected portal metadata: %#v", meta)
 	}
 }
@@ -624,7 +642,7 @@ func TestPortalInfoWithThreadStateSyncsAllRoomState(t *testing.T) {
 		t.Fatal("expected portal info extra updater to sync initial room state")
 	}
 	meta := portalMetadata(portal.Metadata)
-	if meta.ThreadID != "thread-1" || meta.Cwd != "/tmp/project" {
+	if meta.Kind != portalKindProject || meta.ThreadID != "thread-1" || meta.Cwd != "/tmp/project" || meta.ReadOnly || meta.ParentThreadID != "" {
 		t.Fatalf("portal metadata was not persisted: %#v", meta)
 	}
 	for _, eventType := range []string{codexThreadStateType, beeperAIModelStateType, event.StateMSC4391BotCommand.Type} {
@@ -670,17 +688,94 @@ func TestBridgeInfoIncludesSelfHostedIdentity(t *testing.T) {
 	}
 }
 
-func TestBlankPortalMetadataUpdaterDoesNotClearSessionMetadata(t *testing.T) {
+func TestBlankProjectMetadataDoesNotClearSessionMetadata(t *testing.T) {
 	portal := &bridgev2.Portal{Portal: &database.Portal{
 		PortalKey: networkid.PortalKey{ID: "project", Receiver: "codex"},
 		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
 	}}
-	if codexPortalMetadataUpdater("", "")(context.Background(), portal) {
+	meta := portalMetadata(portal.Metadata)
+	if meta.applyProject("", "") {
 		t.Fatal("blank starter metadata should not report a session metadata change")
 	}
-	meta := portalMetadata(portal.Metadata)
 	if meta.ThreadID != "thread-1" || meta.Cwd != "/tmp/project" {
 		t.Fatalf("session metadata was cleared: %#v", meta)
+	}
+}
+
+func TestPortalMetadataApplyGuards(t *testing.T) {
+	var nilMeta *PortalMetadata
+	if nilMeta.canApplyProject("/tmp/project", "thread-1") {
+		t.Fatal("nil portal metadata should not accept project updates")
+	}
+	meta := &PortalMetadata{}
+	if meta.canApplyProject("", "") {
+		t.Fatal("blank project metadata should not be applied")
+	}
+	if !meta.canApplyProject("/tmp/project", "") {
+		t.Fatal("project metadata with cwd should be applied")
+	}
+	if meta.canApplySubagent("") {
+		t.Fatal("blank subagent thread ID should not be applied")
+	}
+	if !meta.canApplySubagent("thread-2") {
+		t.Fatal("subagent metadata with thread ID should be applied")
+	}
+}
+
+func TestPortalMetadataApplyProjectDefaults(t *testing.T) {
+	meta := &PortalMetadata{Kind: portalKindSubagent, ParentThreadID: "thread-1", ReadOnly: true}
+	changed := false
+	meta.applyProjectDefaults(&changed)
+	if !changed {
+		t.Fatal("project defaults should report changed metadata")
+	}
+	if meta.Kind != portalKindProject || meta.ParentThreadID != "" || meta.ReadOnly {
+		t.Fatalf("unexpected project defaults: %#v", meta)
+	}
+}
+
+func TestPortalMetadataApplySubagentFields(t *testing.T) {
+	meta := &PortalMetadata{Kind: portalKindProject, ThreadID: "thread-1", Cwd: "/old/project"}
+	changed := false
+	meta.applySubagentFields("thread-1", "thread-2", "/tmp/project", &changed)
+	if !changed {
+		t.Fatal("subagent fields should report changed metadata")
+	}
+	if meta.Kind != portalKindSubagent || meta.ThreadID != "thread-2" || meta.ParentThreadID != "thread-1" || meta.Cwd != "/tmp/project" || !meta.ReadOnly {
+		t.Fatalf("unexpected subagent fields: %#v", meta)
+	}
+}
+
+func TestSubagentMetadataMarksReadOnlyPortal(t *testing.T) {
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: subagentPortalKey("thread-2", "codex"),
+	}}
+	meta := portalMetadata(portal.Metadata)
+	if !meta.applySubagent("thread-1", "thread-2", "/tmp/project") {
+		t.Fatal("expected subagent metadata to be saved")
+	}
+	portal.Metadata = meta
+	if meta.Kind != portalKindSubagent || meta.ThreadID != "thread-2" || meta.ParentThreadID != "thread-1" || meta.Cwd != "/tmp/project" || !meta.ReadOnly {
+		t.Fatalf("unexpected subagent metadata: %#v", meta)
+	}
+	if !isReadOnlyPortal(portal) {
+		t.Fatal("subagent portal should be read-only")
+	}
+}
+
+func TestSubagentMetadataUpdaterPersistsReadOnlyMetadata(t *testing.T) {
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: subagentPortalKey("thread-2", "codex"),
+	}}
+	if !subagentMetadataUpdater("thread-1", "thread-2", "/tmp/project")(context.Background(), portal) {
+		t.Fatal("expected subagent metadata updater to report a change")
+	}
+	meta := portalMetadata(portal.Metadata)
+	if meta.Kind != portalKindSubagent || meta.ThreadID != "thread-2" || meta.ParentThreadID != "thread-1" || meta.Cwd != "/tmp/project" || !meta.ReadOnly {
+		t.Fatalf("unexpected subagent metadata: %#v", meta)
+	}
+	if subagentMetadataUpdater("thread-1", "", "/tmp/project")(context.Background(), portal) {
+		t.Fatal("blank subagent thread id should not update metadata")
 	}
 }
 
@@ -696,86 +791,23 @@ func TestMessageMetadataMergesTypedFields(t *testing.T) {
 	}
 }
 
+func TestMessageMetadataCopyApprovalClonesContext(t *testing.T) {
+	source := &MessageMetadata{Approval: &aistream.ApprovalContext{ID: "approval-1", ThreadID: "thread-1"}}
+	meta := &MessageMetadata{}
+	meta.CopyFrom(source)
+	if meta.Approval == nil || meta.Approval.ID != "approval-1" || meta.Approval.ThreadID != "thread-1" {
+		t.Fatalf("approval metadata was not copied: %#v", meta)
+	}
+	source.Approval.ID = "approval-2"
+	if meta.Approval.ID != "approval-1" {
+		t.Fatalf("approval metadata should be cloned, got %#v", meta.Approval)
+	}
+}
+
 func TestConnectorUsesTypedMessageMetadata(t *testing.T) {
 	meta := (&Connector{}).GetDBMetaTypes().Message()
 	if _, ok := meta.(*MessageMetadata); !ok {
 		t.Fatalf("unexpected message metadata type %T", meta)
-	}
-}
-
-func TestNormalizeStoredMessageMetadata(t *testing.T) {
-	msg := &database.Message{
-		ID:       "msg-turn-1",
-		PartID:   partID("text"),
-		SenderID: codexUserID,
-		Metadata: &MessageMetadata{
-			ThreadID: "thread-1",
-		},
-	}
-	if !normalizeStoredMessageMetadata(msg) {
-		t.Fatal("expected legacy assistant metadata to be normalized")
-	}
-	meta, ok := msg.Metadata.(*MessageMetadata)
-	if !ok || meta.Role != "assistant" || meta.TurnID != "turn-1" || meta.StreamStatus != "complete" {
-		t.Fatalf("unexpected normalized assistant metadata: %#v", msg.Metadata)
-	}
-
-	msg = &database.Message{
-		ID:       "user:$event",
-		PartID:   partID("text"),
-		SenderID: "login:sh-codex",
-		Metadata: &MessageMetadata{
-			Role:     "user",
-			ThreadID: "thread-1",
-		},
-	}
-	if !normalizeStoredMessageMetadata(msg) {
-		t.Fatal("expected legacy user metadata to be normalized")
-	}
-	meta = msg.Metadata.(*MessageMetadata)
-	if meta.StreamStatus != "done" {
-		t.Fatalf("unexpected normalized user metadata: %#v", meta)
-	}
-}
-
-func TestConnectorNormalizesStoredMessageMetadata(t *testing.T) {
-	ctx := context.Background()
-	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
-	key := projectPortalKey("/tmp/project", "sh-codex")
-	if err := br.DB.Portal.Insert(ctx, &database.Portal{
-		PortalKey: key,
-		MXID:      "!room:example.com",
-		Name:      "project",
-		RoomType:  database.RoomTypeDM,
-		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := br.DB.Ghost.Insert(ctx, &database.Ghost{ID: codexUserID, Name: "Codex"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := br.DB.Message.Insert(ctx, &database.Message{
-		ID:         "msg-turn-1",
-		PartID:     partID("text"),
-		MXID:       "$assistant:example.com",
-		Room:       key,
-		SenderID:   codexUserID,
-		SenderMXID: "@sh-codex_codex:example.com",
-		Timestamp:  time.Unix(10, 0),
-		Metadata:   &MessageMetadata{Role: "assistant", ThreadID: "thread-1", TurnID: "turn-1"},
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	connector.normalizeStoredMessageMetadata(ctx)
-
-	msg, err := br.DB.Message.GetPartByID(ctx, key.Receiver, "msg-turn-1", partID("text"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	meta, ok := msg.Metadata.(*MessageMetadata)
-	if !ok || meta.Role != "assistant" || meta.ThreadID != "thread-1" || meta.TurnID != "turn-1" || meta.StreamStatus != "complete" {
-		t.Fatalf("stored metadata was not normalized: %#v", msg.Metadata)
 	}
 }
 
@@ -809,6 +841,21 @@ func TestThreadNoticeText(t *testing.T) {
 	}
 }
 
+func TestModelRerouteNoticeDetail(t *testing.T) {
+	got := modelRerouteNoticeDetail(map[string]any{"reason": "policy"})
+	if got != "Reason: policy" {
+		t.Fatalf("unexpected reroute detail: %q", got)
+	}
+}
+
+func TestSetMapFieldWithMirror(t *testing.T) {
+	got := map[string]any{}
+	setMapFieldWithMirror(got, "model", "gpt-5", "settings.")
+	if got["model"] != "gpt-5" || got["settings.model"] != "gpt-5" || len(got) != 2 {
+		t.Fatalf("unexpected mirrored map field: %#v", got)
+	}
+}
+
 func TestNotificationThreadID(t *testing.T) {
 	tests := map[string]string{
 		`{"threadId":"thread-1"}`:                               "thread-1",
@@ -837,21 +884,8 @@ func TestNotificationTurnID(t *testing.T) {
 		`{"threadId":"thread-1","item":{"id":"item-no-turn-id"}}`: "",
 	}
 	for raw, want := range tests {
-		if got := notificationTurnID([]byte(raw)); got != want {
-			t.Fatalf("notificationTurnID(%s) = %q, want %q", raw, got, want)
-		}
-	}
-}
-
-func TestNotificationProcessID(t *testing.T) {
-	tests := map[string]string{
-		`{"processId":"proc-1","deltaBase64":"b2s="}`:       "proc-1",
-		`{"processHandle":"handle-1","deltaBase64":"b2s="}`: "handle-1",
-		`{"threadId":"thread-1"}`:                           "",
-	}
-	for raw, want := range tests {
-		if got := notificationProcessID([]byte(raw)); got != want {
-			t.Fatalf("notificationProcessID(%s) = %q, want %q", raw, got, want)
+		if got := nestedIDFromMap(rawPayload([]byte(raw)), 0, []string{"turnId", "expectedTurnId"}, []string{"turn"}, []string{"item", "params", "request"}); got != want {
+			t.Fatalf("nested turn ID from %s = %q, want %q", raw, got, want)
 		}
 	}
 }
@@ -873,7 +907,7 @@ func TestCanStartActiveRunFromNotification(t *testing.T) {
 		"serverRequest/resolved",
 		"configWarning",
 	} {
-		if !canStartActiveRunFromNotification(method) {
+		if !isActiveRunNotification(method) {
 			t.Fatalf("expected %s to be able to start an active run", method)
 		}
 	}
@@ -881,7 +915,7 @@ func TestCanStartActiveRunFromNotification(t *testing.T) {
 		"account/updated",
 		"remoteControl/status/changed",
 	} {
-		if canStartActiveRunFromNotification(method) {
+		if isActiveRunNotification(method) {
 			t.Fatalf("did not expect %s to start an active run", method)
 		}
 	}
@@ -918,7 +952,7 @@ func TestMetadataNotificationWithoutTurnDoesNotStartStream(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", "openai", "gpt-5", "high")
+	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-5", "reasoningEffort": "high"})
 
 	connector.handleNotification("thread/status/changed", []byte(`{
 		"threadId": "thread-1",
@@ -940,7 +974,7 @@ func TestThreadMetadataNotificationUpdatesCachedRoomState(t *testing.T) {
 	connector := &Connector{threadRooms: map[string]threadRoom{}}
 	client := &Client{Main: connector, UserLogin: testUserLogin("sh-codex")}
 	oldKey := projectPortalKey("/old/project", "sh-codex")
-	connector.rememberThreadRoom("thread-1", client, oldKey, "/old/project", "openai", "gpt-4")
+	connector.rememberThreadRoom("thread-1", client, oldKey, "/old/project", map[string]any{"modelProvider": "openai", "model": "gpt-4"})
 
 	connector.handleThreadMetadataNotification("thread/settings/updated", "thread-1", []byte(`{
 		"threadId": "thread-1",
@@ -964,6 +998,63 @@ func TestThreadMetadataNotificationUpdatesCachedRoomState(t *testing.T) {
 	}
 }
 
+func TestThreadArchivedNotificationDetachesPortal(t *testing.T) {
+	ctx := context.Background()
+	oldPortalEventBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	t.Cleanup(func() { bridgev2.PortalEventBuffer = oldPortalEventBuffer })
+
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
+	user, err := br.GetUserByMXID(ctx, id.UserID("@user:example.com"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := user.NewLogin(ctx, &database.UserLogin{
+		ID:            "sh-codex",
+		RemoteName:    "Codex",
+		RemoteProfile: status.RemoteProfile{Name: "Codex"},
+		Metadata:      map[string]any{},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := login.Client.(*Client)
+	key := projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	run := newActiveRun(client, key, "thread-1", "turn-1")
+	connector.setActive("thread-1", run)
+	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-5"})
+	connector.rememberProcess("proc-1", run)
+	connector.rememberWarmThread("thread-1")
+
+	connector.handleThreadMetadataNotification("thread/archived", "thread-1", []byte(`{"threadId":"thread-1"}`))
+
+	if connector.activeRun("thread-1") != nil {
+		t.Fatal("archived Codex thread should stop active bridging")
+	}
+	if _, ok := connector.threadRoom("thread-1"); ok {
+		t.Fatal("archived Codex thread should remove thread room mapping")
+	}
+	if run := connector.activeRunForProcess([]byte(`{"processId":"proc-1"}`)); run != nil {
+		t.Fatal("archived Codex thread should remove process bridge mapping")
+	}
+	if _, warm := connector.warmThreads["thread-1"]; warm {
+		t.Fatal("archived Codex thread should forget warm thread state")
+	}
+	requireEventually(t, time.Second, func() bool {
+		portal, err := br.GetExistingPortalByKey(ctx, key)
+		return err == nil && portal == nil
+	})
+}
+
 func TestThreadMetadataNotificationUpdatesActiveRunPortalKey(t *testing.T) {
 	ctx := context.Background()
 	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
@@ -980,7 +1071,7 @@ func TestThreadMetadataNotificationUpdatesActiveRunPortalKey(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	connector.rememberThreadRoom("thread-1", client, oldKey, "/old/project", "openai", "gpt-4")
+	connector.rememberThreadRoom("thread-1", client, oldKey, "/old/project", map[string]any{"modelProvider": "openai", "model": "gpt-4"})
 	run := newActiveRun(client, oldKey, "thread-1", "turn-1")
 	connector.setActive("thread-1", run)
 
@@ -1058,7 +1149,7 @@ func TestThreadMetadataNotificationQueuesBridgeV2StateSync(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", "openai", "gpt-4")
+	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-4"})
 
 	connector.handleThreadMetadataNotification("thread/settings/updated", "thread-1", []byte(`{
 		"threadId": "thread-1",
@@ -1117,7 +1208,7 @@ func TestThreadMetadataNotificationPreservesCustomRoomNameAndTopic(t *testing.T)
 	}); err != nil {
 		t.Fatal(err)
 	}
-	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", "openai", "gpt-4")
+	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-4"})
 
 	connector.handleThreadMetadataNotification("thread/name/updated", "thread-1", []byte(`{
 		"threadId": "thread-1",
@@ -1168,7 +1259,7 @@ func TestThreadMetadataNotificationPreservesClearedRoomNameAndTopic(t *testing.T
 	}); err != nil {
 		t.Fatal(err)
 	}
-	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", "openai", "gpt-4")
+	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-4"})
 
 	connector.handleThreadMetadataNotification("thread/name/updated", "thread-1", []byte(`{
 		"threadId": "thread-1",
@@ -1250,7 +1341,7 @@ func TestModelVerificationNotificationKeepsCachedAIModelState(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", "openai", "gpt-5", "high")
+	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-5", "reasoningEffort": "high"})
 
 	connector.handleThreadMetadataNotification("model/verification", "thread-1", []byte(`{
 		"threadId": "thread-1",
@@ -1299,7 +1390,7 @@ func TestThreadNoticeNotificationQueuesBeeperAINotice(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", "openai", "gpt-5", "high")
+	connector.rememberThreadRoom("thread-1", login.Client.(*Client), key, "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-5", "reasoningEffort": "high"})
 
 	connector.handleThreadNoticeNotification("thread/compacted", "thread-1", []byte(`{"threadId":"thread-1"}`))
 
@@ -1363,7 +1454,7 @@ func TestThreadNoticeNotificationUsesActiveStreamWhenPresent(t *testing.T) {
 		t.Fatal(err)
 	}
 	client := login.Client.(*Client)
-	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project", "openai", "gpt-5", "high")
+	connector.rememberThreadRoom("thread-1", client, key, "/tmp/project", map[string]any{"modelProvider": "openai", "model": "gpt-5", "reasoningEffort": "high"})
 	run := newActiveRun(client, key, "thread-1", "turn-1")
 	connector.setActive("thread-1", run)
 
@@ -1372,7 +1463,7 @@ func TestThreadNoticeNotificationUsesActiveStreamWhenPresent(t *testing.T) {
 	if len(matrix.api.messages) != 0 {
 		t.Fatalf("active stream notice should not also queue a standalone message: %#v", matrix.api.messages)
 	}
-	if !hasTextDelta(run.run.Events, codexCompactionNotice) {
+	if countTextDelta(run.run.Events, codexCompactionNotice) == 0 {
 		t.Fatalf("active stream did not include compaction notice: %#v", run.run.Events)
 	}
 }

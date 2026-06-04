@@ -16,6 +16,11 @@ type Config struct {
 	DefaultModel string `yaml:"default_model"`
 }
 
+const (
+	defaultCodexCommand = "codex"
+	defaultMinVersion   = "0.133.0"
+)
+
 type umConfig Config
 
 func (c *Config) UnmarshalYAML(node *yaml.Node) error {
@@ -28,21 +33,23 @@ func (c *Config) UnmarshalYAML(node *yaml.Node) error {
 }
 
 func (c *Config) ApplyDefaults() {
-	if c.CodexCommand == "" {
-		c.CodexCommand = "codex"
-	}
-	if c.MinVersion == "" {
-		c.MinVersion = "0.133.0"
-	}
+	c.applyCommandDefaults()
 }
 
-func upgradeConfig(helper up.Helper) {
-	helper.Copy(up.Str, "codex_command")
-	helper.Copy(up.Str, "min_version")
-	helper.Copy(up.Str, "default_model")
+func (c *Config) applyCommandDefaults() {
+	c.CodexCommand = firstNonEmptyString(c.CodexCommand, defaultCodexCommand)
+	c.MinVersion = firstNonEmptyString(c.MinVersion, defaultMinVersion)
 }
 
 func (c *Connector) GetConfig() (string, any, up.Upgrader) {
 	c.Config.ApplyDefaults()
-	return ExampleConfig, &c.Config, up.SimpleUpgrader(upgradeConfig)
+	return ExampleConfig, &c.Config, configUpgrader()
+}
+
+func configUpgrader() up.Upgrader {
+	return up.SimpleUpgrader(func(helper up.Helper) {
+		helper.Copy(up.Str, "codex_command")
+		helper.Copy(up.Str, "min_version")
+		helper.Copy(up.Str, "default_model")
+	})
 }

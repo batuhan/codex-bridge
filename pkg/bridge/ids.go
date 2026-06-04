@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"maunium.net/go/mautrix/bridgev2/networkid"
-	"maunium.net/go/mautrix/id"
 )
 
 const (
@@ -15,66 +14,90 @@ const (
 	defaultLoginID   = networkid.UserLoginID("codex")
 	codexUserID      = networkid.UserID("codex")
 	newProjectUserID = networkid.UserID("new-project")
+
+	projectIDPrefix        = "project:"
+	subagentPortalIDPrefix = "subagent:"
+	newPortalIDPrefix      = "new:"
+
+	codexApprovalPolicyOnRequest = "on-request"
 )
 
-func threadPortalKey(threadID string, loginID networkid.UserLoginID) networkid.PortalKey {
-	return networkid.PortalKey{ID: networkid.PortalID("thread:" + sanitizeID(threadID)), Receiver: loginID}
+var idSanitizer = strings.NewReplacer(" ", "_", "/", "_", "\\", "_", ":", "_", "\n", "_", "\r", "_", "\t", "_")
+
+func subagentPortalKey(threadID string, loginID networkid.UserLoginID) networkid.PortalKey {
+	return portalKey(subagentPortalIDPrefix+sanitizeID(threadID), loginID)
 }
 
 func projectPortalKey(cwd string, loginID networkid.UserLoginID) networkid.PortalKey {
-	return networkid.PortalKey{ID: networkid.PortalID("project:" + encode(strings.TrimSpace(cwd))), Receiver: loginID}
+	return portalKey(projectID(cwd), loginID)
 }
 
 func newProjectPortalKey(loginID networkid.UserLoginID) networkid.PortalKey {
-	var data [16]byte
-	if _, err := rand.Read(data[:]); err != nil {
-		return networkid.PortalKey{ID: networkid.PortalID("new:" + sanitizeID(err.Error())), Receiver: loginID}
-	}
-	return networkid.PortalKey{ID: networkid.PortalID("new:" + base64.RawURLEncoding.EncodeToString(data[:])), Receiver: loginID}
+	return portalKey(newProjectPortalID(), loginID)
 }
 
-func isNewProjectPortalID(portalID networkid.PortalID) bool {
-	return strings.HasPrefix(string(portalID), "new:")
+func newProjectPortalID() string {
+	var data [16]byte
+	if _, err := rand.Read(data[:]); err != nil {
+		return newPortalIDPrefix + sanitizeID(err.Error())
+	}
+	return prefixedRawURLEncoded(newPortalIDPrefix, data[:])
+}
+
+func portalKey(id string, loginID networkid.UserLoginID) networkid.PortalKey {
+	return networkid.PortalKey{ID: networkid.PortalID(id), Receiver: loginID}
 }
 
 func projectUserID(cwd string) networkid.UserID {
-	return networkid.UserID("project:" + encode(strings.TrimSpace(cwd)))
+	return networkid.UserID(projectID(cwd))
+}
+
+func projectID(cwd string) string {
+	return prefixedRawURLEncoded(projectIDPrefix, []byte(firstTrimmedNonEmpty(cwd)))
 }
 
 func parseProjectUserID(userID networkid.UserID) (string, bool) {
-	encoded, ok := strings.CutPrefix(string(userID), "project:")
-	if !ok || encoded == "" {
-		return "", false
-	}
-	raw, err := base64.RawURLEncoding.DecodeString(encoded)
-	return string(raw), err == nil
+	return parseProjectID(string(userID))
 }
 
 func parseProjectPortalID(portalID networkid.PortalID) (string, bool) {
-	encoded, ok := strings.CutPrefix(string(portalID), "project:")
-	if !ok || encoded == "" {
+	return parseProjectID(string(portalID))
+}
+
+func parseProjectID(value string) (string, bool) {
+	encoded, ok := projectIDPayload(value)
+	if !ok {
 		return "", false
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(encoded)
-	return string(raw), err == nil
+	raw, err := rawURLDecoded(encoded)
+	if err != nil {
+		return "", false
+	}
+	return string(raw), true
+}
+
+func projectIDPayload(value string) (string, bool) {
+	encoded, ok := strings.CutPrefix(value, projectIDPrefix)
+	return encoded, ok && encoded != ""
 }
 
 func partID(name string) networkid.PartID {
 	return networkid.PartID(sanitizeID(name))
 }
 
-func matrixSafeID(value string) string {
-	return id.EncodeUserLocalpart(value)
-}
-
-func encode(value string) string {
-	return base64.RawURLEncoding.EncodeToString([]byte(value))
-}
-
 func sanitizeID(value string) string {
-	value = strings.TrimSpace(value)
-	if value == "" {
-		return "unknown"
-	}
-	return strings.NewReplacer(" ", "_", "/", "_", "\\", "_", ":", "_", "\n", "_", "\r", "_", "\t", "_").Replace(value)
+	value = firstTrimmedNonEmpty(value, "unknown")
+	return idSanitizer.Replace(value)
+}
+
+func rawURLEncoded(data []byte) string {
+	return base64.RawURLEncoding.EncodeToString(data)
+}
+
+func rawURLDecoded(value string) ([]byte, error) {
+	return base64.RawURLEncoding.DecodeString(value)
+}
+
+func prefixedRawURLEncoded(prefix string, data []byte) string {
+	return prefix + rawURLEncoded(data)
 }

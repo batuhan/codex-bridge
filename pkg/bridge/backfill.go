@@ -3,6 +3,7 @@ package bridge
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -23,20 +24,26 @@ const codexCompactionNotice = "Codex compacted the thread context."
 const codexEnteredReviewNotice = "Codex entered review mode."
 const codexExitedReviewNotice = "Codex exited review mode."
 
+func reviewModeNoticeText(itemType, review string) string {
+	text := codexEnteredReviewNotice
+	if itemType == "exitedReviewMode" {
+		text = codexExitedReviewNotice
+	}
+	if review := firstTrimmedNonEmpty(review); review != "" {
+		return text + "\n\n" + review
+	}
+	return text
+}
+
 func (cl *Client) projectBackfillMessages(ctx context.Context, portal *bridgev2.Portal, thread appserver.Thread) ([]*bridgev2.BackfillMessage, error) {
 	var messages []*bridgev2.BackfillMessage
 	var streamOrder int64
+	seenSubagents := map[string]bool{}
 	for _, turn := range sortedBackfillTurns(thread) {
 		ts := backfillTurnTime(thread, turn)
 		for _, item := range turn.Items {
-			if item.Type != "userMessage" {
-				continue
-			}
-			if body := backfillUserBody(item); strings.TrimSpace(body) != "" {
-				streamOrder = nextBackfillStreamOrder(streamOrder, ts)
-				messages = append(messages, cl.backfillUserMessage(portal.PortalKey, thread.ID, turn.ID, item, body, ts, streamOrder))
-				ts = ts.Add(time.Millisecond)
-			}
+			cl.queueSubagentResyncs(ctx, thread.ID, thread.Cwd, subagentRefs(backfillItemData(item)), seenSubagents)
+			messages, ts, streamOrder = cl.appendBackfillUserMessage(messages, thread.ID, turn.ID, item, ts, streamOrder)
 		}
 		streamOrder = nextBackfillStreamOrder(streamOrder, ts)
 		msg, ok, err := cl.backfillAssistantMessage(ctx, portal, thread, turn, ts, streamOrder)
@@ -50,283 +57,433 @@ func (cl *Client) projectBackfillMessages(ctx context.Context, portal *bridgev2.
 	return messages, nil
 }
 
-func paginateBackfillMessages(messages []*bridgev2.BackfillMessage, params bridgev2.FetchMessagesParams) *bridgev2.FetchMessagesResponse {
-	count := params.Count
-	if count <= 0 || count > len(messages) {
-		count = len(messages)
+func (cl *Client) appendBackfillUserMessage(messages []*bridgev2.BackfillMessage, threadID, turnID string, item appserver.TurnItem, ts time.Time, streamOrder int64) ([]*bridgev2.BackfillMessage, time.Time, int64) {
+	body := backfillUserMessageBody(item)
+	if body == "" {
+		return messages, ts, streamOrder
 	}
-	start, end := 0, len(messages)
-	if params.Forward {
-		start = forwardBackfillStart(messages, params.AnchorMessage)
-		if params.AnchorMessage == nil && len(messages)-start > count {
-			start = len(messages) - count
-		}
-		end = min(len(messages), start+count)
-		return &bridgev2.FetchMessagesResponse{
-			Messages: messages[start:end],
-			Forward:  true,
-			MarkRead: true,
-		}
-	}
-	end = backwardBackfillEnd(messages, params.AnchorMessage, params.Cursor)
-	start = max(0, end-count)
-	cursor := networkid.PaginationCursor("")
-	if start > 0 {
-		cursor = networkid.PaginationCursor(strconv.Itoa(start))
-	}
-	return &bridgev2.FetchMessagesResponse{
-		Messages:             messages[start:end],
-		Cursor:               cursor,
-		HasMore:              start > 0,
-		MarkRead:             params.AnchorMessage == nil && params.Cursor == "",
-		ApproxTotalCount:     len(messages),
-		ApproxRemainingCount: start,
-	}
-}
-
-func forwardBackfillStart(messages []*bridgev2.BackfillMessage, anchor *database.Message) int {
-	if anchor == nil {
-		return 0
-	}
-	for i, msg := range messages {
-		if msg.ID == anchor.ID {
-			return i + 1
-		}
-	}
-	for i, msg := range messages {
-		if msg.Timestamp.After(anchor.Timestamp) {
-			return i
-		}
-	}
-	return len(messages)
-}
-
-func backwardBackfillEnd(messages []*bridgev2.BackfillMessage, anchor *database.Message, cursor networkid.PaginationCursor) int {
-	if cursor != "" {
-		if end, err := strconv.Atoi(string(cursor)); err == nil {
-			return max(0, min(end, len(messages)))
-		}
-	}
-	if anchor == nil {
-		return len(messages)
-	}
-	for i, msg := range messages {
-		if msg.ID == anchor.ID {
-			return i
-		}
-	}
-	for i, msg := range messages {
-		if !msg.Timestamp.Before(anchor.Timestamp) {
-			return i
-		}
-	}
-	return len(messages)
+	streamOrder = nextBackfillStreamOrder(streamOrder, ts)
+	messages = append(messages, cl.backfillUserMessage(threadID, turnID, item, body, ts, streamOrder))
+	return messages, ts.Add(time.Millisecond), streamOrder
 }
 
 func sortedBackfillTurns(thread appserver.Thread) []appserver.Turn {
-	turns := append([]appserver.Turn(nil), thread.Turns...)
+	turns := slices.Clone(thread.Turns)
 	sort.SliceStable(turns, func(i, j int) bool {
 		return backfillTurnTime(thread, turns[i]).Before(backfillTurnTime(thread, turns[j]))
 	})
 	return turns
 }
 
-func (cl *Client) backfillUserMessage(portalKey networkid.PortalKey, threadID, turnID string, item appserver.TurnItem, body string, ts time.Time, streamOrder int64) *bridgev2.BackfillMessage {
-	msgID := backfillUserMessageID(item, turnID)
+func paginateBackfillMessages(messages []*bridgev2.BackfillMessage, params bridgev2.FetchMessagesParams) *bridgev2.FetchMessagesResponse {
+	count := backfillPageCount(params.Count, len(messages))
+	if params.Forward {
+		start, end := forwardBackfillRange(messages, params, count)
+		return forwardBackfillResponse(messages[start:end])
+	}
+	start, end := backwardBackfillRange(messages, params, count)
+	return backwardBackfillResponse(messages[start:end], params, start, len(messages))
+}
+
+func forwardBackfillResponse(messages []*bridgev2.BackfillMessage) *bridgev2.FetchMessagesResponse {
+	return &bridgev2.FetchMessagesResponse{
+		Messages: messages,
+		Forward:  true,
+		MarkRead: true,
+	}
+}
+
+func backwardBackfillResponse(messages []*bridgev2.BackfillMessage, params bridgev2.FetchMessagesParams, start, total int) *bridgev2.FetchMessagesResponse {
+	return &bridgev2.FetchMessagesResponse{
+		Messages:             messages,
+		Cursor:               backfillPaginationCursor(start),
+		HasMore:              start > 0,
+		MarkRead:             params.AnchorMessage == nil && params.Cursor == "",
+		ApproxTotalCount:     total,
+		ApproxRemainingCount: start,
+	}
+}
+
+func forwardBackfillRange(messages []*bridgev2.BackfillMessage, params bridgev2.FetchMessagesParams, count int) (int, int) {
+	start := forwardBackfillStart(messages, params, count)
+	return start, min(len(messages), start+count)
+}
+
+func backwardBackfillRange(messages []*bridgev2.BackfillMessage, params bridgev2.FetchMessagesParams, count int) (int, int) {
+	end := backwardBackfillEnd(messages, params, len(messages))
+	return max(0, end-count), end
+}
+
+func forwardBackfillStart(messages []*bridgev2.BackfillMessage, params bridgev2.FetchMessagesParams, count int) int {
+	if params.AnchorMessage == nil {
+		if len(messages) > count {
+			return len(messages) - count
+		}
+		return 0
+	}
+	start := len(messages)
+	for i, msg := range messages {
+		if msg.ID == params.AnchorMessage.ID {
+			return i + 1
+		}
+		if start == len(messages) && msg.Timestamp.After(params.AnchorMessage.Timestamp) {
+			start = i
+		}
+	}
+	return start
+}
+
+func backwardBackfillEnd(messages []*bridgev2.BackfillMessage, params bridgev2.FetchMessagesParams, fallback int) int {
+	if params.Cursor != "" {
+		if cursorEnd, err := strconv.Atoi(string(params.Cursor)); err == nil {
+			return max(0, min(cursorEnd, len(messages)))
+		}
+		return fallback
+	}
+	if params.AnchorMessage == nil {
+		return fallback
+	}
+	return backwardAnchorEnd(messages, params.AnchorMessage, fallback)
+}
+
+func backwardAnchorEnd(messages []*bridgev2.BackfillMessage, anchor *database.Message, fallback int) int {
+	end := fallback
+	for i, msg := range messages {
+		if msg.ID == anchor.ID {
+			return i
+		}
+		if end == fallback && !msg.Timestamp.Before(anchor.Timestamp) {
+			end = i
+		}
+	}
+	return end
+}
+
+func backfillPageCount(requested, available int) int {
+	if requested <= 0 || requested > available {
+		return available
+	}
+	return requested
+}
+
+func backfillPaginationCursor(start int) networkid.PaginationCursor {
+	if start <= 0 {
+		var cursor networkid.PaginationCursor
+		return cursor
+	}
+	return networkid.PaginationCursor(strconv.Itoa(start))
+}
+
+func (cl *Client) backfillUserMessage(threadID, turnID string, item appserver.TurnItem, body string, ts time.Time, streamOrder int64) *bridgev2.BackfillMessage {
+	msgID := backfillUserMessageID(turnID, item)
 	return &bridgev2.BackfillMessage{
 		ConvertedMessage: &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{
 			ID:         partID("text"),
 			Type:       event.EventMessage,
 			Content:    msgconv.TextContent(body),
-			DBMetadata: &MessageMetadata{Role: "user", ThreadID: threadID, TurnID: turnID, StreamStatus: "done"},
+			DBMetadata: backfillUserMetadata(threadID, turnID),
 		}}},
-		Sender:      bridgev2.EventSender{Sender: cl.GetUserID(), IsFromMe: true, SenderLogin: cl.UserLogin.ID},
-		ID:          networkid.MessageID(msgID),
-		TxnID:       networkid.TransactionID(msgID),
+		Sender:      cl.backfillUserSender(),
+		ID:          msgID,
+		TxnID:       backfillTransactionID(msgID),
 		Timestamp:   ts,
 		StreamOrder: streamOrder,
 	}
 }
 
+func (cl *Client) backfillUserSender() bridgev2.EventSender {
+	return bridgev2.EventSender{Sender: cl.GetUserID(), IsFromMe: true, SenderLogin: cl.UserLogin.ID}
+}
+
+func backfillUserMetadata(threadID, turnID string) *MessageMetadata {
+	return &MessageMetadata{Role: "user", ThreadID: threadID, TurnID: turnID, StreamStatus: "done"}
+}
+
+func backfillUserMessageID(turnID string, item appserver.TurnItem) networkid.MessageID {
+	if item.ClientID != "" {
+		return networkid.MessageID("user:" + item.ClientID)
+	}
+	return networkid.MessageID("codex:" + turnID + ":" + item.ID)
+}
+
 func (cl *Client) backfillAssistantMessage(ctx context.Context, portal *bridgev2.Portal, thread appserver.Thread, turn appserver.Turn, ts time.Time, streamOrder int64) (*bridgev2.BackfillMessage, bool, error) {
-	run := aistream.NewRun(turn.ID, thread.ID, threadModelRef(thread), "codex", "Codex", ts)
-	run.Data["capabilities"] = codexAgentCapabilities()
+	run := newBackfillRun(thread, turn, ts)
 	writer := aistream.NewWriter(run, func() time.Time { return ts })
 	writer.Start()
 
-	hasContent := false
 	var reasoningSections reasoningSectionState
-	for _, item := range turn.Items {
-		if item.Type == "userMessage" {
-			continue
-		}
-		hasContent = mapBackfillItem(writer, run.MessageID, item, &reasoningSections) || hasContent
-	}
+	hasContent := mapBackfillAssistantItems(writer, run.MessageID, turn.Items, &reasoningSections)
 	statusKind := codexTurnStatusKind(turn.Status)
-	if statusKind == "in_progress" && turn.Error == nil {
+	if skipBackfillAssistantMessage(statusKind, hasContent, turn.Error != nil) {
 		return nil, false, nil
 	}
-	if !hasContent && turn.Error == nil && statusKind != "error" && statusKind != "aborted" {
-		return nil, false, nil
-	}
-	message := ""
-	if turn.Error != nil {
-		message = turn.Error.Message
-	}
-	finishCodexTurn(writer, turn.Status, message)
+	finishCodexTurn(writer, turn.Status, backfillTurnErrorMessage(turn))
 
-	content, extra, err := cl.backfillFinalContent(ctx, portal, *run)
+	content, extra, err := matrixFinalContent(ctx, portal, cl.backfillBotIntent(), *run)
 	if err != nil {
 		return nil, false, err
 	}
-	msgID := "codex:" + turn.ID + ":assistant"
+	msgID := backfillAssistantMessageID(turn.ID)
 	return &bridgev2.BackfillMessage{
 		ConvertedMessage: &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{
 			ID:         partID("text"),
 			Type:       event.EventMessage,
 			Content:    content,
 			Extra:      extra,
-			DBMetadata: &MessageMetadata{Role: "assistant", ThreadID: thread.ID, TurnID: turn.ID, StreamStatus: finalStreamStatus(*run)},
+			DBMetadata: finalMessageMetadata(*run, thread.ID, turn.ID),
 		}}},
-		Sender:      bridgev2.EventSender{Sender: codexUserID},
-		ID:          networkid.MessageID(msgID),
-		TxnID:       networkid.TransactionID(msgID),
+		Sender:      backfillAssistantSender(),
+		ID:          msgID,
+		TxnID:       backfillTransactionID(msgID),
 		Timestamp:   ts,
 		StreamOrder: streamOrder,
 	}, true, nil
 }
 
-func (cl *Client) backfillFinalContent(ctx context.Context, portal *bridgev2.Portal, run aistream.Run) (*event.MessageEventContent, map[string]any, error) {
-	if cl != nil && cl.Main != nil && cl.Main.Bridge != nil && cl.Main.Bridge.Bot != nil && portal != nil && portal.MXID != "" {
-		return matrixFinalContentWithAttachment(ctx, portal, cl.Main.Bridge.Bot, run)
+func backfillAssistantSender() bridgev2.EventSender {
+	return bridgev2.EventSender{Sender: codexUserID}
+}
+
+func newBackfillRun(thread appserver.Thread, turn appserver.Turn, ts time.Time) *aistream.Run {
+	run := aistream.NewRun(turn.ID, thread.ID, backfillRunModel(thread), "codex", "Codex", ts)
+	run.Data["capabilities"] = codexAgentCapabilities()
+	return run
+}
+
+func backfillRunModel(thread appserver.Thread) string {
+	return firstNonEmptyString(codexModelStateRef(thread.Raw, thread.ModelProvider), modelProviderRef(thread.ModelProvider))
+}
+
+func mapBackfillAssistantItems(writer *aistream.Writer, messageID string, items []appserver.TurnItem, reasoningSections *reasoningSectionState) bool {
+	hasContent := false
+	for _, item := range items {
+		if isBackfillUserMessage(item) {
+			continue
+		}
+		hasContent = mapBackfillItem(writer, messageID, item, reasoningSections) || hasContent
 	}
-	content, extra := matrixFinalContent(run)
-	return content, extra, nil
+	return hasContent
+}
+
+func backfillTurnErrorMessage(turn appserver.Turn) string {
+	if turn.Error == nil {
+		return ""
+	}
+	return turn.Error.Message
+}
+
+func backfillTransactionID(msgID networkid.MessageID) networkid.TransactionID {
+	return networkid.TransactionID(msgID)
+}
+
+func backfillAssistantMessageID(turnID string) networkid.MessageID {
+	return networkid.MessageID("codex:" + turnID + ":assistant")
+}
+
+func skipBackfillAssistantMessage(statusKind string, hasContent, hasError bool) bool {
+	if statusKind == "in_progress" && !hasError {
+		return true
+	}
+	return !hasContent && !hasError && statusKind != "error" && statusKind != "aborted"
+}
+
+func (cl *Client) backfillBotIntent() bridgev2.MatrixAPI {
+	if cl == nil || cl.Main == nil || cl.Main.Bridge == nil {
+		return nil
+	}
+	return cl.Main.Bridge.Bot
 }
 
 func mapBackfillItem(writer *aistream.Writer, messageID string, item appserver.TurnItem, reasoningSections *reasoningSectionState) bool {
-	if reasoningSections == nil {
-		reasoningSections = &reasoningSectionState{}
+	if isCodexToolItemType(item.Type) {
+		writeBackfillToolItem(writer, item)
+		return true
 	}
 	switch item.Type {
 	case "agentMessage":
-		if strings.TrimSpace(item.Text) == "" {
+		if firstTrimmedNonEmpty(item.Text) == "" {
 			return false
 		}
 		writer.Text(item.Text)
 	case "contextCompaction":
 		writer.Text(codexCompactionNotice)
 	case "reasoning":
-		reasoning := backfillReasoningTexts(item)
-		if len(reasoning) == 0 {
-			reasoning = backfillRawReasoningTexts(item.Raw)
+		if reasoningSections == nil {
+			reasoningSections = &reasoningSectionState{}
 		}
+		reasoning := backfillReasoningText(item)
 		if len(reasoning) == 0 {
 			return false
 		}
 		for index, text := range reasoning {
 			i := index
-			key := reasoningContentKey(item.ID, "content", &i)
+			key := reasoningContentKey(item.ID, reasoningKindContent, &i)
 			writer.ReasoningDelta(reasoningSections.index(key), text)
 		}
 	case "hookPrompt":
-		if text := hookPromptText(item); text != "" {
+		if text := backfillHookPromptText(item); text != "" {
 			writer.StateDelta(hookPromptStateDelta(item.ID, text))
 		}
 	case "enteredReviewMode", "exitedReviewMode":
-		writer.Text(reviewModeText(item))
+		writer.Text(reviewModeNoticeText(item.Type, item.Review))
 	case "plan":
 		data := backfillItemData(item)
-		writer.Add(planSnapshotActivity(messageID, map[string]any{
-			"explanation": data["text"],
-			"plan":        []any{data},
-		}))
-	case "commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "collabAgentToolCall", "webSearch", "imageView", "imageGeneration":
-		writeBackfillToolItem(writer, item)
+		writer.Add(planItemSnapshotActivity(messageID, data))
 	default:
 		if mapBackfillRawResponseItem(writer, item) {
 			return true
 		}
-		if strings.TrimSpace(item.Text) == "" {
-			return false
-		}
-		writer.Text(item.Text)
+		return mapBackfillItemText(writer, item)
 	}
 	return true
+}
+
+func mapBackfillItemText(writer *aistream.Writer, item appserver.TurnItem) bool {
+	if firstTrimmedNonEmpty(item.Text) == "" {
+		return false
+	}
+	writer.Text(item.Text)
+	return true
+}
+
+func backfillReasoningText(item appserver.TurnItem) []string {
+	var reasoning []string
+	for _, text := range item.Summary {
+		appendNonBlankOriginal(&reasoning, text)
+	}
+	for _, text := range item.ReasoningContent {
+		appendNonBlankOriginal(&reasoning, text)
+	}
+	appendNonBlankOriginal(&reasoning, item.Text)
+	if len(reasoning) != 0 {
+		return reasoning
+	}
+	reasoning = append(reasoning, rawTextItems(item.Raw[reasoningKindSummary])...)
+	return append(reasoning, rawTextItems(item.Raw[reasoningKindContent])...)
+}
+
+func backfillHookPromptText(item appserver.TurnItem) string {
+	var fragments []string
+	for _, fragment := range item.Fragments {
+		appendTrimmedNonEmpty(&fragments, fragment.Text)
+	}
+	if text := strings.Join(fragments, "\n\n"); text != "" {
+		return text
+	}
+	return liveHookPromptText(backfillItemData(item))
 }
 
 func mapBackfillRawResponseItem(writer *aistream.Writer, item appserver.TurnItem) bool {
 	data := backfillItemData(item)
 	switch item.Type {
 	case "message":
-		if role, _ := data["role"].(string); role != agui.RoleAssistant {
+		if firstString(data, "role") != agui.RoleAssistant {
 			return false
 		}
-		text := strings.TrimSpace(rawContentText(data["content"]))
+		text := trimmedRawContentText(data["content"])
 		if text == "" {
 			return false
 		}
 		writer.Text(text)
 	case "function_call", "custom_tool_call", "tool_search_call":
-		callID := rawToolCallID(data)
-		if callID == "" {
-			return false
-		}
-		name := rawToolName(data)
-		input := rawToolInput(data)
-		if !backfillHasToolEvent(writer, callID, agui.EventToolCallStart) {
-			writer.ToolStartWithMetadata(callID, name, 0, nil, codexToolStartMetadata(data))
-		}
-		if text := rawToolInputText(input); text != "" {
-			writer.ToolArgs(callID, text, input)
-		}
-		if !backfillHasToolEvent(writer, callID, agui.EventToolCallEnd) {
-			writer.ToolInputComplete(callID, name, input)
-		}
+		return mapBackfillRawToolCall(writer, data)
 	case "function_call_output", "custom_tool_call_output", "tool_search_output":
-		callID := rawToolCallID(data)
-		if callID == "" {
-			return false
-		}
-		name := rawToolName(data)
-		if !backfillHasToolEvent(writer, callID, agui.EventToolCallStart) {
-			writer.ToolStartWithMetadata(callID, name, 0, nil, codexToolStartMetadata(data))
-		}
-		if output := rawToolResultText(data); output != "" {
-			writer.ToolResult(callID, output, agui.ToolResultStateComplete)
-		}
+		return mapBackfillRawToolCallOutput(writer, data)
 	case "local_shell_call", "web_search_call", "image_generation_call":
-		callID := rawToolCallID(data)
-		if callID == "" {
-			return false
-		}
-		name := rawToolName(data)
-		input := rawToolInput(data)
-		state := toolStateFromStatus(firstString(data, "status"))
-		if !backfillHasToolEvent(writer, callID, agui.EventToolCallStart) {
-			writer.ToolStartWithMetadata(callID, name, 0, nil, codexToolStartMetadata(data))
-		}
-		hasResult := false
-		if output := rawToolResultText(data); output != "" {
-			writer.ToolResult(callID, output, state)
-			hasResult = true
-		}
-		if text := rawToolInputText(input); text != "" {
-			writer.ToolArgs(callID, text, input)
-		}
-		if state != agui.ToolResultStateStreaming && !backfillHasToolEvent(writer, callID, agui.EventToolCallEnd) {
-			if hasResult {
-				writer.ToolInputComplete(callID, name, input)
-			} else {
-				writer.ToolEnd(callID, name, input, map[string]any{"state": state, "status": firstString(data, "status")})
-			}
-		}
+		return mapBackfillRawCompletingToolCall(writer, data)
 	case "context_compaction", "compaction", "compaction_trigger":
 		writer.Text(codexCompactionNotice)
 	default:
 		return false
 	}
 	return true
+}
+
+func mapBackfillRawToolCall(writer *aistream.Writer, data map[string]any) bool {
+	callID, name, input, ok := backfillRawToolCallInput(data)
+	if !ok {
+		return false
+	}
+	ensureBackfillToolStarted(writer, callID, name, data)
+	writeBackfillToolArgs(writer, callID, input)
+	if !backfillHasToolEvent(writer, callID, agui.EventToolCallEnd) {
+		writer.ToolInputComplete(callID, name, input)
+	}
+	return true
+}
+
+func mapBackfillRawToolCallOutput(writer *aistream.Writer, data map[string]any) bool {
+	callID, ok := backfillRawToolCallID(data)
+	if !ok {
+		return false
+	}
+	name := rawToolName(data)
+	ensureBackfillToolStarted(writer, callID, name, data)
+	writeBackfillToolResult(writer, callID, data, agui.ToolResultStateComplete)
+	return true
+}
+
+func mapBackfillRawCompletingToolCall(writer *aistream.Writer, data map[string]any) bool {
+	callID, name, input, ok := backfillRawToolCallInput(data)
+	if !ok {
+		return false
+	}
+	status := firstString(data, "status")
+	state := toolStateFromStatus(status)
+	ensureBackfillToolStarted(writer, callID, name, data)
+	hasResult := writeBackfillToolResult(writer, callID, data, state)
+	writeBackfillToolArgs(writer, callID, input)
+	if state != agui.ToolResultStateStreaming && !backfillHasToolEvent(writer, callID, agui.EventToolCallEnd) {
+		finishBackfillTool(writer, callID, name, input, state, status, hasResult)
+	}
+	return true
+}
+
+func backfillRawToolCallInput(data map[string]any) (callID, name string, input any, ok bool) {
+	callID, ok = backfillRawToolCallID(data)
+	if !ok {
+		return "", "", nil, false
+	}
+	return callID, rawToolName(data), rawToolInput(data), true
+}
+
+func backfillRawToolCallID(data map[string]any) (string, bool) {
+	callID := rawToolCallID(data)
+	return callID, callID != ""
+}
+
+func ensureBackfillToolStarted(writer *aistream.Writer, callID, name string, data map[string]any) {
+	if backfillHasToolEvent(writer, callID, agui.EventToolCallStart) {
+		return
+	}
+	writer.ToolStartWithMetadata(callID, name, 0, nil, codexToolStartMetadata(data))
+}
+
+func writeBackfillToolArgs(writer *aistream.Writer, callID string, input any) {
+	if text := rawToolInputText(input); text != "" {
+		writer.ToolArgs(callID, text, input)
+	}
+}
+
+func writeBackfillToolResult(writer *aistream.Writer, callID string, data map[string]any, state string) bool {
+	output := rawToolResultText(data)
+	return writeBackfillVisibleToolResult(writer, callID, output, state)
+}
+
+func writeBackfillVisibleToolResult(writer *aistream.Writer, callID string, output string, state string) bool {
+	if output == "" {
+		return false
+	}
+	writer.ToolResult(callID, output, state)
+	return true
+}
+
+func finishBackfillTool(writer *aistream.Writer, callID, name string, input any, state, status string, hasResult bool) {
+	if hasResult {
+		writer.ToolInputComplete(callID, name, input)
+		return
+	}
+	writer.ToolEnd(callID, name, input, toolEndResult(state, status))
 }
 
 func backfillHasToolEvent(writer *aistream.Writer, toolCallID string, eventType string) bool {
@@ -343,298 +500,256 @@ func backfillHasToolEvent(writer *aistream.Writer, toolCallID string, eventType 
 
 func writeBackfillToolItem(writer *aistream.Writer, item appserver.TurnItem) {
 	data := backfillItemData(item)
-	name := backfillToolName(item, data)
+	name := codexItem{ID: item.ID, Type: item.Type, Raw: data}.Name()
 	state := codexItemToolState(data)
 	writer.ToolStartWithMetadata(item.ID, name, 0, nil, codexToolStartMetadata(data))
 	input, hasInput := codexItemToolInput(data)
 	if hasInput {
-		if text := rawToolInputText(input); text != "" {
-			writer.ToolArgs(item.ID, text, input)
-		}
+		writeBackfillToolArgs(writer, item.ID, input)
 	}
-	hasResult := false
-	if result := backfillToolResultText(data); result != "" {
-		writer.ToolResult(item.ID, result, state)
-		hasResult = true
+	hasResult := writeBackfillCodexToolResult(writer, item.ID, data, state)
+	if state == agui.ToolResultStateStreaming {
+		return
 	}
-	if state != agui.ToolResultStateStreaming {
-		if result := codexToolCompletionMetadataText(data, state, hasResult); result != "" {
-			writer.ToolResult(item.ID, result, state)
-			hasResult = true
-		}
-		if !hasInput {
-			input = nil
-		}
-		if hasResult {
-			writer.ToolInputComplete(item.ID, name, input)
-		} else {
-			writer.ToolEnd(item.ID, name, input, map[string]any{"state": state, "status": codexItemStatusText(data, state)})
-		}
+	status := codexItemStatusText(data, state)
+	hasResult = writeBackfillToolCompletionMetadata(writer, item.ID, data, state, status, hasResult)
+	if !hasInput {
+		input = nil
 	}
+	finishBackfillTool(writer, item.ID, name, input, state, status, hasResult)
 }
 
-func backfillToolName(item appserver.TurnItem, data map[string]any) string {
-	name := codexItem{ID: item.ID, Type: item.Type, Raw: data}.Name()
-	if strings.TrimSpace(name) != "" {
-		return name
-	}
-	return "codex item"
+func writeBackfillCodexToolResult(writer *aistream.Writer, itemID string, data map[string]any, state string) bool {
+	result := codexToolResultText(data, true)
+	return writeBackfillVisibleToolResult(writer, itemID, result, state)
 }
 
-func backfillToolResultText(data map[string]any) string {
-	return codexToolResultText(data, true)
-}
-
-func completedToolResultText(data map[string]any, alreadyStreamed bool) string {
-	return codexToolResultText(data, !alreadyStreamed)
+func writeBackfillToolCompletionMetadata(writer *aistream.Writer, itemID string, data map[string]any, state, status string, hasResult bool) bool {
+	result := codexToolCompletionMetadataText(data, state, status, hasResult)
+	return writeBackfillVisibleToolResult(writer, itemID, result, state) || hasResult
 }
 
 func codexToolResultText(data map[string]any, includeStreamedFields bool) string {
-	if includeStreamedFields {
-		if text := patchUpdateText(data); text != "" {
-			return text
-		}
+	if !includeStreamedFields {
+		return firstToolResultValueText(data, codexToolResultKeys()...)
 	}
-	keys := []string{"result", "error", "contentItems", "savedPath"}
-	if includeStreamedFields {
-		keys = append([]string{"aggregatedOutput"}, keys...)
+	if text := patchUpdateText(data); text != "" {
+		return text
 	}
-	for _, key := range keys {
-		text := codexToolResultValueText(data[key])
-		if text != "" {
-			return text
-		}
+	if text := codexToolResultValueText(data["aggregatedOutput"]); text != "" {
+		return text
 	}
-	return ""
+	return firstToolResultValueText(data, codexToolResultKeys()...)
+}
+
+func codexToolResultKeys() []string {
+	return []string{"result", "error", "contentItems", "savedPath"}
 }
 
 func codexToolResultValueText(value any) string {
-	if value == nil {
-		return ""
-	}
 	if text, ok := value.(string); ok {
-		if text = strings.TrimSpace(text); text != "" {
-			return text
-		}
-		return ""
+		return firstTrimmedNonEmpty(text)
 	}
 	if typed, ok := value.(map[string]any); ok {
-		if text := strings.TrimSpace(rawContentText(typed)); text != "" && !hasAdditionalToolResultFields(typed, "content", "contentItems", "text", "type", "_meta") {
-			return text
-		}
-		if message, _ := typed["message"].(string); strings.TrimSpace(message) != "" && !hasAdditionalToolResultFields(typed, "message") {
-			return strings.TrimSpace(message)
-		}
-	} else if text := strings.TrimSpace(rawContentText(value)); text != "" {
+		return codexToolResultMapText(typed)
+	} else if text := trimmedRawContentText(value); text != "" {
 		return text
 	}
-	raw, err := json.Marshal(value)
-	if err == nil && len(raw) > 0 && string(raw) != "null" {
-		return string(raw)
-	}
-	return ""
+	return jsonToolResultValueText(value)
 }
 
-func codexToolCompletionMetadataText(data map[string]any, state string, hasVisibleResult bool) string {
-	if !hasVisibleResult || state == agui.ToolResultStateStreaming {
-		return ""
+func codexToolResultMapText(value map[string]any) string {
+	if text := trimmedRawContentText(value); isCompleteToolResultText(value, text, contentToolResultIgnoredFields()...) {
+		return text
 	}
-	status := codexItemStatusText(data, state)
-	meta := map[string]any{
-		"state":  state,
-		"status": status,
+	if message := firstString(value, "message"); isCompleteToolResultText(value, message, messageToolResultIgnoredFields()...) {
+		return message
 	}
-	extra := false
-	for _, key := range []string{"exitCode", "durationMs", "success"} {
-		if value, ok := data[key]; ok && hasNonEmptyValue(value) {
-			meta[key] = value
-			extra = true
-		}
-	}
-	if !extra {
-		return ""
-	}
-	raw, err := json.Marshal(meta)
-	if err != nil || len(raw) == 0 {
+	return jsonToolResultValueText(value)
+}
+
+func jsonToolResultValueText(value any) string {
+	raw, err := json.Marshal(value)
+	if err != nil || len(raw) == 0 || string(raw) == "null" {
 		return ""
 	}
 	return string(raw)
 }
 
-func hasAdditionalToolResultFields(value map[string]any, ignored ...string) bool {
-	ignore := map[string]bool{}
-	for _, key := range ignored {
-		ignore[key] = true
-	}
-	for key, field := range value {
-		if ignore[key] || !hasNonEmptyValue(field) {
-			continue
+func contentToolResultIgnoredFields() []string {
+	return []string{"content", "contentItems", "text", "type", "_meta"}
+}
+
+func messageToolResultIgnoredFields() []string {
+	return []string{"message"}
+}
+
+func isCompleteToolResultText(value map[string]any, text string, ignored ...string) bool {
+	return text != "" && !hasAdditionalToolResultFields(value, ignored...)
+}
+
+func firstToolResultValueText(data map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if text := codexToolResultValueText(data[key]); text != "" {
+			return text
 		}
-		return true
+	}
+	return ""
+}
+
+func codexToolCompletionMetadataText(data map[string]any, state, status string, hasVisibleResult bool) string {
+	if !shouldEmitToolCompletionMetadata(state, hasVisibleResult) {
+		return ""
+	}
+	meta := codexToolCompletionMetadata(data, state, status)
+	if !hasToolCompletionMetadataExtras(meta) {
+		return ""
+	}
+	raw, err := json.Marshal(meta)
+	if err != nil {
+		return ""
+	}
+	return string(raw)
+}
+
+func shouldEmitToolCompletionMetadata(state string, hasVisibleResult bool) bool {
+	return hasVisibleResult && state != agui.ToolResultStateStreaming
+}
+
+func codexToolCompletionMetadata(data map[string]any, state, status string) map[string]any {
+	meta := toolEndResult(state, status)
+	copyNonEmptyMapFields(meta, data, codexToolCompletionMetadataFields()...)
+	return meta
+}
+
+func codexToolCompletionMetadataFields() []string {
+	return []string{"exitCode", "durationMs", "success"}
+}
+
+func hasToolCompletionMetadataExtras(meta map[string]any) bool {
+	return len(meta) > 2
+}
+
+func hasAdditionalToolResultFields(value map[string]any, ignored ...string) bool {
+	for key, field := range value {
+		if isIncludedNonEmptyField(key, field, ignored) {
+			return true
+		}
 	}
 	return false
 }
 
-func isBackfilledThreadItemType(itemType string) bool {
-	switch itemType {
-	case "userMessage",
-		"agentMessage",
-		"contextCompaction",
-		"reasoning",
-		"hookPrompt",
-		"enteredReviewMode",
-		"exitedReviewMode",
-		"plan",
-		"commandExecution",
-		"fileChange",
-		"mcpToolCall",
-		"dynamicToolCall",
-		"collabAgentToolCall",
-		"webSearch",
-		"imageView",
-		"imageGeneration":
-		return true
-	default:
-		return false
-	}
-}
-
 func backfillItemData(item appserver.TurnItem) map[string]any {
-	data := map[string]any{}
-	for key, value := range item.Raw {
-		data[key] = value
-	}
-	if _, ok := data["id"]; !ok && item.ID != "" {
-		data["id"] = item.ID
-	}
-	if _, ok := data["clientId"]; !ok && item.ClientID != "" {
-		data["clientId"] = item.ClientID
-	}
-	if _, ok := data["type"]; !ok && item.Type != "" {
-		data["type"] = item.Type
-	}
-	if _, ok := data["phase"]; !ok && item.Phase != "" {
-		data["phase"] = item.Phase
-	}
-	if _, ok := data["text"]; !ok && item.Text != "" {
-		data["text"] = item.Text
-	}
-	if _, ok := data["summary"]; !ok && len(item.Summary) > 0 {
-		data["summary"] = item.Summary
-	}
-	if _, ok := data["content"]; !ok && len(item.ReasoningContent) > 0 {
-		data["content"] = item.ReasoningContent
-	}
-	if _, ok := data["fragments"]; !ok && len(item.Fragments) > 0 {
-		data["fragments"] = item.Fragments
-	}
-	if _, ok := data["review"]; !ok && item.Review != "" {
-		data["review"] = item.Review
-	}
-	if _, ok := data["command"]; !ok && item.Command != "" {
-		data["command"] = item.Command
-	}
-	if _, ok := data["aggregatedOutput"]; !ok && item.AggregatedOutput != "" {
-		data["aggregatedOutput"] = item.AggregatedOutput
-	}
-	if _, ok := data["arguments"]; !ok && len(item.Arguments) > 0 {
-		data["arguments"] = item.Arguments
-	}
+	data := copyStateMap(item.Raw)
+	enrichBackfillItemData(data, item)
 	return data
 }
 
-func backfillUserMessageID(item appserver.TurnItem, turnID string) networkid.MessageID {
-	if item.ClientID != "" {
-		return networkid.MessageID("user:" + item.ClientID)
+func enrichBackfillItemData(data map[string]any, item appserver.TurnItem) {
+	for _, field := range backfillItemFields(item) {
+		setMissingMapField(data, field)
 	}
-	return networkid.MessageID("codex:" + turnID + ":" + item.ID)
+}
+
+type backfillItemField struct {
+	key     string
+	value   any
+	include bool
+}
+
+func backfillItemFields(item appserver.TurnItem) []backfillItemField {
+	return []backfillItemField{
+		{"id", item.ID, item.ID != ""},
+		{"clientId", item.ClientID, item.ClientID != ""},
+		{"type", item.Type, item.Type != ""},
+		{"phase", item.Phase, item.Phase != ""},
+		{"text", item.Text, item.Text != ""},
+		{"review", item.Review, item.Review != ""},
+		{"command", item.Command, item.Command != ""},
+		{"aggregatedOutput", item.AggregatedOutput, item.AggregatedOutput != ""},
+		{"summary", item.Summary, len(item.Summary) > 0},
+		{"content", item.ReasoningContent, len(item.ReasoningContent) > 0},
+		{"fragments", item.Fragments, len(item.Fragments) > 0},
+		{"arguments", item.Arguments, len(item.Arguments) > 0},
+	}
+}
+
+func setMissingMapField(data map[string]any, field backfillItemField) {
+	if !field.include {
+		return
+	}
+	if _, exists := data[field.key]; exists {
+		return
+	}
+	data[field.key] = field.value
+}
+
+func appendNonBlankOriginal(values *[]string, text string) {
+	if firstTrimmedNonEmpty(text) != "" {
+		*values = append(*values, text)
+	}
 }
 
 func backfillUserBody(item appserver.TurnItem) string {
 	var parts []string
 	for _, part := range item.Content {
-		switch part.Type {
-		case "text":
-			if strings.TrimSpace(part.Text) == "" {
-				continue
-			}
-			parts = append(parts, part.Text)
-		case "image":
-			parts = append(parts, strings.TrimSpace("Image: "+part.URL))
-		case "localImage":
-			parts = append(parts, strings.TrimSpace("Local image: "+part.Path))
-		case "skill":
-			parts = append(parts, strings.TrimSpace("Skill: "+strings.TrimSpace(part.Name+" "+part.Path)))
-		case "mention":
-			parts = append(parts, strings.TrimSpace("Mention: "+strings.TrimSpace(part.Name+" "+part.Path)))
-		}
+		appendNonBlankOriginal(&parts, backfillUserPartText(part))
 	}
 	return strings.Join(parts, "\n\n")
 }
 
-func backfillReasoningTexts(item appserver.TurnItem) []string {
-	var texts []string
-	for _, text := range item.Summary {
-		if strings.TrimSpace(text) != "" {
-			texts = append(texts, text)
+func backfillUserPartText(part appserver.InputPart) string {
+	switch part.Type {
+	case "text":
+		if firstTrimmedNonEmpty(part.Text) != "" {
+			return part.Text
 		}
+	case "image":
+		return firstTrimmedNonEmpty("Image: " + part.URL)
+	case "localImage":
+		return firstTrimmedNonEmpty("Local image: " + part.Path)
+	case "skill":
+		return firstTrimmedNonEmpty("Skill: " + trimmedSpaceJoin(part.Name, part.Path))
+	case "mention":
+		return firstTrimmedNonEmpty("Mention: " + trimmedSpaceJoin(part.Name, part.Path))
 	}
-	for _, text := range item.ReasoningContent {
-		if strings.TrimSpace(text) != "" {
-			texts = append(texts, text)
-		}
-	}
-	if strings.TrimSpace(item.Text) != "" {
-		texts = append(texts, item.Text)
-	}
-	return texts
+	return ""
 }
 
-func backfillRawReasoningTexts(data map[string]any) []string {
-	var texts []string
-	texts = append(texts, rawTextItems(data["summary"])...)
-	texts = append(texts, rawTextItems(data["content"])...)
-	return texts
+func backfillUserMessageBody(item appserver.TurnItem) string {
+	if !isBackfillUserMessage(item) {
+		return ""
+	}
+	return backfillUserBody(item)
 }
 
-func hookPromptText(item appserver.TurnItem) string {
-	var fragments []string
-	for _, fragment := range item.Fragments {
-		if strings.TrimSpace(fragment.Text) != "" {
-			fragments = append(fragments, strings.TrimSpace(fragment.Text))
-		}
-	}
-	if len(fragments) > 0 {
-		return strings.Join(fragments, "\n\n")
-	}
-	return liveHookPromptText(backfillItemData(item))
+func isBackfillUserMessage(item appserver.TurnItem) bool {
+	return item.Type == "userMessage"
 }
 
-func reviewModeText(item appserver.TurnItem) string {
-	text := codexEnteredReviewNotice
-	if item.Type == "exitedReviewMode" {
-		text = codexExitedReviewNotice
+func appendTrimmedNonEmpty(values *[]string, text string) {
+	if text := firstTrimmedNonEmpty(text); text != "" {
+		*values = append(*values, text)
 	}
-	if strings.TrimSpace(item.Review) != "" {
-		text += "\n\n" + strings.TrimSpace(item.Review)
-	}
-	return text
 }
 
 func backfillTurnTime(thread appserver.Thread, turn appserver.Turn) time.Time {
-	if turn.StartedAt > 0 {
-		return time.Unix(turn.StartedAt, 0)
-	}
-	if thread.CreatedAt > 0 {
-		return time.Unix(thread.CreatedAt, 0)
+	if ts := firstPositiveInt64(turn.StartedAt, thread.CreatedAt); ts > 0 {
+		return time.Unix(ts, 0)
 	}
 	return time.Now()
 }
 
 func nextBackfillStreamOrder(previous int64, ts time.Time) int64 {
 	order := ts.UnixNano()
-	if order <= previous {
-		return previous + 1
+	return max(order, previous+1)
+}
+
+func firstPositiveInt64(values ...int64) int64 {
+	for _, value := range values {
+		if value > 0 {
+			return value
+		}
 	}
-	return order
+	return 0
 }

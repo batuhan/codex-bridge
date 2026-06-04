@@ -16,24 +16,69 @@ import (
 	"maunium.net/go/mautrix/event/cmdschema"
 )
 
-func TestApprovalResponseFromCommand(t *testing.T) {
-	response, ok := approvalResponseFromCommand("approval-1", "approve")
+func TestParseApprovalCommandResponse(t *testing.T) {
+	response, ok := parseApprovalCommandResponse("approval-1 approve")
 	if !ok || !response.Approved || response.Always || response.ID != "approval-1" {
 		t.Fatalf("unexpected approve response: %#v ok=%v", response, ok)
 	}
 
-	response, ok = approvalResponseFromCommand("approval-1", "always")
+	response, ok = parseApprovalCommandResponse("approval-1 always")
 	if !ok || !response.Approved || !response.Always {
 		t.Fatalf("unexpected always response: %#v ok=%v", response, ok)
 	}
 
-	response, ok = approvalResponseFromCommand("approval-1", "deny")
+	response, ok = parseApprovalCommandResponse("approval-1 deny")
 	if !ok || response.Approved || response.Reason != "denied" {
 		t.Fatalf("unexpected deny response: %#v ok=%v", response, ok)
 	}
 
-	if _, ok = approvalResponseFromCommand("approval-1", "maybe"); ok {
+	if _, ok = parseApprovalCommandResponse("approval-1 maybe"); ok {
 		t.Fatal("unexpected success for invalid choice")
+	}
+}
+
+func TestResolveRawApprovalChoice(t *testing.T) {
+	choice, ok := resolveRawApprovalChoice("")
+	if !ok || choice.Key != "approve" {
+		t.Fatalf("blank approval choice should default to approve: %#v ok=%v", choice, ok)
+	}
+	choice, ok = resolveRawApprovalChoice("always")
+	if !ok || choice.Key != "always_approve" {
+		t.Fatalf("unexpected always approval choice: %#v ok=%v", choice, ok)
+	}
+	if _, ok = resolveRawApprovalChoice("maybe"); ok {
+		t.Fatal("invalid approval choice should not resolve")
+	}
+}
+
+func TestApprovalCommandStateIncludesOptionalDetails(t *testing.T) {
+	got := approvalCommandState(aistream.ToolApprovalResponse{
+		ID:       "approval-1",
+		Approved: true,
+		Always:   true,
+		Reason:   "trusted",
+	})
+	want := map[string]any{
+		"id":       "approval-1",
+		"approved": true,
+		"choice":   "always",
+		"always":   true,
+		"reason":   "trusted",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected approval command state:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestSplitCommandArg(t *testing.T) {
+	head, tail, ok := splitCommandArg("input-1   /tmp/project ")
+	if !ok || head != "input-1" || tail != "/tmp/project" {
+		t.Fatalf("unexpected split command arg: head=%q tail=%q ok=%v", head, tail, ok)
+	}
+
+	head, tail, ok = splitCommandArg("input-1")
+	if ok || head != "input-1" || tail != "" {
+		t.Fatalf("single command arg should have no tail: head=%q tail=%q ok=%v", head, tail, ok)
 	}
 }
 
@@ -51,7 +96,8 @@ func TestResolveApprovalCommandDefaultsToApprove(t *testing.T) {
 	}
 	responseCh := run.pending["approval-1"].Response
 
-	if !run.resolveApprovalCommand("approval-1") {
+	response, ok := parseApprovalCommandResponse("approval-1")
+	if !ok || !run.resolvePendingResponse(response) {
 		t.Fatal("approval command without explicit choice did not resolve")
 	}
 
@@ -80,10 +126,16 @@ func TestDynamicToolCallServerRequestStreamsUnsupportedToolCall(t *testing.T) {
 	if !ok || got["success"] != false {
 		t.Fatalf("unexpected dynamic tool response: %#v", response)
 	}
+	contentItems, ok := got["contentItems"].([]map[string]any)
+	if !ok || len(contentItems) != 1 || contentItems[0]["type"] != "inputText" || contentItems[0]["text"] != unsupportedDynamicToolCallText {
+		t.Fatalf("unexpected dynamic tool content items: %#v", got["contentItems"])
+	}
 	if !hasToolCallStartName(run.run.Events, "call-1", "browser: open") {
 		t.Fatalf("dynamic tool request did not start visible AG-UI tool call: %#v", run.run.Events)
 	}
-	if !hasToolStartMetadataContaining(run.run.Events, "call-1", `"request":"item/tool/call"`) {
+	if !hasToolStartMetadataContaining(run.run.Events, "call-1", `"request":"item/tool/call"`) ||
+		!hasToolStartMetadataContaining(run.run.Events, "call-1", `"callId":"call-1"`) ||
+		!hasToolStartMetadataContaining(run.run.Events, "call-1", `"name":"browser: open"`) {
 		t.Fatalf("dynamic tool request did not sync tool start metadata: %#v", run.run.Events)
 	}
 	if !hasToolArgsContaining(run.run.Events, "call-1", `"url":"https://example.com"`) || !hasToolArgsContaining(run.run.Events, "call-1", `"namespace":"browser"`) {
@@ -153,30 +205,28 @@ func TestParseCodexCommand(t *testing.T) {
 			ok:   true,
 		},
 		{
-			name: "structured stop alias",
+			name: "structured stop",
 			content: &event.MessageEventContent{MSC4391BotCommand: &event.MSC4391BotCommandInput{
-				Command: "abort",
+				Command: "stop",
 			}},
 			want: codexCommand{name: "stop"},
 			ok:   true,
 		},
 		{
-			name:    "stop alias",
+			name:    "slash stop",
 			content: &event.MessageEventContent{Body: "/stop"},
 			want:    codexCommand{name: "stop"},
 			ok:      true,
 		},
 		{
-			name:    "abort alias",
+			name:    "abort is not a command",
 			content: &event.MessageEventContent{Body: "/abort"},
-			want:    codexCommand{name: "stop"},
-			ok:      true,
+			ok:      false,
 		},
 		{
-			name:    "interrupt alias",
+			name:    "interrupt is not a command",
 			content: &event.MessageEventContent{Body: "/interrupt"},
-			want:    codexCommand{name: "stop"},
-			ok:      true,
+			ok:      false,
 		},
 		{
 			name:    "normal message",
@@ -194,10 +244,8 @@ func TestParseCodexCommand(t *testing.T) {
 	}
 }
 
-func TestParseCodexCommandMessageFromRawBeeperCommand(t *testing.T) {
-	msg := testMatrixMessage("thread-1", "")
-	msg.Content = &event.MessageEventContent{MsgType: matrixCommandMsgType}
-	msg.Event.Content.Raw = map[string]any{
+func TestCodexCommandFromRawBeeperCommand(t *testing.T) {
+	raw := map[string]any{
 		"msgtype": string(matrixCommandMsgType),
 		"command": "approve",
 		"arguments": map[string]any{
@@ -205,9 +253,90 @@ func TestParseCodexCommandMessageFromRawBeeperCommand(t *testing.T) {
 			"choice": "always",
 		},
 	}
-	command, ok := parseCodexCommandMessage(msg)
+	command, ok := codexCommandFromRawContent(raw)
 	if !ok || command != (codexCommand{name: "approve", arg: "approval-1 always"}) {
 		t.Fatalf("unexpected raw command: ok=%v command=%#v", ok, command)
+	}
+}
+
+func TestCodexCommandFromRawBeeperCommandStringArguments(t *testing.T) {
+	raw := map[string]any{
+		"msgtype":   string(matrixCommandMsgType),
+		"command":   "answer",
+		"arguments": "input-1 hello world",
+	}
+	command, ok := codexCommandFromRawContent(raw)
+	if !ok || command != (codexCommand{name: "answer", arg: "input-1 hello world"}) {
+		t.Fatalf("unexpected raw command: ok=%v command=%#v", ok, command)
+	}
+}
+
+func TestNestedRawCodexCommand(t *testing.T) {
+	raw := map[string]any{"org.matrix.msc4391.command": map[string]any{"command": "approve"}}
+	if got := nestedRawCodexCommand(raw); got["command"] != "approve" {
+		t.Fatalf("unexpected nested raw command: %#v", got)
+	}
+	if got := nestedRawCodexCommand(map[string]any{}); len(got) != 0 {
+		t.Fatalf("missing nested raw command should stay empty, got %#v", got)
+	}
+}
+
+func TestRawCommandArgumentsUsesFirstNonNilAlias(t *testing.T) {
+	raw := map[string]any{
+		"arguments": nil,
+		"args":      "input-1 from args",
+		"parameters": map[string]any{
+			"id": "input-1",
+		},
+	}
+	if got := rawCommandArguments(raw); got != "input-1 from args" {
+		t.Fatalf("unexpected raw command arguments: %#v", got)
+	}
+}
+
+func TestCodexCommandFromRawArgValue(t *testing.T) {
+	raw := map[string]any{"id": "approval-1", "choice": "deny"}
+	if got := codexCommandFromRawArgValue("approve", "approval-1 always", raw); got != (codexCommand{name: "approve", arg: "approval-1 always"}) {
+		t.Fatalf("unexpected string raw arg command: %#v", got)
+	}
+	if got := codexCommandFromRawArgValue("approve", nil, raw); got != (codexCommand{name: "approve", arg: "approval-1 deny"}) {
+		t.Fatalf("unexpected fallback raw arg command: %#v", got)
+	}
+}
+
+func TestCodexRequestArgCommand(t *testing.T) {
+	got := codexRequestArgCommand("approve", map[string]any{"id": "approval-1", "choice": "deny"}, "approval_id", "choice")
+	if got != (codexCommand{name: "approve", arg: "approval-1 deny"}) {
+		t.Fatalf("unexpected primary ID request command: %#v", got)
+	}
+	got = codexRequestArgCommand("answer", map[string]any{"request_id": "input-1", "answer": "hello"}, "request_id", "answer")
+	if got != (codexCommand{name: "answer", arg: "input-1 hello"}) {
+		t.Fatalf("unexpected legacy ID request command: %#v", got)
+	}
+}
+
+func TestCodexCommandFromRawBeeperCommandLegacyIDAliases(t *testing.T) {
+	approve, ok := codexCommandFromRawContent(map[string]any{
+		"msgtype": string(matrixCommandMsgType),
+		"command": "approve",
+		"args": map[string]any{
+			"approval_id": "approval-1",
+			"choice":      "deny",
+		},
+	})
+	if !ok || approve != (codexCommand{name: "approve", arg: "approval-1 deny"}) {
+		t.Fatalf("unexpected legacy approve command: ok=%v command=%#v", ok, approve)
+	}
+	answer, ok := codexCommandFromRawContent(map[string]any{
+		"msgtype": string(matrixCommandMsgType),
+		"command": "answer",
+		"args": map[string]any{
+			"request_id": "input-1",
+			"answer":     "hello world",
+		},
+	})
+	if !ok || answer != (codexCommand{name: "answer", arg: "input-1 hello world"}) {
+		t.Fatalf("unexpected legacy answer command: ok=%v command=%#v", ok, answer)
 	}
 }
 
@@ -227,26 +356,26 @@ func TestCodexCommandDescriptionsAreValid(t *testing.T) {
 			t.Fatalf("missing command description %q", want)
 		}
 	}
-	if keys := commandParamKeys(seen["approve"]); !reflect.DeepEqual(keys, []string{"id", "choice"}) {
-		t.Fatalf("approve command parameters changed: %#v", keys)
+	approveKeys := make([]string, 0, len(seen["approve"].Parameters))
+	for _, param := range seen["approve"].Parameters {
+		approveKeys = append(approveKeys, param.Key)
+	}
+	if !reflect.DeepEqual(approveKeys, []string{"id", "choice"}) {
+		t.Fatalf("approve command parameters changed: %#v", approveKeys)
 	}
 	if !seen["approve"].Parameters[1].Optional {
 		t.Fatal("approve choice should stay optional so clients can send a one-tap approval")
 	}
-	if keys := commandParamKeys(seen["answer"]); !reflect.DeepEqual(keys, []string{"id", "answer"}) || seen["answer"].TailParam != "answer" {
-		t.Fatalf("answer command parameters changed: keys=%#v tail=%q", keys, seen["answer"].TailParam)
+	answerKeys := make([]string, 0, len(seen["answer"].Parameters))
+	for _, param := range seen["answer"].Parameters {
+		answerKeys = append(answerKeys, param.Key)
 	}
-	if !reflect.DeepEqual(seen["stop"].Aliases, []string{"abort", "interrupt"}) {
-		t.Fatalf("stop command aliases changed: %#v", seen["stop"].Aliases)
+	if !reflect.DeepEqual(answerKeys, []string{"id", "answer"}) || seen["answer"].TailParam != "answer" {
+		t.Fatalf("answer command parameters changed: keys=%#v tail=%q", answerKeys, seen["answer"].TailParam)
 	}
-}
-
-func commandParamKeys(command *cmdschema.EventContent) []string {
-	keys := make([]string, 0, len(command.Parameters))
-	for _, param := range command.Parameters {
-		keys = append(keys, param.Key)
+	if len(seen["stop"].Aliases) != 0 {
+		t.Fatalf("stop command should not advertise aliases: %#v", seen["stop"].Aliases)
 	}
-	return keys
 }
 
 func TestDirectServerRequestErrors(t *testing.T) {
@@ -261,6 +390,14 @@ func TestDirectServerRequestErrors(t *testing.T) {
 	code, message, ok = directServerRequestError("attestation/generate")
 	if !ok || code == 0 || !strings.Contains(message, "attestation tokens") {
 		t.Fatalf("unexpected attestation direct error: code=%d message=%q ok=%v", code, message, ok)
+	}
+}
+
+func TestServerRequestErrorMetadata(t *testing.T) {
+	got := serverRequestErrorMetadata("item/tool/call")
+	want := map[string]any{"method": "item/tool/call"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected server request error metadata:\n got: %#v\nwant: %#v", got, want)
 	}
 }
 
@@ -281,7 +418,7 @@ func TestCommandHandledResponseUsesTypedMetadata(t *testing.T) {
 	if !ok || meta.Role != "command" || meta.ThreadID != "thread-1" || meta.StreamStatus != "approvals" {
 		t.Fatalf("unexpected command metadata: %#v", resp.DB.Metadata)
 	}
-	if resp.StreamOrder != matrixEventTime(msg.Event).UnixNano() {
+	if resp.StreamOrder != time.UnixMilli(msg.Event.Timestamp).UnixNano() {
 		t.Fatalf("unexpected command stream order: %d", resp.StreamOrder)
 	}
 }
@@ -453,8 +590,15 @@ func TestHandleMatrixMessageResolvesStructuredPendingCommands(t *testing.T) {
 	if !hasCodexRunStateDelta(run.run.Events, "command/answer", "id", "input-1") {
 		t.Fatalf("structured answer command was not synced as AG-UI client state: %#v", run.run.Events)
 	}
-	if hasCodexRunStatePayloadText(run.run.Events, "command/answer", "/tmp/project") {
-		t.Fatalf("answer client request state should not duplicate answer text: %#v", run.run.Events)
+	for _, event := range run.run.Events {
+		if event.Type() != agui.EventStateDelta {
+			continue
+		}
+		delta, _ := event.Get("delta").(map[string]any)
+		codexRun, _ := delta["codexRun"].(map[string]any)
+		if strings.Contains(anyString(codexRun["command/answer"]), "/tmp/project") {
+			t.Fatalf("answer client request state should not duplicate answer text: %#v", run.run.Events)
+		}
 	}
 }
 
@@ -490,6 +634,14 @@ func TestPendingRequestsText(t *testing.T) {
 	}
 }
 
+func TestPendingRequestIntroLines(t *testing.T) {
+	got := pendingRequestIntroLines("request-1", "Approve command?")
+	want := []string{"", "### request-1", "Approve command?"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected pending request intro:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
 func TestPendingRequestsTextIncludesMCPElicitationURL(t *testing.T) {
 	run := &activeRun{pending: map[string]*pendingServerRequest{
 		"elicit-1": {
@@ -521,7 +673,10 @@ func TestCommandNoticeRunUsesBeeperStreamFinal(t *testing.T) {
 	if run.ThreadID != "thread-1" || run.MessageID != "message-1" {
 		t.Fatalf("unexpected notice run IDs: %#v", run)
 	}
-	content, extra := matrixFinalContent(run)
+	content, extra, err := matrixFinalContent(context.Background(), nil, nil, run)
+	if err != nil {
+		t.Fatal(err)
+	}
 	assertCodexProfile(t, content)
 	ai, ok := extra[aistream.BeeperAIKey].(aistream.BeeperAI)
 	if !ok {
@@ -571,24 +726,44 @@ func TestApprovalPromptReferencesAnchorEvent(t *testing.T) {
 }
 
 func TestCodexApprovalResponseMapping(t *testing.T) {
-	approved := aistream.ToolApprovalResponse{ID: "a", Approved: true}
-	always := aistream.ToolApprovalResponse{ID: "a", Approved: true, Always: true}
-	denied := aistream.ToolApprovalResponse{ID: "a", Approved: false}
-
-	command := &pendingServerRequest{Method: "item/commandExecution/requestApproval"}
-	if got := codexApprovalResponse(command, approved).(map[string]any)["decision"]; got != "accept" {
-		t.Fatalf("unexpected command approve decision: %v", got)
+	tests := []struct {
+		name     string
+		method   string
+		response aistream.ToolApprovalResponse
+		want     string
+	}{
+		{
+			name:     "command approve",
+			method:   "item/commandExecution/requestApproval",
+			response: aistream.ToolApprovalResponse{ID: "a", Approved: true},
+			want:     "accept",
+		},
+		{
+			name:     "command always",
+			method:   "item/commandExecution/requestApproval",
+			response: aistream.ToolApprovalResponse{ID: "a", Approved: true, Always: true},
+			want:     "acceptForSession",
+		},
+		{
+			name:     "command deny",
+			method:   "item/commandExecution/requestApproval",
+			response: aistream.ToolApprovalResponse{ID: "a", Approved: false},
+			want:     "decline",
+		},
+		{
+			name:     "legacy command always",
+			method:   "execCommandApproval",
+			response: aistream.ToolApprovalResponse{ID: "a", Approved: true, Always: true},
+			want:     "approved_for_session",
+		},
 	}
-	if got := codexApprovalResponse(command, always).(map[string]any)["decision"]; got != "acceptForSession" {
-		t.Fatalf("unexpected command always decision: %v", got)
-	}
-	if got := codexApprovalResponse(command, denied).(map[string]any)["decision"]; got != "decline" {
-		t.Fatalf("unexpected command deny decision: %v", got)
-	}
-
-	legacy := &pendingServerRequest{Method: "execCommandApproval"}
-	if got := codexApprovalResponse(legacy, always).(map[string]any)["decision"]; got != "approved_for_session" {
-		t.Fatalf("unexpected legacy always decision: %v", got)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			pending := &pendingServerRequest{Method: tc.method}
+			if got := codexApprovalResponse(pending, tc.response).(map[string]any)["decision"]; got != tc.want {
+				t.Fatalf("unexpected decision: got %v, want %v", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -607,6 +782,16 @@ func TestPermissionApprovalResponseMapping(t *testing.T) {
 	want = map[string]any{"permissions": map[string]any{}, "scope": "turn"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected denied permissions response:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestRequestedApprovalPermissions(t *testing.T) {
+	got, ok := requestedApprovalPermissions(map[string]any{"permissions": map[string]any{"network": true}})
+	if !ok || !reflect.DeepEqual(got, map[string]any{"network": true}) {
+		t.Fatalf("unexpected requested permissions: %#v ok=%v", got, ok)
+	}
+	if got, ok := requestedApprovalPermissions(map[string]any{}); ok || got != nil {
+		t.Fatalf("missing permissions should not match: %#v ok=%v", got, ok)
 	}
 }
 
@@ -651,6 +836,103 @@ func TestAnswerResponse(t *testing.T) {
 	}
 }
 
+func TestNamedAnswerValuesDefaultsEmptyQuestionIDs(t *testing.T) {
+	got, err := namedAnswerValues(nil, "plain answer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]string{defaultAnswerQuestionID: "plain answer"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected default answer values:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestSingleAnswerID(t *testing.T) {
+	if got := singleAnswerID([]string{"path"}); got != "path" {
+		t.Fatalf("unexpected single answer ID: %q", got)
+	}
+	if got := singleAnswerID(nil); got != defaultAnswerQuestionID {
+		t.Fatalf("unexpected default answer ID: %q", got)
+	}
+}
+
+func TestHasAnswerAssignments(t *testing.T) {
+	if !hasAnswerAssignments("name=bridge") {
+		t.Fatal("expected assignment syntax to be detected")
+	}
+	if hasAnswerAssignments("plain answer") {
+		t.Fatal("plain answer should not be treated as assignment syntax")
+	}
+}
+
+func TestAnswerKeyEnd(t *testing.T) {
+	if got := answerKeyEnd("name=bridge", 0); got != len("name") {
+		t.Fatalf("unexpected key end before equals: %d", got)
+	}
+	if got := answerKeyEnd("name bridge", 0); got != len("name") {
+		t.Fatalf("unexpected key end before space: %d", got)
+	}
+}
+
+func TestInvalidAnswerKeyRange(t *testing.T) {
+	if !invalidAnswerKeyRange("=value", 0, 0) {
+		t.Fatal("empty key range before equals should be invalid")
+	}
+	if !invalidAnswerKeyRange("name", 0, len("name")) {
+		t.Fatal("missing equals should be an invalid answer key range")
+	}
+	if invalidAnswerKeyRange("name=value", 0, len("name")) {
+		t.Fatal("valid answer key range should not be invalid")
+	}
+}
+
+func TestIsQuotedAnswerValue(t *testing.T) {
+	if !isQuotedAnswerValue('"') || !isQuotedAnswerValue('\'') {
+		t.Fatal("single and double quotes should start quoted answer values")
+	}
+	if isQuotedAnswerValue('a') {
+		t.Fatal("plain text should not start a quoted answer value")
+	}
+}
+
+func TestUnquotedAnswerValueEnd(t *testing.T) {
+	if got := unquotedAnswerValueEnd("bridge", 0); got != len("bridge") {
+		t.Fatalf("unexpected end for full unquoted value: %d", got)
+	}
+	if got := unquotedAnswerValueEnd("name=value next=answer", len("name=")); got != len("name=value") {
+		t.Fatalf("unexpected end before next assignment: %d", got)
+	}
+}
+
+func TestQuotedAnswerByte(t *testing.T) {
+	if ch, next := quotedAnswerByte(`\"`, '\\', 1); ch != '"' || next != 2 {
+		t.Fatalf("unexpected escaped quoted byte: ch=%q next=%d", ch, next)
+	}
+	if ch, next := quotedAnswerByte("abc", 'a', 1); ch != 'a' || next != 1 {
+		t.Fatalf("unexpected plain quoted byte: ch=%q next=%d", ch, next)
+	}
+}
+
+func TestInvalidQuotedAnswerSuffix(t *testing.T) {
+	if invalidQuotedAnswerSuffix(`name="bridge"`, len(`name="bridge"`)) {
+		t.Fatal("quoted value at end should not have an invalid suffix")
+	}
+	if invalidQuotedAnswerSuffix(`name="bridge" cwd=/tmp`, len(`name="bridge"`)) {
+		t.Fatal("quoted value followed by space should not have an invalid suffix")
+	}
+	if !invalidQuotedAnswerSuffix(`name="bridge"cwd=/tmp`, len(`name="bridge"`)) {
+		t.Fatal("quoted value followed by non-space should have an invalid suffix")
+	}
+}
+
+func TestMCPDefaultAnswerResponse(t *testing.T) {
+	got := mcpDefaultAnswerResponse("plain answer")
+	want := map[string]any{defaultAnswerQuestionID: "plain answer"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("unexpected MCP default answer response:\n got: %#v\nwant: %#v", got, want)
+	}
+}
+
 func TestAnswerResolutionClearsStreamInterruptWithoutChangingCodexResponse(t *testing.T) {
 	run := newActiveRun(&Client{}, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
 	answer := map[string]any{"path": map[string]any{"answers": []string{"/tmp/project"}}}
@@ -687,7 +969,14 @@ func TestAnswerResolutionClearsStreamInterruptWithoutChangingCodexResponse(t *te
 	if run.run.Status.State != "streaming" {
 		t.Fatalf("answer should resume stream, got status %#v", run.run.Status)
 	}
-	if !hasToolCallResult(run.run.Events, "input-1") {
+	foundToolResult := false
+	for _, event := range run.run.Events {
+		if event.Type() == agui.EventToolCallResult && event.Get("toolCallId") == "input-1" {
+			foundToolResult = true
+			break
+		}
+	}
+	if !foundToolResult {
 		t.Fatalf("answer did not publish tool result event: %#v", run.run.Events)
 	}
 	select {
@@ -700,6 +989,38 @@ func TestAnswerResolutionClearsStreamInterruptWithoutChangingCodexResponse(t *te
 	}
 }
 
+func TestPendingApprovalResponseWrapsAnswerMetadata(t *testing.T) {
+	answer := map[string]any{"path": map[string]any{"answers": []string{"/tmp/project"}}}
+	pending := &pendingServerRequest{
+		ID:     "input-1",
+		Method: "item/tool/requestUserInput",
+	}
+
+	response, ok := pendingApprovalResponse(pending, answer)
+	if !ok || response.ID != "input-1" || !response.Approved || response.Choice != "answer" {
+		t.Fatalf("unexpected pending approval response: %#v ok=%v", response, ok)
+	}
+	wantMeta := map[string]any{"method": "item/tool/requestUserInput", "response": answer}
+	if !reflect.DeepEqual(response.Metadata, wantMeta) {
+		t.Fatalf("unexpected pending response metadata:\n got: %#v\nwant: %#v", response.Metadata, wantMeta)
+	}
+}
+
+func TestWrappedPendingApprovalResponse(t *testing.T) {
+	answer := map[string]any{"path": map[string]any{"answers": []string{"/tmp/project"}}}
+	pending := &pendingServerRequest{ID: "input-1", Method: "item/tool/requestUserInput"}
+	response, ok := wrappedPendingApprovalResponse(pending, answer)
+	if !ok || response.ID != "input-1" || !response.Approved || response.Choice != "answer" {
+		t.Fatalf("unexpected wrapped pending approval response: %#v ok=%v", response, ok)
+	}
+	if response.RespondedAt == "" {
+		t.Fatal("wrapped pending approval response should include response time")
+	}
+	if _, ok := wrappedPendingApprovalResponse(nil, answer); ok {
+		t.Fatal("nil pending request should not produce a wrapped response")
+	}
+}
+
 func TestUserInputApprovalResponseBecomesEmptyAnswers(t *testing.T) {
 	pending := &pendingServerRequest{Method: "item/tool/requestUserInput"}
 	got := codexInputResponse(pending, aistream.ToolApprovalResponse{ID: "input-1", Approved: false}).(map[string]any)
@@ -707,29 +1028,6 @@ func TestUserInputApprovalResponseBecomesEmptyAnswers(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected denied input response:\n got: %#v\nwant: %#v", got, want)
 	}
-}
-
-func hasToolCallResult(events []agui.Event, toolCallID string) bool {
-	for _, event := range events {
-		if event.Type() == agui.EventToolCallResult && event.Get("toolCallId") == toolCallID {
-			return true
-		}
-	}
-	return false
-}
-
-func hasCodexRunStatePayloadText(events []agui.Event, method, text string) bool {
-	for _, event := range events {
-		if event.Type() != agui.EventStateDelta {
-			continue
-		}
-		delta, _ := event.Get("delta").(map[string]any)
-		run, _ := delta["codexRun"].(map[string]any)
-		if strings.Contains(anyString(run[method]), text) {
-			return true
-		}
-	}
-	return false
 }
 
 func TestNewApprovalRequestUsesCodexIDs(t *testing.T) {
@@ -757,9 +1055,41 @@ func TestNewApprovalRequestUsesCodexIDs(t *testing.T) {
 	}
 }
 
+func TestCommandApprovalTitle(t *testing.T) {
+	if got := commandApprovalTitle(map[string]any{"command": "git status"}); got != "Approve command: git status" {
+		t.Fatalf("unexpected command approval title: %q", got)
+	}
+	if got := commandApprovalTitle(map[string]any{}); got != "Approve command?" {
+		t.Fatalf("unexpected fallback command approval title: %q", got)
+	}
+}
+
+func TestApprovalPlanSkipsEmptyLabelValues(t *testing.T) {
+	if got := approvalPlan("item/commandExecution/requestApproval", map[string]any{}); got != "item/commandExecution/requestApproval" {
+		t.Fatalf("unexpected empty approval plan: %q", got)
+	}
+	got := approvalPlan("item/commandExecution/requestApproval", map[string]any{
+		"command": "git status",
+		"reason":  "needs shell",
+	})
+	want := "Command: git status\nReason: needs shell"
+	if got != want {
+		t.Fatalf("unexpected approval plan:\n got: %q\nwant: %q", got, want)
+	}
+}
+
+func TestJoinLinesOrFallback(t *testing.T) {
+	if got := joinLinesOrFallback(nil, "fallback"); got != "fallback" {
+		t.Fatalf("unexpected fallback line join: %q", got)
+	}
+	if got := joinLinesOrFallback([]string{"one", "two"}, "fallback"); got != "one\ntwo" {
+		t.Fatalf("unexpected joined lines: %q", got)
+	}
+}
+
 func TestNewApprovalRequestFallsBackToRPCRequestID(t *testing.T) {
 	run := &activeRun{turnID: "turn-1"}
-	pending, request, err := run.newApprovalRequest("execCommandApproval", "rpc-approval", []byte(`{
+	pending, request, err := run.newApprovalRequest("item/commandExecution/requestApproval", "rpc-approval", []byte(`{
 		"threadId": "thread-1",
 		"turnId": "turn-1",
 		"command": "git status"
@@ -808,6 +1138,105 @@ func TestNewInputRequestUsesRPCIDForMCPFormElicitation(t *testing.T) {
 	}
 }
 
+func TestMCPElicitationFieldName(t *testing.T) {
+	if got := mcpElicitationFieldName("repo (required) - Repository"); got != "repo" {
+		t.Fatalf("unexpected MCP field name: %q", got)
+	}
+	if got := mcpElicitationFieldName(""); got != "" {
+		t.Fatalf("empty MCP field descriptor should stay empty, got %q", got)
+	}
+}
+
+func TestUseMCPFieldQuestionIDs(t *testing.T) {
+	if !useMCPFieldQuestionIDs("mcpServer/elicitation/request", nil) {
+		t.Fatal("MCP elicitation without explicit questions should use schema field IDs")
+	}
+	if useMCPFieldQuestionIDs("mcpServer/elicitation/request", []string{"repo"}) {
+		t.Fatal("explicit question IDs should win over schema field IDs")
+	}
+	if useMCPFieldQuestionIDs("item/tool/requestUserInput", nil) {
+		t.Fatal("non-MCP input should not use schema field IDs")
+	}
+}
+
+func TestMCPElicitationProperties(t *testing.T) {
+	schema := map[string]any{"properties": map[string]any{"repo": map[string]any{"title": "Repository"}}}
+	if got := mcpElicitationProperties(schema); len(got) != 1 || got["repo"] == nil {
+		t.Fatalf("unexpected MCP elicitation properties: %#v", got)
+	}
+	if got := mcpElicitationProperties(map[string]any{}); len(got) != 0 {
+		t.Fatalf("missing properties should return empty map, got %#v", got)
+	}
+}
+
+func TestMCPElicitationRequiredSuffix(t *testing.T) {
+	if got := mcpElicitationRequiredSuffix("repo", []string{"branch", "repo"}); got != " (required)" {
+		t.Fatalf("unexpected required suffix: %q", got)
+	}
+	if got := mcpElicitationRequiredSuffix("owner", []string{"branch", "repo"}); got != "" {
+		t.Fatalf("unexpected optional suffix: %q", got)
+	}
+}
+
+func TestMCPElicitationDetailSuffix(t *testing.T) {
+	if got := mcpElicitationDetailSuffix(map[string]any{"title": "Repository", "description": "Repo name"}); got != " - Repository" {
+		t.Fatalf("unexpected title detail suffix: %q", got)
+	}
+	if got := mcpElicitationDetailSuffix(map[string]any{"description": "Branch name"}); got != " - Branch name" {
+		t.Fatalf("unexpected description detail suffix: %q", got)
+	}
+	if got := mcpElicitationDetailSuffix(map[string]any{"title": "  "}); got != "" {
+		t.Fatalf("blank detail suffix should stay empty, got %q", got)
+	}
+}
+
+func TestMCPElicitationFieldsLine(t *testing.T) {
+	input := map[string]any{"requestedSchema": map[string]any{
+		"properties": map[string]any{
+			"repo":   map[string]any{"title": "Repository"},
+			"branch": map[string]any{"description": "Branch name"},
+		},
+		"required": []any{"repo"},
+	}}
+	want := "Fields: branch - Branch name, repo (required) - Repository"
+	if got := mcpElicitationFieldsLine(input); got != want {
+		t.Fatalf("unexpected MCP fields line:\n got: %q\nwant: %q", got, want)
+	}
+	if got := mcpElicitationFieldsLine(map[string]any{}); got != "" {
+		t.Fatalf("missing MCP fields should not produce a line, got %q", got)
+	}
+}
+
+func TestInputQuestionLine(t *testing.T) {
+	if got := inputQuestionLine(map[string]any{"header": "Path", "question": "Where is the repo?"}); got != "Path Where is the repo?" {
+		t.Fatalf("unexpected input question line: %q", got)
+	}
+	if got := inputQuestionLine(map[string]any{"question": "Where is the repo?"}); got != "Where is the repo?" {
+		t.Fatalf("unexpected question-only line: %q", got)
+	}
+	if got := inputQuestionLine(map[string]any{"header": "  "}); got != "" {
+		t.Fatalf("blank question line should stay empty, got %q", got)
+	}
+}
+
+func TestInputPlanText(t *testing.T) {
+	reply := "Reply with `/answer input-1 <answer>`."
+	if got := inputPlanText("Pick a branch", reply); got != "Pick a branch\n\n"+reply {
+		t.Fatalf("unexpected described input plan: %q", got)
+	}
+	if got := inputPlanText("  ", reply); got != reply {
+		t.Fatalf("blank description should not prefix input plan: %q", got)
+	}
+}
+
+func TestCommandPartsStringPreservesStringParts(t *testing.T) {
+	got := commandPartsString([]any{"git", " commit", 3, "--message=fix"})
+	want := "git  commit --message=fix"
+	if got != want {
+		t.Fatalf("unexpected command parts string:\n got: %q\nwant: %q", got, want)
+	}
+}
+
 func TestMCPFormAnswerUsesSchemaFields(t *testing.T) {
 	pending := &pendingServerRequest{
 		Method:      "mcpServer/elicitation/request",
@@ -850,11 +1279,25 @@ func TestMCPFormAnswerUsesSchemaFields(t *testing.T) {
 func TestMCPFormCodexInputResponseWrapsContent(t *testing.T) {
 	pending := &pendingServerRequest{Method: "mcpServer/elicitation/request"}
 	content := map[string]string{"repo": "codex-bridge"}
+	direct := mcpElicitationResponse(mcpElicitationActionAccept, content)
+	if direct["action"] != "accept" || !reflect.DeepEqual(direct["content"], content) || direct["_meta"] != nil {
+		t.Fatalf("unexpected direct MCP elicitation response: %#v", direct)
+	}
+
 	got := codexInputResponse(pending, content).(map[string]any)
 	if got["action"] != "accept" || !reflect.DeepEqual(got["content"], content) {
 		t.Fatalf("unexpected MCP elicitation response: %#v", got)
 	}
+	got = codexInputResponse(pending, aistream.ToolApprovalResponse{Approved: true}).(map[string]any)
+	if got["action"] != "accept" || got["content"] != nil {
+		t.Fatalf("unexpected accepted MCP elicitation approval response: %#v", got)
+	}
+	got = codexInputResponse(pending, aistream.ToolApprovalResponse{Approved: false}).(map[string]any)
+	if got["action"] != "decline" || got["content"] != nil {
+		t.Fatalf("unexpected declined MCP elicitation approval response: %#v", got)
+	}
 }
+
 func TestNewInputRequestIncludesMCPURLElicitationContext(t *testing.T) {
 	run := &activeRun{turnID: "turn-1"}
 	pending, request, err := run.newInputRequest("mcpServer/elicitation/request", "rpc-elicit-1", []byte(`{

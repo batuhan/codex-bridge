@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"os"
 	"regexp"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -547,6 +546,12 @@ func TestArchivedThreadDetection(t *testing.T) {
 	if isArchivedThread(appserver.Thread{Raw: map[string]any{"archived": false}}) {
 		t.Fatal("non-archived thread was treated as archived")
 	}
+	if !isDetachedThread(appserver.Thread{Raw: map[string]any{"closed": true}}) {
+		t.Fatal("closed thread should be detached")
+	}
+	if isDetachedThread(appserver.Thread{Raw: map[string]any{"archived": false, "closed": false}}) {
+		t.Fatal("active thread was treated as detached")
+	}
 }
 
 func TestBackfillSortsTurnsOldestFirst(t *testing.T) {
@@ -624,6 +629,13 @@ func TestPaginateBackfillMessagesUsesAnchor(t *testing.T) {
 	})
 	if ids := backfillMessageIDs(backward.Messages); strings.Join(ids, ",") != "m2,m3" {
 		t.Fatalf("unexpected backward anchor page IDs: %v", ids)
+	}
+	backward = paginateBackfillMessages(messages, bridgev2.FetchMessagesParams{
+		Count:         2,
+		AnchorMessage: &database.Message{ID: "missing", Timestamp: messages[3].Timestamp},
+	})
+	if ids := backfillMessageIDs(backward.Messages); strings.Join(ids, ",") != "m2,m3" {
+		t.Fatalf("unexpected timestamp fallback anchor page IDs: %v", ids)
 	}
 	forward := paginateBackfillMessages(messages, bridgev2.FetchMessagesParams{
 		Forward:       true,
@@ -748,6 +760,17 @@ func TestBackfillUserBodyIncludesNonTextInputs(t *testing.T) {
 	}
 }
 
+func TestBackfillUserBodySkipsBlankParts(t *testing.T) {
+	body := backfillUserBody(appserver.TurnItem{Content: []appserver.InputPart{
+		{Type: "text", Text: "  "},
+		{Type: "unknown", Text: "ignored"},
+		{Type: "text", Text: "keep me"},
+	}})
+	if body != "keep me" {
+		t.Fatalf("unexpected backfill user body: %q", body)
+	}
+}
+
 func TestBackfillItemDataPreservesRawFields(t *testing.T) {
 	var item appserver.TurnItem
 	if err := json.Unmarshal([]byte(`{
@@ -769,8 +792,75 @@ func TestBackfillItemDataPreservesRawFields(t *testing.T) {
 	}
 }
 
+func TestBackfillItemDataEnrichesGeneratedFieldsWithoutOverwritingRaw(t *testing.T) {
+	item := appserver.TurnItem{
+		ID:               "item-1",
+		Type:             "reasoning",
+		Text:             "generated text",
+		Summary:          []string{"summary"},
+		ReasoningContent: []string{"content"},
+		Fragments:        []appserver.PromptFragment{{Text: "fragment"}},
+		Arguments:        json.RawMessage(`{"cwd":"/tmp/project"}`),
+		Raw: map[string]any{
+			"text": "raw text",
+		},
+	}
+
+	data := backfillItemData(item)
+	if data["text"] != "raw text" {
+		t.Fatalf("raw text should not be overwritten: %#v", data)
+	}
+	if data["id"] != "item-1" || data["type"] != "reasoning" {
+		t.Fatalf("generated scalar fields were not filled: %#v", data)
+	}
+	if got, _ := data["summary"].([]string); len(got) != 1 || got[0] != "summary" {
+		t.Fatalf("generated summary was not filled: %#v", data)
+	}
+	if got, _ := data["content"].([]string); len(got) != 1 || got[0] != "content" {
+		t.Fatalf("generated reasoning content was not filled: %#v", data)
+	}
+	if got, _ := data["fragments"].([]appserver.PromptFragment); len(got) != 1 || got[0].Text != "fragment" {
+		t.Fatalf("generated fragments were not filled: %#v", data)
+	}
+	if got, _ := data["arguments"].(json.RawMessage); string(got) != `{"cwd":"/tmp/project"}` {
+		t.Fatalf("generated arguments were not filled: %#v", data)
+	}
+}
+
+func isBackfilledThreadItemType(itemType string) bool {
+	switch itemType {
+	case "userMessage",
+		"agentMessage",
+		"contextCompaction",
+		"reasoning",
+		"hookPrompt",
+		"enteredReviewMode",
+		"exitedReviewMode",
+		"plan",
+		"commandExecution",
+		"fileChange",
+		"mcpToolCall",
+		"dynamicToolCall",
+		"collabAgentToolCall",
+		"webSearch",
+		"imageView",
+		"imageGeneration":
+		return true
+	default:
+		return false
+	}
+}
+
 func TestGeneratedCodexThreadItemsAreBackfilled(t *testing.T) {
-	for _, itemType := range generatedCodexThreadItemTypes(t) {
+	raw, err := os.ReadFile(codexGeneratedSchemaPath)
+	if err != nil {
+		t.Fatalf("read generated Codex schema: %v", err)
+	}
+	itemTypes := sortedUniqueMatches(regexp.MustCompile(`(?s)type:\s*Annotated\[\s*Literal\["([^"]+)"\].{0,300}?ThreadItemType`), raw)
+	if len(itemTypes) == 0 {
+		t.Fatal("generated Codex schema did not contain thread item types")
+	}
+	for _, itemType := range itemTypes {
 		if !isBackfilledThreadItemType(itemType) {
 			t.Fatalf("generated Codex thread item %q is not covered by backfill", itemType)
 		}
@@ -793,11 +883,11 @@ func TestBackfillToolNameAndResultUseRichItemData(t *testing.T) {
 		"tool":   "list_issues",
 		"result": map[string]any{"count": float64(2)},
 	}
-	name := backfillToolName(appserver.TurnItem{ID: "mcp-1", Type: "mcpToolCall"}, data)
+	name := (codexItem{ID: "mcp-1", Type: "mcpToolCall", Raw: data}).Name()
 	if name != "github list_issues" {
 		t.Fatalf("unexpected tool name: %q", name)
 	}
-	result := backfillToolResultText(data)
+	result := codexToolResultText(data, true)
 	if !strings.Contains(result, `"count":2`) {
 		t.Fatalf("unexpected tool result: %q", result)
 	}
@@ -807,17 +897,80 @@ func TestBackfillToolNameAndResultUseRichItemData(t *testing.T) {
 		"structuredContent": map[string]any{"count": float64(2)},
 		"_meta":             nil,
 	}
-	result = backfillToolResultText(data)
+	result = codexToolResultText(data, true)
 	if !strings.Contains(result, "found two issues") || !strings.Contains(result, `"structuredContent":{"count":2}`) {
 		t.Fatalf("unexpected MCP structured content result: %q", result)
 	}
 
 	data = map[string]any{"type": "dynamicToolCall", "tool": "custom_tool", "contentItems": []any{map[string]any{"text": "done"}}}
-	if name := backfillToolName(appserver.TurnItem{Type: "dynamicToolCall"}, data); name != "custom_tool" {
+	if name := (codexItem{Type: "dynamicToolCall", Raw: data}).Name(); name != "custom_tool" {
 		t.Fatalf("unexpected dynamic tool name: %q", name)
 	}
-	if result := backfillToolResultText(data); !strings.Contains(result, "done") {
+	if result := codexToolResultText(data, true); !strings.Contains(result, "done") {
 		t.Fatalf("unexpected dynamic tool result: %q", result)
+	}
+}
+
+func TestCodexToolResultMapText(t *testing.T) {
+	contentOnly := map[string]any{"content": []any{map[string]any{"text": "found"}}}
+	if got := codexToolResultMapText(contentOnly); got != "found" {
+		t.Fatalf("unexpected content-only result: %q", got)
+	}
+
+	structured := map[string]any{
+		"content":           []any{map[string]any{"text": "found"}},
+		"structuredContent": map[string]any{"count": float64(2)},
+	}
+	got := codexToolResultMapText(structured)
+	if !strings.Contains(got, "found") || !strings.Contains(got, `"structuredContent":{"count":2}`) {
+		t.Fatalf("unexpected structured result: %q", got)
+	}
+}
+
+func TestIsCompleteToolResultText(t *testing.T) {
+	if !isCompleteToolResultText(map[string]any{"message": "done"}, "done", messageToolResultIgnoredFields()...) {
+		t.Fatal("message-only result text should be complete")
+	}
+	if isCompleteToolResultText(map[string]any{"message": "done", "count": float64(2)}, "done", messageToolResultIgnoredFields()...) {
+		t.Fatal("result text with additional fields should not be complete")
+	}
+	if isCompleteToolResultText(map[string]any{"message": "done"}, "", messageToolResultIgnoredFields()...) {
+		t.Fatal("empty result text should not be complete")
+	}
+}
+
+func TestJSONToolResultValueText(t *testing.T) {
+	if got := jsonToolResultValueText(nil); got != "" {
+		t.Fatalf("nil tool result should be suppressed, got %q", got)
+	}
+	got := jsonToolResultValueText(map[string]any{"count": float64(2)})
+	if got != `{"count":2}` {
+		t.Fatalf("unexpected JSON tool result: %q", got)
+	}
+}
+
+func TestShouldEmitToolCompletionMetadata(t *testing.T) {
+	if shouldEmitToolCompletionMetadata(agui.ToolResultStateComplete, false) {
+		t.Fatal("metadata should not emit before a visible result")
+	}
+	if shouldEmitToolCompletionMetadata(agui.ToolResultStateStreaming, true) {
+		t.Fatal("metadata should not emit for streaming tool state")
+	}
+	if !shouldEmitToolCompletionMetadata(agui.ToolResultStateComplete, true) {
+		t.Fatal("metadata should emit for completed tool with visible result")
+	}
+}
+
+func TestHasToolCompletionMetadataExtras(t *testing.T) {
+	if hasToolCompletionMetadataExtras(toolStatusResult(agui.ToolResultStateComplete, "completed")) {
+		t.Fatal("state/status-only metadata should not count as extra")
+	}
+	if !hasToolCompletionMetadataExtras(map[string]any{
+		"state":    agui.ToolResultStateComplete,
+		"status":   "completed",
+		"exitCode": float64(0),
+	}) {
+		t.Fatal("terminal metadata field should count as extra")
 	}
 }
 
@@ -1421,6 +1574,11 @@ func TestBackfillToolInputPreservesGeneratedMetadata(t *testing.T) {
 			t.Fatalf("expected backfilled collab input to preserve %s, got %#v", want, run.Events)
 		}
 	}
+	for _, want := range []string{`"subagents"`, `"threadId":"thread-2"`, `"portalId":"subagent:thread-2"`, `"readOnly":true`, `"status":"running"`} {
+		if !hasToolStartMetadataContaining(run.Events, "collab-1", want) {
+			t.Fatalf("expected backfilled collab metadata to preserve subagent %s, got %#v", want, run.Events)
+		}
+	}
 	for _, want := range []string{`"type":"commandExecution"`, `"status":"completed"`, `"processId":"proc-1"`} {
 		if !hasToolStartMetadataContaining(run.Events, "cmd-1", want) {
 			t.Fatalf("expected backfilled command start metadata to preserve %s, got %#v", want, run.Events)
@@ -1431,6 +1589,64 @@ func TestBackfillToolInputPreservesGeneratedMetadata(t *testing.T) {
 			t.Fatalf("backfilled command start metadata should not include output field %s: %#v", unwanted, run.Events)
 		}
 	}
+}
+
+func TestBackfillMaterializesReadOnlySubagentPortal(t *testing.T) {
+	ctx := context.Background()
+	oldPortalEventBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	t.Cleanup(func() { bridgev2.PortalEventBuffer = oldPortalEventBuffer })
+
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := login.Client.(*Client)
+	parentKey := projectPortalKey("/tmp/project", login.ID)
+	parentPortal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: parentKey,
+		MXID:      "!parent:example.com",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{Kind: portalKindProject, ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}}
+	connector.rememberThreadRoom("thread-1", client, parentKey, "/tmp/project", nil)
+
+	_, err = client.projectBackfillMessages(ctx, parentPortal, appserver.Thread{
+		ID:  "thread-1",
+		Cwd: "/tmp/project",
+		Turns: []appserver.Turn{{
+			ID: "turn-1",
+			Items: []appserver.TurnItem{{
+				ID:   "collab-1",
+				Type: "collabAgentToolCall",
+				Raw: map[string]any{
+					"id":                "collab-1",
+					"type":              "collabAgentToolCall",
+					"receiverThreadIds": []any{"thread-2"},
+					"agentsStates":      map[string]any{"thread-2": map[string]any{"status": "running"}},
+					"status":            "completed",
+				},
+			}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key := subagentPortalKey("thread-2", login.ID)
+	requireEventually(t, time.Second, func() bool {
+		portal, err := br.GetExistingPortalByKey(ctx, key)
+		if err != nil || portal == nil {
+			return false
+		}
+		meta := portalMetadata(portal.Metadata)
+		return portal.MXID != "" && meta.Kind == portalKindSubagent && meta.ThreadID == "thread-2" && meta.ParentThreadID == "thread-1" && meta.Cwd == "/tmp/project" && meta.ReadOnly
+	})
 }
 
 func TestBackfillFileChangeIncludesPatchDiff(t *testing.T) {
@@ -1530,42 +1746,13 @@ func TestBackfillHookPromptMapsRawTextState(t *testing.T) {
 	}
 }
 
-func generatedCodexThreadItemTypes(t *testing.T) []string {
-	t.Helper()
-	raw, err := os.ReadFile(codexGeneratedSchemaPath)
-	if err != nil {
-		t.Fatalf("read generated Codex schema: %v", err)
-	}
-	re := regexp.MustCompile(`(?s)type:\s*Annotated\[\s*Literal\["([^"]+)"\].{0,300}?ThreadItemType`)
-	seen := map[string]bool{}
-	for _, match := range re.FindAllSubmatch(raw, -1) {
-		seen[string(match[1])] = true
-	}
-	types := make([]string, 0, len(seen))
-	for itemType := range seen {
-		types = append(types, itemType)
-	}
-	sort.Strings(types)
-	return types
-}
-
 func generatedTypeScriptThreadItemTypes(t *testing.T) []string {
 	t.Helper()
 	raw, err := os.ReadFile(codexTypeScriptV2ThreadItemPath)
 	if err != nil {
 		t.Fatalf("read generated Codex TypeScript thread item schema: %v", err)
 	}
-	re := regexp.MustCompile(`"type":\s*"([^"]+)"`)
-	seen := map[string]bool{}
-	for _, match := range re.FindAllSubmatch(raw, -1) {
-		seen[string(match[1])] = true
-	}
-	types := make([]string, 0, len(seen))
-	for itemType := range seen {
-		types = append(types, itemType)
-	}
-	sort.Strings(types)
-	return types
+	return sortedUniqueMatches(regexp.MustCompile(`"type":\s*"([^"]+)"`), raw)
 }
 
 func aiMessageHasText(ai aistream.BeeperAI, text string) bool {

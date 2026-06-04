@@ -110,10 +110,29 @@ func TestGlobalCodexNotificationsBroadcastBridgeState(t *testing.T) {
 				t.Fatal(err)
 			}
 			login.Client = &Client{Main: connector, UserLogin: login, loggedIn: true}
-			drainBridgeStates(matrix.bridgeStateCh)
+			for drained := false; !drained; {
+				select {
+				case <-matrix.bridgeStateCh:
+				default:
+					drained = true
+				}
+			}
 
 			connector.handleGlobalNotification(tt.method, []byte(tt.params))
-			state := waitBridgeStateForNotification(t, matrix.bridgeStateCh, tt.method)
+			var state status.BridgeState
+			deadline := time.After(time.Second)
+			for received := false; !received; {
+				select {
+				case candidate := <-matrix.bridgeStateCh:
+					codex, _ := candidate.Info["codex"].(map[string]any)
+					if codex["lastNotification"] == tt.method {
+						state = candidate
+						received = true
+					}
+				case <-deadline:
+					t.Fatalf("timed out waiting for bridge state for %s", tt.method)
+				}
+			}
 			if state.StateEvent != tt.wantState {
 				t.Fatalf("state event = %s, want %s: %#v", state.StateEvent, tt.wantState, state)
 			}
@@ -135,20 +154,19 @@ func TestGlobalCodexNotificationsBroadcastBridgeState(t *testing.T) {
 	}
 }
 
-func waitBridgeStateForNotification(t *testing.T, ch <-chan status.BridgeState, method string) status.BridgeState {
-	t.Helper()
-	deadline := time.After(time.Second)
-	for {
-		select {
-		case state := <-ch:
-			codex, _ := state.Info["codex"].(map[string]any)
-			if codex["lastNotification"] == method {
-				return state
-			}
-		case <-deadline:
-			t.Fatalf("timed out waiting for bridge state for %s", method)
-			return status.BridgeState{}
-		}
+func TestWindowsWorldWritablePathsPrefersSamplePaths(t *testing.T) {
+	got := windowsWorldWritablePaths(map[string]any{
+		"samplePaths": []any{"C:\\tmp"},
+		"paths":       []any{"D:\\work"},
+	})
+	if strings.Join(got, ",") != "C:\\tmp" {
+		t.Fatalf("unexpected sampled paths: %#v", got)
+	}
+	got = windowsWorldWritablePaths(map[string]any{
+		"paths": []any{"D:\\work"},
+	})
+	if strings.Join(got, ",") != "D:\\work" {
+		t.Fatalf("unexpected fallback paths: %#v", got)
 	}
 }
 
@@ -182,37 +200,12 @@ func handledAsGlobalNotification(method string) bool {
 	}
 }
 
-func drainBridgeStates(ch <-chan status.BridgeState) {
-	for {
-		select {
-		case <-ch:
-		default:
-			return
-		}
-	}
-}
-
-func waitBridgeState(t *testing.T, ch <-chan status.BridgeState) status.BridgeState {
-	t.Helper()
-	select {
-	case state := <-ch:
-		return state
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for bridge state")
-		return status.BridgeState{}
-	}
-}
-
-func TestCurrentCodexServerNotificationsAreClassified(t *testing.T) {
-	for _, method := range generatedTypeScriptMethods(t, codexTypeScriptNotificationPath) {
-		if !isThreadNotification(method) && !isGlobalNotification(method) {
-			t.Fatalf("Codex server notification %q is not classified", method)
-		}
-	}
-}
-
 func TestGeneratedCodexServerNotificationsAreClassified(t *testing.T) {
-	methods := generatedCodexNotificationMethods(t)
+	raw, err := os.ReadFile(codexGeneratedSchemaPath)
+	if err != nil {
+		t.Fatalf("read generated Codex schema: %v", err)
+	}
+	methods := sortedUniqueMatches(regexp.MustCompile(`(?s)method:\s*Annotated\[\s*Literal\["([^"]+)"\][^\]]*NotificationMethod`), raw)
 	if len(methods) == 0 {
 		t.Fatal("generated Codex schema did not contain notification methods")
 	}
@@ -240,14 +233,43 @@ func TestCurrentCodexServerNotificationsMatchGeneratedSchemas(t *testing.T) {
 }
 
 func TestTypeScriptV2NotificationFilesAreInServerNotificationUnion(t *testing.T) {
-	files := generatedTypeScriptV2NotificationTypes(t)
-	imports := generatedTypeScriptV2NotificationImports(t)
-	params := generatedTypeScriptNotificationParamTypes(t)
+	entries, err := os.ReadDir(codexTypeScriptV2NotificationDir)
+	if err != nil {
+		t.Fatalf("read generated Codex TypeScript v2 schema dir: %v", err)
+	}
+	var files []string
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, "Notification.ts") {
+			continue
+		}
+		files = append(files, strings.TrimSuffix(name, ".ts"))
+	}
+	sort.Strings(files)
+	raw, err := os.ReadFile(codexTypeScriptNotificationPath)
+	if err != nil {
+		t.Fatalf("read generated Codex TypeScript schema: %v", err)
+	}
+	imports := sortedUniqueMatches(regexp.MustCompile(`import type \{ ([A-Za-z0-9_]+Notification) \} from "\./v2/[A-Za-z0-9_]+Notification";`), raw)
+	params := sortedUniqueMatches(regexp.MustCompile(`"params":\s*([A-Za-z0-9_]+Notification)`), raw)
 	if len(files) == 0 {
 		t.Fatal("TypeScript v2 schema did not contain notification files")
 	}
 	assertStringSetEqual(t, imports, files, "TypeScript v2 notification files")
-	assertStringSetContains(t, params, imports, "TypeScript server notification union")
+	paramsSet := map[string]bool{}
+	for _, param := range params {
+		paramsSet[param] = true
+	}
+	var missing []string
+	for _, name := range imports {
+		if !paramsSet[name] {
+			missing = append(missing, name)
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Fatalf("TypeScript server notification union is missing values: %v", missing)
+	}
 }
 
 func TestTypeScriptCodexThreadNotificationsHaveDispatchLane(t *testing.T) {
@@ -313,14 +335,14 @@ func TestTypeScriptActiveRunNotificationsHaveMappingDecision(t *testing.T) {
 		if !isActiveRunNotification(method) {
 			continue
 		}
-		if !isActiveRunNotificationMapped(method) && !isActiveRunNotificationIntentionallyInvisible(method) {
-			t.Fatalf("active-run notification %q has no visible AG-UI mapping or explicit invisible decision", method)
+		if !isActiveRunNotificationMapped(method) {
+			t.Fatalf("active-run notification %q has no visible AG-UI mapping", method)
 		}
 	}
 }
 
 func TestActiveRunMappedNotificationsAreExplicitlyHandled(t *testing.T) {
-	handled := sourceSwitchCases(t, "stream.go", "func (r *activeRun) handle(", "func (r *activeRun) finishTurnLocked")
+	handled := sourceSwitchCases(t, "stream.go", "func (r *activeRun) handle(", "func finishCodexTurn")
 	for _, method := range generatedTypeScriptMethods(t, codexTypeScriptNotificationPath) {
 		if !isActiveRunNotificationMapped(method) {
 			continue
@@ -332,7 +354,7 @@ func TestActiveRunMappedNotificationsAreExplicitlyHandled(t *testing.T) {
 }
 
 func TestGlobalNotificationsAreExplicitlyHandled(t *testing.T) {
-	handled := sourceSwitchCases(t, "connector.go", "func (c *Connector) handleGlobalNotification(", "func mcpOAuthLoginMessage")
+	handled := sourceSwitchCases(t, "connector.go", "func (c *Connector) handleGlobalNotification(", "func (c *Connector) updateGlobalState")
 	for _, method := range generatedTypeScriptMethods(t, codexTypeScriptNotificationPath) {
 		if !handledAsGlobalNotification(method) {
 			continue
@@ -343,35 +365,36 @@ func TestGlobalNotificationsAreExplicitlyHandled(t *testing.T) {
 	}
 }
 
-func TestTypeScriptRawResponseCompactionItemsAreMapped(t *testing.T) {
-	itemTypes := generatedTypeScriptResponseItemTypes(t)
-	for _, itemType := range itemTypes {
-		if strings.Contains(itemType, "compaction") && !isRawResponseCompactionItem(itemType) {
-			t.Fatalf("raw response compaction item %q is not mapped to a user-visible notice", itemType)
-		}
-	}
-}
-
 func TestTypeScriptRawResponseItemTypesHaveMappingDecision(t *testing.T) {
-	itemTypes := generatedTypeScriptResponseItemTypes(t)
+	raw, err := os.ReadFile(codexTypeScriptResponseItemPath)
+	if err != nil {
+		t.Fatalf("read generated Codex TypeScript response item schema: %v", err)
+	}
+	itemTypes := sortedUniqueMatches(regexp.MustCompile(`"type":\s*"([^"]+)"`), raw)
 	if len(itemTypes) == 0 {
 		t.Fatal("TypeScript Codex schema did not contain response item types")
 	}
 	for _, itemType := range itemTypes {
-		if !isRawResponseItemMapped(itemType) && !isRawResponseItemIntentionallyInvisible(itemType) {
-			t.Fatalf("raw response item type %q has no visible mapping or explicit invisible decision", itemType)
+		mapped := false
+		switch itemType {
+		case "message",
+			"reasoning",
+			"function_call",
+			"custom_tool_call",
+			"tool_search_call",
+			"function_call_output",
+			"custom_tool_call_output",
+			"tool_search_output",
+			"local_shell_call",
+			"web_search_call",
+			"image_generation_call",
+			"compaction",
+			"compaction_trigger",
+			"context_compaction":
+			mapped = true
 		}
-	}
-}
-
-func TestTypeScriptRawResponseItemTypesHaveBackfillMappingDecision(t *testing.T) {
-	itemTypes := generatedTypeScriptResponseItemTypes(t)
-	if len(itemTypes) == 0 {
-		t.Fatal("TypeScript Codex schema did not contain response item types")
-	}
-	for _, itemType := range itemTypes {
-		if !isRawResponseItemBackfilled(itemType) && !isRawResponseItemIntentionallyInvisible(itemType) {
-			t.Fatalf("raw response item type %q has no backfill mapping or explicit invisible decision", itemType)
+		if !mapped && itemType != "other" {
+			t.Fatalf("raw response item type %q has no visible mapping", itemType)
 		}
 	}
 }
@@ -412,23 +435,21 @@ func TestCombinedJSONCodexServerRequestsAreHandled(t *testing.T) {
 	}
 }
 
-func generatedCodexNotificationMethods(t *testing.T) []string {
-	t.Helper()
-	raw, err := os.ReadFile(codexGeneratedSchemaPath)
-	if err != nil {
-		t.Fatalf("read generated Codex schema: %v", err)
+func isHandledCodexServerRequest(method string) bool {
+	if _, _, ok := directServerRequestError(method); ok {
+		return true
 	}
-	re := regexp.MustCompile(`(?s)method:\s*Annotated\[\s*Literal\["([^"]+)"\][^\]]*NotificationMethod`)
-	seen := map[string]bool{}
-	for _, match := range re.FindAllSubmatch(raw, -1) {
-		seen[string(match[1])] = true
+	if isApprovalRequestMethod(method) {
+		return true
 	}
-	methods := make([]string, 0, len(seen))
-	for method := range seen {
-		methods = append(methods, method)
+	switch method {
+	case "item/tool/requestUserInput",
+		"mcpServer/elicitation/request",
+		"item/tool/call":
+		return true
+	default:
+		return false
 	}
-	sort.Strings(methods)
-	return methods
 }
 
 func generatedJSONMethods(t *testing.T, path string) []string {
@@ -492,61 +513,6 @@ func generatedCombinedJSONMethods(t *testing.T, definition string) []string {
 	return uniqueMethodEnums(definitionSchema.OneOf)
 }
 
-func generatedTypeScriptResponseItemTypes(t *testing.T) []string {
-	t.Helper()
-	raw, err := os.ReadFile(codexTypeScriptResponseItemPath)
-	if err != nil {
-		t.Fatalf("read generated Codex TypeScript response item schema: %v", err)
-	}
-	re := regexp.MustCompile(`"type":\s*"([^"]+)"`)
-	seen := map[string]bool{}
-	for _, match := range re.FindAllSubmatch(raw, -1) {
-		seen[string(match[1])] = true
-	}
-	types := make([]string, 0, len(seen))
-	for itemType := range seen {
-		types = append(types, itemType)
-	}
-	sort.Strings(types)
-	return types
-}
-
-func isRawResponseCompactionItem(itemType string) bool {
-	switch itemType {
-	case "compaction", "compaction_trigger", "context_compaction":
-		return true
-	default:
-		return false
-	}
-}
-
-func isRawResponseItemMapped(itemType string) bool {
-	switch itemType {
-	case "message",
-		"reasoning",
-		"function_call",
-		"custom_tool_call",
-		"tool_search_call",
-		"function_call_output",
-		"custom_tool_call_output",
-		"tool_search_output",
-		"local_shell_call",
-		"web_search_call",
-		"image_generation_call":
-		return true
-	default:
-		return isRawResponseCompactionItem(itemType)
-	}
-}
-
-func isRawResponseItemBackfilled(itemType string) bool {
-	return isRawResponseItemMapped(itemType)
-}
-
-func isRawResponseItemIntentionallyInvisible(itemType string) bool {
-	return itemType == "other"
-}
-
 func isActiveRunNotificationMapped(method string) bool {
 	switch method {
 	case "thread/started",
@@ -606,27 +572,13 @@ func isActiveRunNotificationMapped(method string) bool {
 	}
 }
 
-func isActiveRunNotificationIntentionallyInvisible(method string) bool {
-	return false
-}
-
 func generatedTypeScriptMethods(t *testing.T, path string) []string {
 	t.Helper()
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read generated Codex TypeScript schema: %v", err)
 	}
-	re := regexp.MustCompile(`"method":\s*"([^"]+)"`)
-	seen := map[string]bool{}
-	for _, match := range re.FindAllSubmatch(raw, -1) {
-		seen[string(match[1])] = true
-	}
-	methods := make([]string, 0, len(seen))
-	for method := range seen {
-		methods = append(methods, method)
-	}
-	sort.Strings(methods)
-	return methods
+	return sortedUniqueMatches(regexp.MustCompile(`"method":\s*"([^"]+)"`), raw)
 }
 
 func sourceSwitchCases(t *testing.T, path, start, end string) map[string]bool {
@@ -651,44 +603,6 @@ func sourceSwitchCases(t *testing.T, path, start, end string) map[string]bool {
 		handled[match[1]] = true
 	}
 	return handled
-}
-
-func generatedTypeScriptV2NotificationTypes(t *testing.T) []string {
-	t.Helper()
-	entries, err := os.ReadDir(codexTypeScriptV2NotificationDir)
-	if err != nil {
-		t.Fatalf("read generated Codex TypeScript v2 schema dir: %v", err)
-	}
-	types := make([]string, 0, len(entries))
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, "Notification.ts") {
-			continue
-		}
-		types = append(types, strings.TrimSuffix(name, ".ts"))
-	}
-	sort.Strings(types)
-	return types
-}
-
-func generatedTypeScriptV2NotificationImports(t *testing.T) []string {
-	t.Helper()
-	raw, err := os.ReadFile(codexTypeScriptNotificationPath)
-	if err != nil {
-		t.Fatalf("read generated Codex TypeScript schema: %v", err)
-	}
-	re := regexp.MustCompile(`import type \{ ([A-Za-z0-9_]+Notification) \} from "\./v2/[A-Za-z0-9_]+Notification";`)
-	return sortedUniqueMatches(re, raw)
-}
-
-func generatedTypeScriptNotificationParamTypes(t *testing.T) []string {
-	t.Helper()
-	raw, err := os.ReadFile(codexTypeScriptNotificationPath)
-	if err != nil {
-		t.Fatalf("read generated Codex TypeScript schema: %v", err)
-	}
-	re := regexp.MustCompile(`"params":\s*([A-Za-z0-9_]+Notification)`)
-	return sortedUniqueMatches(re, raw)
 }
 
 func sortedUniqueMatches(re *regexp.Regexp, raw []byte) []string {
@@ -729,24 +643,6 @@ func assertStringSetEqual(t *testing.T, got, want []string, label string) {
 	sort.Strings(extra)
 	if len(missing) > 0 || len(extra) > 0 {
 		t.Fatalf("string set differs from %s: missing=%v extra=%v", label, missing, extra)
-	}
-}
-
-func assertStringSetContains(t *testing.T, got, want []string, label string) {
-	t.Helper()
-	gotSet := map[string]bool{}
-	for _, value := range got {
-		gotSet[value] = true
-	}
-	var missing []string
-	for _, value := range want {
-		if !gotSet[value] {
-			missing = append(missing, value)
-		}
-	}
-	sort.Strings(missing)
-	if len(missing) > 0 {
-		t.Fatalf("%s is missing values: %v", label, missing)
 	}
 }
 

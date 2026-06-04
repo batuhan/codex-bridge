@@ -4,7 +4,13 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN_DIR="${CODEX_BRIDGE_BIN_DIR:-$ROOT/bin}"
 BRIDGE_BIN="${CODEX_BRIDGE_BIN:-$BIN_DIR/codex-bridge}"
-BRIDGE_NAME="${CODEX_BRIDGE_NAME:-sh-codex}"
+if [[ -n "${CODEX_BRIDGE_NAME:-}" ]]; then
+	BRIDGE_NAME="$CODEX_BRIDGE_NAME"
+	BRIDGE_NAME_EXPLICIT=1
+else
+	BRIDGE_NAME="sh-codex"
+	BRIDGE_NAME_EXPLICIT=0
+fi
 CONFIG_FILE="${CODEX_BRIDGE_CONFIG_FILE:-config.yaml}"
 if [[ "$CONFIG_FILE" = /* ]]; then
 	CONFIG_PATH="$CONFIG_FILE"
@@ -105,6 +111,52 @@ ensure_beeper_login() {
 	bbctl --color never login
 }
 
+bridge_name_taken() {
+	local name="$1"
+	local whoami
+	whoami="$(bbctl --color never whoami 2>&1 || true)"
+	awk -v target="$name" '$1 == target { found = 1 } END { exit !found }' <<<"$whoami"
+}
+
+choose_bridge_name() {
+	if [[ "$BRIDGE_NAME_EXPLICIT" == 1 ]]; then
+		return
+	fi
+
+	local base="$BRIDGE_NAME"
+	local candidate="$base"
+	local suffix=2
+	while bridge_name_taken "$candidate"; do
+		candidate="$base-$suffix"
+		suffix=$((suffix + 1))
+	done
+
+	if [[ "$candidate" != "$BRIDGE_NAME" ]]; then
+		log "Bridge name $BRIDGE_NAME is already registered; using $candidate"
+		BRIDGE_NAME="$candidate"
+	fi
+}
+
+configured_bridge_name() {
+	awk '
+		/^[[:space:]]*bot:[[:space:]]*$/ {
+			in_bot = 1
+			next
+		}
+		in_bot && /^[[:space:]]*username:[[:space:]]*/ {
+			name = $0
+			sub(/^[[:space:]]*username:[[:space:]]*/, "", name)
+			gsub(/["'\''"]/, "", name)
+			sub(/bot$/, "", name)
+			print name
+			exit
+		}
+		in_bot && /^[^[:space:]]/ {
+			in_bot = 0
+		}
+	' "$CONFIG_PATH"
+}
+
 ensure_codex_login() {
 	find_codex_cli
 	local codex_status
@@ -125,10 +177,16 @@ build_bridge() {
 
 ensure_config() {
 	if [[ -s "$CONFIG_PATH" ]]; then
+		local configured
+		configured="$(configured_bridge_name || true)"
+		if [[ -n "$configured" ]]; then
+			BRIDGE_NAME="$configured"
+		fi
 		log "Using existing $CONFIG_FILE"
 		return
 	fi
 
+	choose_bridge_name
 	log "Generating $CONFIG_FILE with bbctl"
 	bbctl --color never config \
 		--type bridgev2 \

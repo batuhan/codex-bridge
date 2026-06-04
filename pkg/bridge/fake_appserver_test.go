@@ -40,120 +40,118 @@ func runFakeAppServer() {
 		if err := json.Unmarshal(scanner.Bytes(), &msg); err != nil || msg.Method == "" {
 			continue
 		}
-		appendFakeAppServerRequest(msg.Method, msg.Params)
+		logFakeAppServerRequest(msg)
+		payload := map[string]any{}
+		_ = json.Unmarshal(msg.Params, &payload)
 		resp := fakeAppServerMessage{ID: msg.ID}
-		if rpcErr := fakeAppServerError(msg.Method, msg.Params); rpcErr != nil {
-			resp.Error = rpcErr
-		} else {
-			resp.Result = fakeAppServerResult(msg.Method, msg.Params)
+		if msg.Method == "thread/read" {
+			if firstString(payload, "threadId") == "missing-thread" {
+				resp.Error = map[string]any{"code": -32004, "message": "thread not loaded: missing-thread"}
+			}
 		}
-		delayFakeAppServerResponse()
+		if resp.Error == nil {
+			threadID := firstString(payload, "threadId")
+			if threadID == "" {
+				threadID = "thread-1"
+			}
+			cwd := firstString(payload, "cwd")
+			switch msg.Method {
+			case "model/list":
+				resp.Result = map[string]any{
+					"data": []map[string]any{
+						{"id": "gpt-5", "model": "gpt-5"},
+						{"id": "gpt-5.1", "model": "gpt-5.1"},
+						{"id": "claude-sonnet-4.5", "model": "anthropic/claude-sonnet-4.5"},
+					},
+				}
+			case "thread/read", "thread/resume", "thread/start", "thread/rollback":
+				if cwd == "" {
+					cwd = os.TempDir()
+				}
+				thread := map[string]any{
+					"thread": map[string]any{
+						"id":            threadID,
+						"sessionId":     threadID,
+						"cwd":           cwd,
+						"modelProvider": "openai",
+					},
+					"cwd":             cwd,
+					"model":           "gpt-5",
+					"modelProvider":   "openai",
+					"reasoningEffort": "high",
+				}
+				if threadID == "archived-thread" {
+					thread["thread"].(map[string]any)["archived"] = true
+				}
+				if msg.Method == "thread/read" && payload["includeTurns"] == true {
+					thread["thread"].(map[string]any)["turns"] = []map[string]any{
+						{"id": "turn-1", "status": "completed"},
+						{"id": "turn-2", "status": "completed"},
+					}
+				}
+				resp.Result = thread
+			case "turn/start":
+				resp.Result = map[string]any{
+					"turn": map[string]any{
+						"id":     "turn-1",
+						"status": "inProgress",
+					},
+				}
+			case "turn/steer", "turn/interrupt":
+				resp.Result = map[string]any{}
+			default:
+				resp.Result = map[string]any{}
+			}
+		}
+		delay, err := strconv.Atoi(os.Getenv(fakeAppServerDelayEnv))
+		if err == nil && delay > 0 {
+			time.Sleep(time.Duration(delay) * time.Millisecond)
+		}
 		raw, _ := json.Marshal(resp)
 		_, _ = writer.Write(append(raw, '\n'))
 		_ = writer.Flush()
 	}
 }
 
-func delayFakeAppServerResponse() {
-	delay, err := strconv.Atoi(os.Getenv(fakeAppServerDelayEnv))
-	if err != nil || delay <= 0 {
-		return
-	}
-	time.Sleep(time.Duration(delay) * time.Millisecond)
-}
-
-func appendFakeAppServerRequest(method string, params json.RawMessage) {
+func logFakeAppServerRequest(msg fakeAppServerMessage) {
 	logPath := os.Getenv(fakeAppServerLogEnv)
 	if logPath == "" {
 		return
 	}
-	raw, _ := json.Marshal(struct {
+	raw, _ := fakeAppServerRequestLogLine(msg)
+	if file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+		_, _ = file.Write(append(raw, '\n'))
+		_ = file.Close()
+	}
+}
+
+func fakeAppServerRequestLogLine(msg fakeAppServerMessage) ([]byte, error) {
+	return json.Marshal(struct {
 		Method string          `json:"method"`
 		Params json.RawMessage `json:"params"`
-	}{Method: method, Params: params})
-	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return
-	}
-	_, _ = file.Write(append(raw, '\n'))
-	_ = file.Close()
-}
-
-func fakeAppServerError(method string, params json.RawMessage) any {
-	payload := map[string]any{}
-	_ = json.Unmarshal(params, &payload)
-	if method == "thread/read" && firstFakeAppServerString(payload, "threadId") == "missing-thread" {
-		return map[string]any{"code": -32004, "message": "thread not loaded: missing-thread"}
-	}
-	return nil
-}
-
-func fakeAppServerResult(method string, params json.RawMessage) any {
-	payload := map[string]any{}
-	_ = json.Unmarshal(params, &payload)
-	threadID := firstFakeAppServerString(payload, "threadId")
-	if threadID == "" {
-		threadID = "thread-1"
-	}
-	cwd := firstFakeAppServerString(payload, "cwd")
-	switch method {
-	case "model/list":
-		return map[string]any{
-			"data": []map[string]any{
-				{"id": "gpt-5", "model": "gpt-5"},
-				{"id": "gpt-5.1", "model": "gpt-5.1"},
-				{"id": "claude-sonnet-4.5", "model": "anthropic/claude-sonnet-4.5"},
-			},
-		}
-	case "thread/read", "thread/resume", "thread/start", "thread/rollback":
-		if cwd == "" {
-			cwd = os.TempDir()
-		}
-		thread := map[string]any{
-			"thread": map[string]any{
-				"id":            threadID,
-				"sessionId":     threadID,
-				"cwd":           cwd,
-				"modelProvider": "openai",
-			},
-			"cwd":             cwd,
-			"model":           "gpt-5",
-			"modelProvider":   "openai",
-			"reasoningEffort": "high",
-		}
-		if method == "thread/read" && payload["includeTurns"] == true {
-			thread["thread"].(map[string]any)["turns"] = []map[string]any{
-				{"id": "turn-1", "status": "completed"},
-				{"id": "turn-2", "status": "completed"},
-			}
-		}
-		return thread
-	case "turn/start":
-		return map[string]any{
-			"turn": map[string]any{
-				"id":     "turn-1",
-				"status": "inProgress",
-			},
-		}
-	case "turn/steer", "turn/interrupt":
-		return map[string]any{}
-	default:
-		return map[string]any{}
-	}
-}
-
-func firstFakeAppServerString(payload map[string]any, keys ...string) string {
-	for _, key := range keys {
-		if value, _ := payload[key].(string); strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
+	}{Method: msg.Method, Params: msg.Params})
 }
 
 type fakeAppServerRequest struct {
 	Method string         `json:"method"`
 	Params map[string]any `json:"params"`
+}
+
+func TestFakeAppServerRequestLogLine(t *testing.T) {
+	raw, err := fakeAppServerRequestLogLine(fakeAppServerMessage{
+		Method: "thread/start",
+		Params: json.RawMessage(`{"cwd":"/tmp/project"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req fakeAppServerRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.Method != "thread/start" || req.Params["cwd"] != "/tmp/project" {
+		t.Fatalf("unexpected fake app-server log line: %s", raw)
+	}
 }
 
 func readFakeAppServerRequests(t *testing.T, path string) []fakeAppServerRequest {
@@ -163,7 +161,7 @@ func readFakeAppServerRequests(t *testing.T, path string) []fakeAppServerRequest
 		t.Fatal(err)
 	}
 	var out []fakeAppServerRequest
-	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+	for _, line := range strings.Split(firstTrimmedNonEmpty(string(raw)), "\n") {
 		if line == "" {
 			continue
 		}

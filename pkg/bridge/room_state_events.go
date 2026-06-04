@@ -11,12 +11,12 @@ type rawRoomStateEventContent map[string]any
 type aiModelStateEventContent map[string]any
 
 func init() {
-	registerRoomStateEventContentTypes()
+	registerRoomStateEventContent(codexThreadStateType, rawRoomStateEventContent{})
+	registerRoomStateEventContent(beeperAIModelStateType, aiModelStateEventContent{})
 }
 
-func registerRoomStateEventContentTypes() {
-	event.TypeMap[roomStateEventType(codexThreadStateType)] = reflect.TypeOf(rawRoomStateEventContent{})
-	event.TypeMap[roomStateEventType(beeperAIModelStateType)] = reflect.TypeOf(aiModelStateEventContent{})
+func registerRoomStateEventContent(stateType string, content any) {
+	event.TypeMap[roomStateEventType(stateType)] = reflect.TypeOf(content)
 }
 
 func roomStateEventType(stateType string) event.Type {
