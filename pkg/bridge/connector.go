@@ -33,6 +33,7 @@ import (
 const appServerStartupTimeout = 15 * time.Second
 const bridgeStartupSyncTimeout = 2 * time.Minute
 const contactGhostSyncLimit = 20
+const recentThreadSyncInterval = 15 * time.Second
 const bridgeInfoVersion = 2
 const roomCapabilitiesVersion = 12
 const roomFeaturesID = "com.beeper.codex.capabilities.2026_06_03.room_features_user_ai_model_and_edits"
@@ -260,7 +261,8 @@ func (c *Connector) Start(ctx context.Context) error {
 	runBridgeStartupSync(ctx, func(syncCtx context.Context) {
 		c.syncContactGhostsForThreads(syncCtx, nil)
 	})
-	go c.syncRecentContactGhosts(ctx)
+	go c.syncRecentThreads(ctx)
+	go c.pollRecentThreads(ctx)
 	go c.dispatchAppServer()
 	return nil
 }
@@ -1169,6 +1171,34 @@ func (c *Connector) syncRecentContactGhosts(ctx context.Context) {
 	c.syncContactGhostsForThreads(ctx, threads)
 }
 
+func (c *Connector) pollRecentThreads(ctx context.Context) {
+	ticker := time.NewTicker(recentThreadSyncInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.syncRecentThreads(ctx)
+		}
+	}
+}
+
+func (c *Connector) syncRecentThreads(ctx context.Context) {
+	if c == nil || c.Bridge == nil {
+		return
+	}
+	var resp appserver.ThreadListResponse
+	err := c.request(ctx, "thread/list", threadListParams("", contactGhostSyncLimit), &resp)
+	threads := resp.Data
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to list Codex threads for recent room sync")
+		threads = c.cachedThreadsForLogin(nil)
+	}
+	c.syncContactGhostsForThreads(ctx, threads)
+	c.syncProjectRoomsForThreads(ctx, threads)
+}
+
 func (c *Connector) syncContactGhostsForThreads(ctx context.Context, threads []appserver.Thread) {
 	if c == nil || c.Bridge == nil {
 		return
@@ -1181,6 +1211,78 @@ func (c *Connector) syncContactGhostsForThreads(ctx context.Context, threads []a
 		}
 		ghost.UpdateInfo(ctx, contact.info)
 	}
+}
+
+func (c *Connector) syncProjectRoomsForThreads(ctx context.Context, threads []appserver.Thread) {
+	if c == nil || c.Bridge == nil {
+		return
+	}
+	login := c.notificationUserLogin()
+	if login == nil {
+		return
+	}
+	cl := newLoggedInClient(c, login)
+	for _, thread := range sortedRecentDirectories(threads) {
+		if thread.ID == "" || thread.Cwd == "" || isDetachedThread(thread) {
+			continue
+		}
+		c.syncProjectRoomForThread(ctx, cl, thread)
+	}
+}
+
+func (c *Connector) syncProjectRoomForThread(ctx context.Context, cl *Client, thread appserver.Thread) {
+	if c == nil || c.Bridge == nil || cl == nil || cl.UserLogin == nil || thread.ID == "" || thread.Cwd == "" {
+		return
+	}
+	key := projectPortalKey(thread.Cwd, cl.UserLogin.ID)
+	state := codexThreadInitialState(thread)
+	portal, err := c.Bridge.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Str("thread_id", thread.ID).Stringer("portal_key", key).Msg("Failed to load Codex project portal during recent room sync")
+		return
+	}
+	if portal != nil && portal.MXID != "" {
+		cl.syncThreadPortal(ctx, portal, thread)
+		return
+	}
+	res := c.queueProjectRoomResync(ctx, cl, key, thread.Cwd, thread.ID, state, time.Now())
+	if !res.Success {
+		logCodexQueueFailure(ctx, res, "Failed to queue Codex recent project room sync", map[string]any{
+			"thread_id": thread.ID,
+			"cwd":       thread.Cwd,
+		})
+		return
+	}
+	zerolog.Ctx(ctx).Info().
+		Str("thread_id", thread.ID).
+		Str("cwd", thread.Cwd).
+		Stringer("portal_key", key).
+		Msg("Queued Codex recent project room sync")
+}
+
+func (c *Connector) queueProjectRoomResync(ctx context.Context, cl *Client, key networkid.PortalKey, cwd, threadID string, state map[string]any, ts time.Time) bridgev2.EventHandlingResult {
+	if ts.IsZero() {
+		ts = time.Now()
+	}
+	c.rememberThreadRoom(threadID, cl, key, cwd, state)
+	meta := remoteEventMeta(bridgev2.RemoteEventChatResync, key, codexUserID, ts)
+	meta.CreatePortal = true
+	meta.PreHandleFunc = func(ctx context.Context, portal *bridgev2.Portal) {
+		if cl == nil || portal == nil {
+			return
+		}
+		cl.syncProjectPortalMetadata(ctx, portal, cwd, threadID)
+	}
+	meta.PostHandleFunc = func(ctx context.Context, portal *bridgev2.Portal) {
+		if c != nil && cl != nil && portal != nil {
+			c.rememberThreadRoom(threadID, cl, portal.PortalKey, cwd, state)
+		}
+	}
+	return cl.UserLogin.QueueRemoteEvent(&simplevent.ChatResync{
+		EventMeta:       meta,
+		ChatInfo:        portalInfo(codexThreadDisplayName(cwd, state), cl.codexMembers(), cwd, threadID, state),
+		LatestMessageTS: ts,
+	})
 }
 
 func contactGhostUpdates(threads []appserver.Thread) []contactGhostUpdate {
@@ -1325,15 +1427,19 @@ func (c *Connector) handleThreadMetadataNotification(method, threadID string, pa
 	if !isThreadMetadataNotification(method) {
 		return
 	}
-	room, ok := c.lookupThreadRoom(context.Background(), threadID)
+	ctx := context.Background()
+	room, ok := c.lookupThreadRoom(ctx, threadID)
 	if !ok {
-		return
+		room, ok = c.materializeThreadRoomFromNotification(ctx, method, threadID, params)
+		if !ok {
+			return
+		}
 	}
 	state := codexThreadState(method, threadID, room.cwd, params)
 	if cwd := firstString(state, "cwd"); cwd != "" && cwd != room.cwd {
 		room.cwd = cwd
 	}
-	room = c.canonicalizeThreadRoom(context.Background(), threadID, room)
+	room = c.canonicalizeThreadRoom(ctx, threadID, room)
 	room.fillState(state)
 	room.applyState(state)
 	room.fillState(state)
@@ -1346,7 +1452,7 @@ func (c *Connector) handleThreadMetadataNotification(method, threadID string, pa
 	}
 	switch method {
 	case "thread/archived", "thread/closed":
-		c.detachThreadPortal(context.Background(), threadID, room, method)
+		c.detachThreadPortal(ctx, threadID, room, method)
 		return
 	}
 	if room.login == nil || room.login.Bridge == nil {
@@ -1354,9 +1460,9 @@ func (c *Connector) handleThreadMetadataNotification(method, threadID string, pa
 	}
 	info := codexThreadChatInfo(room.cwd, threadID, state)
 	if c.Bridge != nil {
-		portal, err := c.Bridge.GetExistingPortalByKey(context.Background(), room.portalKey)
+		portal, err := c.Bridge.GetExistingPortalByKey(ctx, room.portalKey)
 		if err != nil {
-			zerolog.Ctx(context.Background()).Warn().Err(err).Str("thread_id", threadID).Stringer("portal_key", room.portalKey).Msg("Failed to load portal before Codex thread metadata update")
+			zerolog.Ctx(ctx).Warn().Err(err).Str("thread_id", threadID).Stringer("portal_key", room.portalKey).Msg("Failed to load portal before Codex thread metadata update")
 		} else {
 			applyStoredPortalInfo(info, portal)
 		}
@@ -1373,6 +1479,59 @@ func (c *Connector) handleThreadMetadataNotification(method, threadID string, pa
 			"cwd":       room.cwd,
 		})
 	}
+}
+
+func (c *Connector) materializeThreadRoomFromNotification(ctx context.Context, method, threadID string, params json.RawMessage) (threadRoom, bool) {
+	if c == nil || c.Bridge == nil || threadID == "" {
+		return threadRoom{}, false
+	}
+	state := codexThreadState(method, threadID, "", params)
+	login := c.notificationUserLogin()
+	if login == nil {
+		zerolog.Ctx(ctx).Debug().Str("thread_id", threadID).Str("method", method).Msg("Ignoring Codex thread notification without a cached login")
+		return threadRoom{}, false
+	}
+	cl := newLoggedInClient(c, login)
+	cwd := firstString(state, "cwd")
+	if cwd == "" {
+		thread, err := cl.readThread(ctx, threadID, false)
+		if err != nil {
+			zerolog.Ctx(ctx).Debug().Err(err).Str("thread_id", threadID).Str("method", method).Msg("Ignoring Codex thread notification without a cwd")
+			return threadRoom{}, false
+		}
+		cwd = thread.Cwd
+		initial := codexThreadInitialState(thread)
+		maps.Copy(initial, state)
+		state = initial
+	}
+	if cwd == "" {
+		zerolog.Ctx(ctx).Debug().Str("thread_id", threadID).Str("method", method).Msg("Ignoring Codex thread notification without a cwd")
+		return threadRoom{}, false
+	}
+	key := projectPortalKey(cwd, login.ID)
+	c.rememberThreadRoom(threadID, cl, key, cwd, state)
+	room, _ := c.threadRoom(threadID)
+	zerolog.Ctx(ctx).Info().
+		Str("thread_id", threadID).
+		Str("cwd", cwd).
+		Stringer("portal_key", key).
+		Msg("Materialized Codex thread room from app-server notification")
+	return room, true
+}
+
+func (c *Connector) notificationUserLogin() *bridgev2.UserLogin {
+	if c == nil || c.Bridge == nil {
+		return nil
+	}
+	if login := c.Bridge.GetCachedUserLoginByID(c.loginIDForUser()); login != nil {
+		return login
+	}
+	for _, login := range c.Bridge.GetAllCachedUserLogins() {
+		if login != nil {
+			return login
+		}
+	}
+	return nil
 }
 
 func (c *Connector) detachThreadPortal(ctx context.Context, threadID string, room threadRoom, reason string) {
