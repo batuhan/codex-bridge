@@ -73,6 +73,14 @@ func codexCommandDescriptions() []*cmdschema.EventContent {
 			Command:     "stop",
 			Description: event.MakeExtensibleText("Stop the active Codex turn."),
 		},
+		{
+			Command:     "unbridge",
+			Description: event.MakeExtensibleText("Disable Codex history backfill for a project and remove imported history."),
+			Parameters: []*cmdschema.Parameter{
+				codexCommandParameter("path", cmdschema.PrimitiveTypeString.Schema(), "Project directory path.", false),
+			},
+			TailParam: "path",
+		},
 	}
 }
 
@@ -92,10 +100,21 @@ func codexCommandFromRawContent(raw map[string]any) (codexCommand, bool) {
 		}
 	}
 	name := canonicalCodexCommandName(firstString(raw, "command"))
-	if name == "" {
+	if name != "" {
+		return codexCommandFromRawArgs(name, raw), true
+	}
+	return codexCommandFromRawCommandText(raw)
+}
+
+func codexCommandFromRawCommandText(raw map[string]any) (codexCommand, bool) {
+	if lowerTrimmed(firstString(raw, "msgtype")) != string(matrixCommandMsgType) {
 		return codexCommand{}, false
 	}
-	return codexCommandFromRawArgs(name, raw), true
+	body, ok := codexCommandBody(firstString(raw, string(matrixCommandMsgType), "body"))
+	if !ok {
+		return codexCommand{}, false
+	}
+	return codexCommandFromBody(body)
 }
 
 func nestedRawCodexCommand(raw map[string]any) map[string]any {
@@ -137,6 +156,8 @@ func codexCommandFromArgsMap(name string, args map[string]any) codexCommand {
 		return codexRequestArgCommand(name, args, "approval_id", "choice")
 	case "answer":
 		return codexRequestArgCommand(name, args, "request_id", "answer")
+	case "unbridge":
+		return codexCommandWithArg(name, firstString(args, "path"))
 	default:
 		return codexCommand{name: name}
 	}

@@ -1280,7 +1280,7 @@ func (c *Connector) clearMissingPortalThread(ctx context.Context, cl *Client, po
 	cwd := missingThreadCWD(portal, meta.Cwd)
 	cl.clearMissingThread(ctx, portal, meta)
 	state := missingThreadState(cwd, oldThreadID)
-	portal.UpdateInfo(ctx, portalInfo(projectDisplayPath(cwd), cl.codexMembers(), cwd, "", state), cl.UserLogin, nil, time.Now())
+	portal.UpdateInfo(ctx, portalInfo(provisionalProjectRoomName(cwd), cl.codexMembers(), cwd, "", state), cl.UserLogin, nil, time.Now())
 	zerolog.Ctx(ctx).Warn().Str("thread_id", oldThreadID).Str("cwd", cwd).Msg("Cleared missing Codex thread during startup")
 }
 
@@ -1578,11 +1578,8 @@ func codexThreadDisplayName(cwd string, state map[string]any) string {
 	if name := codexThreadTitle(state); name != "" {
 		return projectThreadRoomName(name, cwd)
 	}
-	if name := firstString(state, "preview"); name != "" {
-		return projectThreadRoomName(name, cwd)
-	}
 	if cwd != "" {
-		return projectDisplayPath(cwd)
+		return provisionalProjectRoomName(cwd)
 	}
 	return ""
 }
@@ -2259,7 +2256,7 @@ func (c *Connector) bridgeAlias() string {
 }
 
 func directoryName(path string) string {
-	path = firstTrimmedNonEmpty(path, "New Project")
+	path = firstTrimmedNonEmpty(path, provisionalProjectTitle())
 	base := filepath.Base(path)
 	switch base {
 	case ".", "/", "":
@@ -2378,7 +2375,7 @@ func codexUserInfo(name string, isBot bool, identifiers ...string) *bridgev2.Use
 }
 
 func newProjectUserInfo() *bridgev2.UserInfo {
-	return codexUserInfo("New Project", false, "new", "new project", "codex")
+	return codexUserInfo(provisionalProjectTitle(), false, "new", "new codex session", "new project", "codex")
 }
 
 func projectThreadUserInfo(thread appserver.Thread) *bridgev2.UserInfo {
@@ -2446,12 +2443,38 @@ func applyStoredPortalInfo(info *bridgev2.ChatInfo, portal *bridgev2.Portal) {
 	if info == nil || portal == nil {
 		return
 	}
-	if portal.NameSet {
+	meta := portalMetadata(portal.Metadata)
+	if portal.NameSet && !isReplaceableProjectRoomName(portal.Name, meta.Cwd) {
 		info.Name = &portal.Name
 	}
 	if portal.TopicSet {
-		info.Topic = &portal.Topic
+		if isReplaceableProjectRoomTopic(portal.Topic, meta) {
+			if info.Topic == nil {
+				topic := ""
+				info.Topic = &topic
+			}
+		} else {
+			info.Topic = &portal.Topic
+		}
 	}
+}
+
+func isReplaceableProjectRoomName(name, cwd string) bool {
+	if cwd == "" {
+		return name == legacyProjectTitle()
+	}
+	return name == provisionalProjectTitle() ||
+		name == legacyProjectTitle() ||
+		name == projectDisplayPath(cwd) ||
+		name == provisionalProjectRoomName(cwd) ||
+		name == projectThreadRoomName(legacyProjectTitle(), cwd)
+}
+
+func isReplaceableProjectRoomTopic(topic string, meta *PortalMetadata) bool {
+	if meta == nil || (meta.Cwd == "" && meta.ThreadID == "") {
+		return false
+	}
+	return topic == newProjectPrompt
 }
 
 func updatePortalInfo(ctx context.Context, portal *bridgev2.Portal, login *bridgev2.UserLogin, info *bridgev2.ChatInfo) {

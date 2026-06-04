@@ -21,6 +21,7 @@ type PortalMetadata struct {
 	ParentThreadID         string `json:"parent_thread_id,omitempty"`
 	ReadOnly               bool   `json:"read_only,omitempty"`
 	BackfillVersion        int    `json:"backfill_version,omitempty"`
+	BackfillDisabled       bool   `json:"backfill_disabled,omitempty"`
 	NewProjectIntroMessage bool   `json:"new_project_intro_message,omitempty"`
 }
 

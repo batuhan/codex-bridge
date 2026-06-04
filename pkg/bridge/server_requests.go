@@ -501,6 +501,13 @@ func (cl *Client) handleBridgeCommand(ctx context.Context, msg *bridgev2.MatrixM
 		}
 		return nil, false, nil
 	}
+	if command.name == "unbridge" {
+		text, err := cl.unbridgeProjectBackfill(context.WithoutCancel(ctx), command.arg)
+		if err != nil {
+			return nil, true, err
+		}
+		return cl.commandNoticeHandled(msg, "", "unbridge", text)
+	}
 	meta := portalMetadata(msg.Portal.Metadata)
 	if meta.ThreadID == "" {
 		return cl.commandNoticeHandled(msg, "", "no_session", "No Codex session is active in this room.")
@@ -626,6 +633,10 @@ func parseCodexCommand(content *event.MessageEventContent) (codexCommand, bool) 
 	if !ok {
 		return codexCommand{}, false
 	}
+	return codexCommandFromBody(body)
+}
+
+func codexCommandFromBody(body string) (codexCommand, bool) {
 	name, arg, _ := splitCommandArg(body)
 	name = canonicalCodexCommandName(name)
 	if name == "" {
@@ -665,6 +676,9 @@ func codexCommandBody(body string) (string, bool) {
 	if command, ok := strings.CutPrefix(body, "!codex "); ok {
 		return firstTrimmedNonEmpty(command), true
 	}
+	if command, ok := strings.CutPrefix(body, "!ai "); ok {
+		return firstTrimmedNonEmpty(command), true
+	}
 	name, _, _ := splitCommandArg(body)
 	if canonicalCodexCommandName(name) != "" {
 		return body, true
@@ -700,6 +714,8 @@ func canonicalCodexCommandName(name string) string {
 		return "answer"
 	case "abort", "cancel", "interrupt", "stop":
 		return "stop"
+	case "unbridge":
+		return "unbridge"
 	default:
 		return ""
 	}

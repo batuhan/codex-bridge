@@ -68,6 +68,26 @@ func (cl *Client) backfillMessagesFromEntries(ctx context.Context, portal *bridg
 	return messages, nil
 }
 
+func dedupeBackfillMessages(messages []*bridgev2.BackfillMessage) []*bridgev2.BackfillMessage {
+	if len(messages) < 2 {
+		return messages
+	}
+	seen := make(map[networkid.MessageID]bool, len(messages))
+	filtered := messages[:0]
+	for _, msg := range messages {
+		if msg == nil || msg.ID == "" {
+			filtered = append(filtered, msg)
+			continue
+		}
+		if seen[msg.ID] {
+			continue
+		}
+		seen[msg.ID] = true
+		filtered = append(filtered, msg)
+	}
+	return filtered
+}
+
 func (cl *Client) queueBackfillSubagentsForTurn(ctx context.Context, thread appserver.Thread, turn appserver.Turn, seen map[string]bool) {
 	for _, item := range turn.Items {
 		cl.queueSubagentResyncs(ctx, thread.ID, thread.Cwd, subagentRefs(backfillItemData(item)), seen)

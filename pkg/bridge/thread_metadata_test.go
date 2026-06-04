@@ -243,7 +243,7 @@ func TestCodexThreadChatInfoName(t *testing.T) {
 	if info := codexThreadChatInfo("", "thread-1", state); info.Name != nil {
 		t.Fatalf("unexpected null name %#v", info.Name)
 	}
-	if info := codexThreadChatInfo("/tmp/project", "thread-1", map[string]any{}); info.Name == nil || *info.Name != "/tmp/project" {
+	if info := codexThreadChatInfo("/tmp/project", "thread-1", map[string]any{}); info.Name == nil || *info.Name != "New Codex Session (/tmp/project)" {
 		t.Fatalf("unexpected cwd fallback name %#v", info.Name)
 	}
 }
@@ -271,7 +271,7 @@ func TestCodexThreadChatInfoSyncsMetadataNameAndBackfill(t *testing.T) {
 		}
 	}`))
 	info := codexThreadChatInfo("/old/project", "thread-1", state)
-	if info.Name == nil || *info.Name != "/new/project" {
+	if info.Name == nil || *info.Name != "New Codex Session (/new/project)" {
 		t.Fatalf("expected room name from updated cwd, got %#v", info.Name)
 	}
 	if !info.ExcludeChangesFromTimeline || !info.CanBackfill {
@@ -1331,6 +1331,30 @@ func TestApplyStoredPortalInfoPreservesClearedTopic(t *testing.T) {
 	}
 	if info.Topic == nil || *info.Topic != "" {
 		t.Fatalf("cleared room topic was not preserved: %#v", info.Topic)
+	}
+}
+
+func TestApplyStoredPortalInfoReplacesProjectStarterDefaults(t *testing.T) {
+	for _, storedName := range []string{"New Codex Session", "New Project"} {
+		name := "Generated title (/tmp/project)"
+		topic := "Generated topic"
+		info := &bridgev2.ChatInfo{Name: &name, Topic: &topic}
+		portal := &bridgev2.Portal{Portal: &database.Portal{
+			Name:     storedName,
+			NameSet:  true,
+			Topic:    newProjectPrompt,
+			TopicSet: true,
+			Metadata: &PortalMetadata{Kind: portalKindProject, ThreadID: "thread-1", Cwd: "/tmp/project"},
+		}}
+
+		applyStoredPortalInfo(info, portal)
+
+		if info.Name == nil || *info.Name != "Generated title (/tmp/project)" {
+			t.Fatalf("%q project starter name should be replaceable: %#v", storedName, info.Name)
+		}
+		if info.Topic == nil || *info.Topic != "Generated topic" {
+			t.Fatalf("%q project starter topic should be replaceable: %#v", storedName, info.Topic)
+		}
 	}
 }
 

@@ -219,6 +219,21 @@ func TestParseCodexCommand(t *testing.T) {
 			ok:      true,
 		},
 		{
+			name:    "slash unbridge",
+			content: &event.MessageEventContent{Body: "/unbridge ~/projects/pickle"},
+			want:    codexCommand{name: "unbridge", arg: "~/projects/pickle"},
+			ok:      true,
+		},
+		{
+			name: "structured unbridge",
+			content: &event.MessageEventContent{MSC4391BotCommand: &event.MSC4391BotCommandInput{
+				Command:   "unbridge",
+				Arguments: json.RawMessage(`{"path":"~/projects/pickle"}`),
+			}},
+			want: codexCommand{name: "unbridge", arg: "~/projects/pickle"},
+			ok:   true,
+		},
+		{
 			name:    "slash abort aliases stop",
 			content: &event.MessageEventContent{Body: "/abort"},
 			want:    codexCommand{name: "stop"},
@@ -239,6 +254,12 @@ func TestParseCodexCommand(t *testing.T) {
 		{
 			name:    "matrix command bot prefix stop",
 			content: &event.MessageEventContent{MsgType: matrixCommandMsgType, Body: "!codex stop"},
+			want:    codexCommand{name: "stop"},
+			ok:      true,
+		},
+		{
+			name:    "matrix command ai prefix stop",
+			content: &event.MessageEventContent{MsgType: matrixCommandMsgType, Body: "!ai stop"},
 			want:    codexCommand{name: "stop"},
 			ok:      true,
 		},
@@ -288,6 +309,17 @@ func TestCodexCommandFromRawBeeperCommandStringArguments(t *testing.T) {
 	command, ok := codexCommandFromRawContent(raw)
 	if !ok || command != (codexCommand{name: "answer", arg: "input-1 hello world"}) {
 		t.Fatalf("unexpected raw command: ok=%v command=%#v", ok, command)
+	}
+}
+
+func TestCodexCommandFromRawBeeperCommandText(t *testing.T) {
+	raw := map[string]any{
+		"msgtype":                    string(matrixCommandMsgType),
+		string(matrixCommandMsgType): "!ai stop",
+	}
+	command, ok := codexCommandFromRawContent(raw)
+	if !ok || command != (codexCommand{name: "stop"}) {
+		t.Fatalf("unexpected raw command text: ok=%v command=%#v", ok, command)
 	}
 }
 

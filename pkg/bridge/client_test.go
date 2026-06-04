@@ -172,7 +172,7 @@ func TestCreateChatWithGhostMapsProjectGhosts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(resp.PortalKey.ID), "new:") || resp.PortalKey.Receiver != defaultLoginID {
+	if resp.PortalKey != projectPortalKey("/tmp/project", defaultLoginID) {
 		t.Fatalf("unexpected portal key: %#v", resp.PortalKey)
 	}
 	if resp.PortalInfo == nil || resp.PortalInfo.CanBackfill {
@@ -221,8 +221,8 @@ func TestCreateChatWithGhostMapsNewProjectGhostToNewProjectChat(t *testing.T) {
 	if !strings.HasPrefix(string(resp.PortalKey.ID), "new:") || resp.PortalKey.Receiver != "login-1" {
 		t.Fatalf("unexpected portal key: %#v", resp.PortalKey)
 	}
-	if resp.PortalInfo == nil || resp.PortalInfo.Name == nil || *resp.PortalInfo.Name != "New Project" {
-		t.Fatalf("new project ghost should create a New Project room: %#v", resp.PortalInfo)
+	if resp.PortalInfo == nil || resp.PortalInfo.Name == nil || *resp.PortalInfo.Name != "New Codex Session" {
+		t.Fatalf("new project ghost should create a New Codex Session room: %#v", resp.PortalInfo)
 	}
 }
 
@@ -234,6 +234,12 @@ func TestProjectStarterChatQueuesBackgroundBackfill(t *testing.T) {
 	login.Client = client
 
 	resp := client.newProjectChatForCWD("/tmp/project")
+	if resp.PortalKey != projectPortalKey("/tmp/project", login.ID) {
+		t.Fatalf("project starter should use canonical project portal key, got %#v", resp.PortalKey)
+	}
+	if resp.PortalInfo == nil || resp.PortalInfo.Name == nil || *resp.PortalInfo.Name != "New Codex Session (/tmp/project)" {
+		t.Fatalf("project starter should use provisional project room name: %#v", resp.PortalInfo)
+	}
 	if err := br.DB.Portal.Insert(ctx, &database.Portal{
 		PortalKey: resp.PortalKey,
 		MXID:      "!project:example.com",
@@ -777,7 +783,7 @@ func TestNewProjectChatInfoQueuesIntroOnRoomCreate(t *testing.T) {
 	if err = br.DB.Portal.Insert(ctx, &database.Portal{
 		PortalKey: key,
 		MXID:      "!starter:example.com",
-		Name:      "New Project",
+		Name:      "New Codex Session",
 		RoomType:  database.RoomTypeDM,
 		Metadata:  &PortalMetadata{},
 	}); err != nil {
@@ -817,6 +823,51 @@ func TestNewProjectChatInfoQueuesIntroOnRoomCreate(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	if len(matrix.intent().messages) != 1 {
 		t.Fatalf("new project intro should only be queued once, got %#v", matrix.intent().messages)
+	}
+}
+
+func TestNewProjectChatInfoRequeuesIntroWhenFlagIsStale(t *testing.T) {
+	ctx := context.Background()
+	oldPortalEventBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	t.Cleanup(func() { bridgev2.PortalEventBuffer = oldPortalEventBuffer })
+
+	matrix := &fakeMatrixConnector{}
+	connector, br := testBridgeWithDB(t, matrix)
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireEventually(t, time.Second, func() bool { return len(matrix.intent().messages) == 1 })
+	matrix.intent().messages = nil
+	client := &Client{Main: connector, UserLogin: login, loggedIn: true}
+	login.Client = client
+	key := newProjectPortalKey(login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: key,
+		MXID:      "!starter:example.com",
+		Name:      "New Codex Session",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{NewProjectIntroMessage: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := client.newProjectChatInfo()
+	if info.ExtraUpdates == nil || !info.ExtraUpdates(ctx, portal) {
+		t.Fatal("expected stale new project intro flag to queue a replacement intro")
+	}
+
+	requireEventually(t, time.Second, func() bool { return len(matrix.intent().messages) == 1 })
+	if matrix.intent().messages[0].RoomID != "!starter:example.com" {
+		t.Fatalf("intro was queued to the wrong room: %#v", matrix.intent().messages[0])
 	}
 }
 
@@ -1131,7 +1182,7 @@ func TestContactsIncludeOneNewProjectGhost(t *testing.T) {
 		}
 	}
 	if contacts[0].UserInfo == nil || contacts[0].UserInfo.IsBot == nil || *contacts[0].UserInfo.IsBot {
-		t.Fatalf("New Project contact should not be marked as a network bot: %#v", contacts[0].UserInfo)
+		t.Fatalf("New Codex Session contact should not be marked as a network bot: %#v", contacts[0].UserInfo)
 	}
 }
 
@@ -1177,7 +1228,7 @@ func TestContactsUseConcreteGhostsWhenBridgeIsAvailable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(searched.Results) != 1 || searched.Results[0].ID != newProjectUserID || searched.Results[0].MXID == "" {
-		t.Fatalf("provisioned search should find New Project ghost: %#v", searched.Results)
+		t.Fatalf("provisioned search should find New Codex Session ghost: %#v", searched.Results)
 	}
 	projectDir := t.TempDir()
 	resolved, err := provisionutil.ResolveIdentifier(context.Background(), login, projectDir, false)
@@ -1263,7 +1314,7 @@ func TestResolveIdentifierDecodesProjectIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.UserID != projectUserID(cwd) || resp.Chat == nil || !strings.HasPrefix(string(resp.Chat.PortalKey.ID), "new:") {
+	if resp.UserID != projectUserID(cwd) || resp.Chat == nil || resp.Chat.PortalKey != projectPortalKey(cwd, "sh-codex") {
 		t.Fatalf("unexpected project identifier response: %#v", resp)
 	}
 	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: resp.Chat.PortalKey}}
@@ -1281,8 +1332,8 @@ func TestResolveIdentifierCodexUsesNewProjectGhostProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.UserID != newProjectUserID || resp.UserInfo == nil || resp.UserInfo.Name == nil || *resp.UserInfo.Name != "New Project" || resp.UserInfo.IsBot == nil || *resp.UserInfo.IsBot {
-		t.Fatalf("Codex identifier should resolve to New Project ghost profile: %#v", resp)
+	if resp.UserID != newProjectUserID || resp.UserInfo == nil || resp.UserInfo.Name == nil || *resp.UserInfo.Name != "New Codex Session" || resp.UserInfo.IsBot == nil || *resp.UserInfo.IsBot {
+		t.Fatalf("Codex identifier should resolve to New Codex Session ghost profile: %#v", resp)
 	}
 }
 
@@ -1312,8 +1363,17 @@ func TestProvisioningCreateDMCreatesCodexRooms(t *testing.T) {
 		if resp == nil || resp.DMRoomID == "" || !resp.JustCreated || resp.Portal == nil {
 			t.Fatalf("create DM for %q did not materialize a room: %#v", identifier, resp)
 		}
+		if resp.DMRoomID != resp.Portal.MXID {
+			t.Fatalf("create DM for %q returned wrong room ID: dm=%s portal=%s", identifier, resp.DMRoomID, resp.Portal.MXID)
+		}
+		if resp.ID != newProjectUserID || resp.Name != "New Codex Session" {
+			t.Fatalf("create DM for %q returned wrong identity: %#v", identifier, resp)
+		}
 		if resp.Portal.PortalKey.Receiver != login.ID || resp.Portal.RoomType != database.RoomTypeDM {
 			t.Fatalf("create DM for %q used wrong portal: %#v", identifier, resp.Portal.Portal)
+		}
+		if resp.Portal.PortalKey.ID == "" || !strings.HasPrefix(string(resp.Portal.PortalKey.ID), "new:") {
+			t.Fatalf("starter create DM for %q used wrong portal key: %#v", identifier, resp.Portal.PortalKey)
 		}
 		meta := portalMetadata(resp.Portal.Metadata)
 		if meta.ThreadID != "" || meta.Cwd != "" {
@@ -1427,16 +1487,153 @@ func TestProvisioningCreateDMMaterializesProjectRoom(t *testing.T) {
 	if resp == nil || resp.DMRoomID == "" || !resp.JustCreated || resp.Portal == nil {
 		t.Fatalf("project create DM did not materialize a room: %#v", resp)
 	}
+	if resp.DMRoomID != resp.Portal.MXID {
+		t.Fatalf("project create DM returned wrong room ID: dm=%s portal=%s", resp.DMRoomID, resp.Portal.MXID)
+	}
 	cleanCWD, err := cleanProjectDir(cwd)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.ID != projectUserID(cleanCWD) || !strings.HasPrefix(string(resp.Portal.PortalKey.ID), "new:") || resp.Portal.PortalKey.Receiver != login.ID {
+	if resp.ID != projectUserID(cleanCWD) || resp.Portal.PortalKey != projectPortalKey(cleanCWD, login.ID) {
 		t.Fatalf("project create DM used wrong identity: %#v portal=%#v", resp, resp.Portal.Portal)
+	}
+	if resp.Portal.RoomType != database.RoomTypeDM {
+		t.Fatalf("project create DM should create a DM room, got %#v", resp.Portal.RoomType)
 	}
 	meta := portalMetadata(resp.Portal.Metadata)
 	if meta.Cwd != cleanCWD || meta.ThreadID != "" {
 		t.Fatalf("project create DM should persist cwd metadata, got %#v", meta)
+	}
+}
+
+func TestProvisioningCreateGroupUnsupported(t *testing.T) {
+	ctx := context.Background()
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login.Client = &Client{Main: connector, UserLogin: login, loggedIn: true}
+
+	caps := connector.GetCapabilities()
+	if len(caps.Provisioning.GroupCreation) != 0 {
+		t.Fatalf("Codex bridge should only advertise DM creation, got group caps %#v", caps.Provisioning.GroupCreation)
+	}
+	if _, err = provisionutil.CreateGroup(ctx, login, &bridgev2.GroupCreateParams{Type: "default"}); err == nil {
+		t.Fatal("Codex bridge should not support provisioning group creation")
+	}
+}
+
+func TestUnbridgeProjectDisablesBackfillAndRemovesOtherThreads(t *testing.T) {
+	ctx := context.Background()
+	matrixAPI := &fakeMatrixAPI{}
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{api: matrixAPI})
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{Main: connector, UserLogin: login, loggedIn: true}
+	login.Client = client
+
+	cwd := t.TempDir()
+	projectResp, err := provisionutil.ResolveIdentifier(ctx, login, cwd, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectPortal := projectResp.Portal
+	meta := portalMetadata(projectPortal.Metadata)
+	meta.applyProject(cwd, "thread-live")
+	projectPortal.Metadata = meta
+	if err = projectPortal.Save(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err = br.DB.BackfillTask.Upsert(ctx, &database.BackfillTask{
+		PortalKey:         projectPortal.PortalKey,
+		UserLoginID:       login.ID,
+		BatchCount:        -1,
+		NextDispatchMinTS: time.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	messages := []*database.Message{
+		{ID: "live", MXID: "$live", Metadata: &MessageMetadata{ThreadID: "thread-live", Role: "assistant"}},
+		{ID: "old-1", MXID: "$old-1", Metadata: &MessageMetadata{ThreadID: "thread-old", Role: "assistant"}},
+		{ID: "old-2", MXID: "$old-2", Metadata: &MessageMetadata{ThreadID: "thread-older", Role: "user"}},
+	}
+	for i, msg := range messages {
+		msg.PartID = partID("text")
+		msg.Room = projectPortal.PortalKey
+		msg.SenderID = codexUserID
+		msg.Timestamp = time.Now().Add(time.Duration(i) * time.Second)
+		if err = br.DB.Message.Insert(ctx, msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	starterResp, err := provisionutil.ResolveIdentifier(ctx, login, "new project", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	matrixAPI.messages = nil
+	resp, handled, err := client.handleBridgeCommand(ctx, &bridgev2.MatrixMessage{
+		MatrixEventBase: bridgev2.MatrixEventBase[*event.MessageEventContent]{
+			Event: &event.Event{ID: "$unbridge"},
+			Content: &event.MessageEventContent{
+				Body: "/unbridge " + cwd,
+			},
+			Portal: starterResp.Portal,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !handled || resp == nil || resp.DB == nil {
+		t.Fatalf("unbridge command was not handled: resp=%#v handled=%v", resp, handled)
+	}
+
+	projectPortal, err = br.GetExistingPortalByKey(ctx, projectPortal.PortalKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	meta = portalMetadata(projectPortal.Metadata)
+	if !meta.BackfillDisabled || meta.ThreadID != "thread-live" {
+		t.Fatalf("unbridge did not persist project backfill opt-out: %#v", meta)
+	}
+	task, err := br.DB.BackfillTask.GetNextForPortal(ctx, projectPortal.PortalKey, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task != nil {
+		t.Fatalf("unbridge should delete the pending backfill task: %#v", task)
+	}
+	if got, err := br.DB.Message.GetPartByID(ctx, projectPortal.PortalKey.Receiver, "live", partID("text")); err != nil || got == nil {
+		t.Fatalf("current thread message should remain: got=%#v err=%v", got, err)
+	}
+	for _, id := range []networkid.MessageID{"old-1", "old-2"} {
+		got, err := br.DB.Message.GetPartByID(ctx, projectPortal.PortalKey.Receiver, id, partID("text"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != nil {
+			t.Fatalf("backfilled message %s should be deleted: %#v", id, got)
+		}
+	}
+	redactions := 0
+	for _, sent := range matrixAPI.messages {
+		if sent.Type == event.EventRedaction && sent.RoomID == projectPortal.MXID {
+			redactions++
+		}
+	}
+	if redactions != 2 {
+		t.Fatalf("expected two redactions in project room, got %d events=%#v", redactions, matrixAPI.messages)
 	}
 }
 
@@ -2617,7 +2814,7 @@ func TestDirectorySelectionPostSaveStartsThreadAndCanonicalizesMessage(t *testin
 	if err = br.DB.Portal.Insert(ctx, &database.Portal{
 		PortalKey: starterKey,
 		MXID:      "!starter:example.com",
-		Name:      "New Project",
+		Name:      "New Codex Session",
 		RoomType:  database.RoomTypeDM,
 		Metadata:  &PortalMetadata{},
 	}); err != nil {
@@ -3398,16 +3595,16 @@ func TestClientConnectMaterializesDefaultNewProjectRoom(t *testing.T) {
 		t.Fatal(err)
 	}
 	if portal == nil || portal.MXID == "" || portal.RoomType != database.RoomTypeDM {
-		t.Fatalf("login connect did not materialize the default New Project room: %#v", portal)
+		t.Fatalf("login connect did not materialize the default New Codex Session room: %#v", portal)
 	}
-	if portal.Name != "New Project" || portal.Topic != newProjectPrompt {
-		t.Fatalf("default New Project room has wrong info: %#v", portal.Portal)
+	if portal.Name != "New Codex Session" || portal.Topic != newProjectPrompt {
+		t.Fatalf("default New Codex Session room has wrong info: %#v", portal.Portal)
 	}
 	requireEventually(t, time.Second, func() bool { return len(matrix.intent().messages) == 1 })
 	msg := matrix.intent().messages[0]
 	content, ok := msg.Content.Parsed.(*event.MessageEventContent)
 	if msg.RoomID != portal.MXID || !ok || !strings.Contains(content.Body, "Send a project directory path") || !strings.Contains(content.Body, "/approvals") {
-		t.Fatalf("default New Project room intro was not queued: %#v", msg)
+		t.Fatalf("default New Codex Session room intro was not queued: %#v", msg)
 	}
 }
 
@@ -3424,6 +3621,7 @@ func TestClientConnectDoesNotCreateDefaultNewProjectRoomWhenStarterExists(t *tes
 		PortalKey: existingKey,
 		MXID:      "!existing-starter:example.com",
 		Name:      "New Project",
+		NameSet:   true,
 		RoomType:  database.RoomTypeDM,
 		Metadata:  &PortalMetadata{NewProjectIntroMessage: true},
 	}); err != nil {
@@ -3443,6 +3641,11 @@ func TestClientConnectDoesNotCreateDefaultNewProjectRoomWhenStarterExists(t *tes
 		t.Fatal(err)
 	} else if portal != nil && portal.MXID != "" {
 		t.Fatalf("connect should not create a second default starter room when one exists: %#v", portal.Portal)
+	}
+	if portal, err := br.GetExistingPortalByKey(ctx, existingKey); err != nil {
+		t.Fatal(err)
+	} else if portal == nil || portal.Name != "New Codex Session" {
+		t.Fatalf("existing legacy starter room should be renamed: %#v", portal)
 	}
 	if len(matrix.intent().messages) != 0 {
 		t.Fatalf("existing starter with intro metadata should not queue another intro: %#v", matrix.intent().messages)
@@ -3702,7 +3905,7 @@ func TestHydrateThreadRoomsCleansStaleRoomFeaturePowerLevels(t *testing.T) {
 	if err = br.DB.Portal.Insert(ctx, &database.Portal{
 		PortalKey: key,
 		MXID:      "!starter:example.com",
-		Name:      "New Project",
+		Name:      "New Codex Session",
 		RoomType:  database.RoomTypeDM,
 		Metadata:  &PortalMetadata{},
 	}); err != nil {
@@ -3756,7 +3959,7 @@ func TestHydrateThreadRoomsQueuesExistingNewProjectIntro(t *testing.T) {
 	if err = br.DB.Portal.Insert(ctx, &database.Portal{
 		PortalKey: key,
 		MXID:      "!starter:example.com",
-		Name:      "New Project",
+		Name:      "New Codex Session",
 		RoomType:  database.RoomTypeDM,
 		Metadata:  &PortalMetadata{},
 	}); err != nil {

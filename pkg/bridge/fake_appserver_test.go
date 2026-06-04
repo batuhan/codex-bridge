@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/beeper/codex-bridge/pkg/appserver"
 )
 
 const fakeAppServerEnv = "CODEX_BRIDGE_FAKE_APPSERVER"
@@ -58,53 +60,60 @@ func runFakeAppServer() {
 			}
 			cwd := firstString(payload, "cwd")
 			switch msg.Method {
+			case "account/read":
+				resp.Result = fakeAppServerAccountReadResponse()
 			case "model/list":
 				resp.Result = map[string]any{
-					"data": []map[string]any{
-						{"id": "gpt-5", "model": "gpt-5"},
-						{"id": "gpt-5.1", "model": "gpt-5.1"},
-						{"id": "claude-sonnet-4.5", "model": "anthropic/claude-sonnet-4.5"},
+					"data": []any{
+						fakeAppServerModel("gpt-5", "gpt-5", "GPT-5", true),
+						fakeAppServerModel("gpt-5.1", "gpt-5.1", "GPT-5.1", false),
+						fakeAppServerModel("claude-sonnet-4.5", "anthropic/claude-sonnet-4.5", "Claude Sonnet 4.5", false),
 					},
+					"nextCursor": nil,
+				}
+			case "thread/list":
+				cwdFilter := firstString(payload, "cwd")
+				if cwdFilter == "" {
+					cwdFilter = "/tmp/project"
+				}
+				resp.Result = map[string]any{
+					"data": []any{
+						fakeAppServerThread("thread-1", cwdFilter, false),
+						fakeAppServerThread("thread-2", cwdFilter, false),
+					},
+					"nextCursor":      nil,
+					"backwardsCursor": "thread-1",
 				}
 			case "thread/read", "thread/resume", "thread/start", "thread/rollback":
 				if cwd == "" {
 					cwd = os.TempDir()
 				}
 				thread := map[string]any{
-					"thread": map[string]any{
-						"id":            threadID,
-						"sessionId":     threadID,
-						"cwd":           cwd,
-						"modelProvider": "openai",
-					},
-					"cwd":             cwd,
-					"model":           "gpt-5",
-					"modelProvider":   "openai",
-					"reasoningEffort": "high",
+					"thread":             fakeAppServerThread(threadID, cwd, msg.Method == "thread/read" && payload["includeTurns"] == true),
+					"cwd":                cwd,
+					"model":              "gpt-5",
+					"modelProvider":      "openai",
+					"serviceTier":        nil,
+					"instructionSources": []string{},
+					"approvalPolicy":     "on-request",
+					"approvalsReviewer":  map[string]any{"type": "user"},
+					"sandbox":            map[string]any{"mode": "workspace-write"},
+					"reasoningEffort":    "high",
 				}
 				if threadID == "archived-thread" {
-					thread["thread"].(map[string]any)["archived"] = true
-				}
-				if msg.Method == "thread/read" && payload["includeTurns"] == true {
-					thread["thread"].(map[string]any)["turns"] = []map[string]any{
-						{"id": "turn-1", "status": "completed"},
-						{"id": "turn-2", "status": "completed"},
-					}
+					thread["thread"].(map[string]any)["archivedAt"] = "2026-06-01T00:00:00Z"
 				}
 				resp.Result = thread
 			case "turn/start":
 				turnID := firstTrimmedNonEmpty(os.Getenv(fakeAppServerTurnStartIDEnv), "turn-1")
 				resp.Result = map[string]any{
-					"turn": map[string]any{
-						"id":     turnID,
-						"status": "inProgress",
-					},
+					"turn": fakeAppServerTurn(turnID, "inProgress"),
 				}
 			case "turn/steer":
 				if os.Getenv(fakeAppServerNoActiveSteerEnv) == "1" {
-					resp.Error = map[string]any{"code": -32004, "message": "no active turn to steer"}
+					resp.Error = map[string]any{"code": -32600, "message": "no active turn to steer"}
 				} else {
-					resp.Result = map[string]any{}
+					resp.Result = map[string]any{"turnId": firstString(payload, "expectedTurnId")}
 				}
 			case "turn/interrupt":
 				resp.Result = map[string]any{}
@@ -119,6 +128,148 @@ func runFakeAppServer() {
 		raw, _ := json.Marshal(resp)
 		_, _ = writer.Write(append(raw, '\n'))
 		_ = writer.Flush()
+	}
+}
+
+func fakeAppServerAccountReadResponse() map[string]any {
+	return map[string]any{
+		"account": map[string]any{
+			"type":     "chatgpt",
+			"email":    "alice@example.com",
+			"planType": "pro",
+		},
+		"requiresOpenaiAuth": true,
+	}
+}
+
+func fakeAppServerModel(id, model, displayName string, isDefault bool) map[string]any {
+	return map[string]any{
+		"id":                        id,
+		"model":                     model,
+		"upgrade":                   nil,
+		"upgradeInfo":               nil,
+		"availabilityNux":           nil,
+		"displayName":               displayName,
+		"description":               displayName,
+		"hidden":                    false,
+		"supportedReasoningEfforts": []any{map[string]any{"reasoningEffort": "high", "description": "high"}},
+		"defaultReasoningEffort":    "high",
+		"inputModalities":           []string{"text", "image"},
+		"supportsPersonality":       true,
+		"additionalSpeedTiers":      []string{},
+		"serviceTiers":              []any{},
+		"defaultServiceTier":        nil,
+		"isDefault":                 isDefault,
+	}
+}
+
+func fakeAppServerThread(threadID, cwd string, includeTurns bool) map[string]any {
+	turns := []any{}
+	if includeTurns {
+		turns = []any{
+			fakeAppServerTurn("turn-1", "completed"),
+			fakeAppServerTurn("turn-2", "completed"),
+		}
+	}
+	return map[string]any{
+		"id":             threadID,
+		"sessionId":      threadID,
+		"forkedFromId":   nil,
+		"parentThreadId": nil,
+		"preview":        "",
+		"ephemeral":      false,
+		"modelProvider":  "openai",
+		"createdAt":      int64(1_717_200_000),
+		"updatedAt":      int64(1_717_200_060),
+		"status":         map[string]any{"type": "idle"},
+		"path":           nil,
+		"cwd":            cwd,
+		"cliVersion":     "0.136.0",
+		"source":         "appServer",
+		"threadSource":   "user",
+		"agentNickname":  nil,
+		"agentRole":      nil,
+		"gitInfo":        nil,
+		"name":           nil,
+		"turns":          turns,
+	}
+}
+
+func fakeAppServerTurn(turnID, status string) map[string]any {
+	return map[string]any{
+		"id":          turnID,
+		"items":       []any{},
+		"itemsView":   "full",
+		"status":      status,
+		"error":       nil,
+		"startedAt":   int64(1_717_200_000),
+		"completedAt": nil,
+		"durationMs":  nil,
+	}
+}
+
+func TestFakeAppServerContractShapes(t *testing.T) {
+	raw, err := json.Marshal(fakeAppServerAccountReadResponse())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var account appserver.AccountReadResponse
+	if err = json.Unmarshal(raw, &account); err != nil {
+		t.Fatal(err)
+	}
+	if account.Account == nil || account.Account.Type != "chatgpt" || account.Account.PlanType != "pro" || !account.RequiresOpenAIAuth {
+		t.Fatalf("bad fake account/read shape: %#v", account)
+	}
+
+	raw, err = json.Marshal(map[string]any{
+		"data":       []any{fakeAppServerModel("gpt-5", "gpt-5", "GPT-5", true)},
+		"nextCursor": nil,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var models appserver.ModelListResponse
+	if err = json.Unmarshal(raw, &models); err != nil {
+		t.Fatal(err)
+	}
+	if len(models.Data) != 1 || models.Data[0].DisplayName != "GPT-5" || !models.Data[0].IsDefault {
+		t.Fatalf("bad fake model/list shape: %#v", models)
+	}
+
+	raw, err = json.Marshal(map[string]any{"thread": fakeAppServerThread("thread-1", "/tmp/project", true)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var thread appserver.ThreadReadResponse
+	if err = json.Unmarshal(raw, &thread); err != nil {
+		t.Fatal(err)
+	}
+	if thread.Thread.ID != "thread-1" || thread.Thread.Cwd != "/tmp/project" || len(thread.Thread.Turns) != 2 || thread.Thread.Raw["status"] == nil {
+		t.Fatalf("bad fake thread/read shape: %#v", thread.Thread)
+	}
+
+	raw, err = json.Marshal(map[string]any{"turn": fakeAppServerTurn("turn-1", "inProgress")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var start appserver.TurnStartResponse
+	if err = json.Unmarshal(raw, &start); err != nil {
+		t.Fatal(err)
+	}
+	if start.Turn.ID != "turn-1" || start.Turn.Status != "inProgress" {
+		t.Fatalf("bad fake turn/start shape: %#v", start)
+	}
+
+	raw, err = json.Marshal(map[string]any{"turnId": "turn-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var steer appserver.TurnSteerResponse
+	if err = json.Unmarshal(raw, &steer); err != nil {
+		t.Fatal(err)
+	}
+	if steer.TurnID != "turn-1" {
+		t.Fatalf("bad fake turn/steer shape: %#v", steer)
 	}
 }
 

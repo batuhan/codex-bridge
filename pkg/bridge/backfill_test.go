@@ -786,6 +786,20 @@ func TestNewestBackfillEntryWindowUsesNewestEntries(t *testing.T) {
 	}
 }
 
+func TestDedupeBackfillMessagesDropsDuplicateIDs(t *testing.T) {
+	messages := []*bridgev2.BackfillMessage{
+		{ID: "m1", Timestamp: time.Unix(1, 0)},
+		{ID: "m1", Timestamp: time.Unix(2, 0)},
+		{ID: "m2", Timestamp: time.Unix(3, 0)},
+	}
+
+	filtered := dedupeBackfillMessages(messages)
+
+	if ids := backfillMessageIDs(filtered); strings.Join(ids, ",") != "m1,m2" {
+		t.Fatalf("unexpected deduped backfill IDs: %#v", ids)
+	}
+}
+
 func TestBackfillEntryCursorFiltersSameTimestampByID(t *testing.T) {
 	ts := time.Unix(100, 0)
 	cursor := backfillEntryCursorFor(&backfillEntry{ID: "m2", Timestamp: ts})
@@ -872,6 +886,10 @@ func TestCodexBackfillMaxBatchCountIsUnlimitedForRooms(t *testing.T) {
 	portal.Metadata = &PortalMetadata{}
 	if got := client.GetBackfillMaxBatchCount(context.Background(), portal, nil); got != 0 {
 		t.Fatalf("rooms without a Codex thread should not backfill, got %d", got)
+	}
+	portal.Metadata = &PortalMetadata{ThreadID: "thread-1", BackfillDisabled: true}
+	if got := client.GetBackfillMaxBatchCount(context.Background(), portal, nil); got != 0 {
+		t.Fatalf("backfill-disabled rooms should not backfill, got %d", got)
 	}
 	portal.RoomType = database.RoomTypeSpace
 	portal.Metadata = &PortalMetadata{ThreadID: "thread-1"}

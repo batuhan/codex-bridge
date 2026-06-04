@@ -3,12 +3,14 @@ package appserver
 import "encoding/json"
 
 type AccountReadResponse struct {
-	Account *Account `json:"account"`
+	Account            *Account `json:"account"`
+	RequiresOpenAIAuth bool     `json:"requiresOpenaiAuth"`
 }
 
 type Account struct {
-	Type  string `json:"type"`
-	Email string `json:"email"`
+	Type     string `json:"type"`
+	Email    string `json:"email"`
+	PlanType string `json:"planType"`
 }
 
 type ThreadListResponse struct {
@@ -46,12 +48,23 @@ type ModelListResponse struct {
 }
 
 type Model struct {
-	ID    string `json:"id"`
-	Model string `json:"model"`
+	ID                     string   `json:"id"`
+	Model                  string   `json:"model"`
+	DisplayName            string   `json:"displayName"`
+	Description            string   `json:"description"`
+	Hidden                 bool     `json:"hidden"`
+	DefaultReasoningEffort string   `json:"defaultReasoningEffort"`
+	InputModalities        []string `json:"inputModalities"`
+	SupportsPersonality    bool     `json:"supportsPersonality"`
+	IsDefault              bool     `json:"isDefault"`
 }
 
 type TurnStartResponse struct {
 	Turn Turn `json:"turn"`
+}
+
+type TurnSteerResponse struct {
+	TurnID string `json:"turnId"`
 }
 
 type Thread struct {

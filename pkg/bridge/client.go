@@ -35,6 +35,8 @@ type Client struct {
 	loggedIn                bool
 	activeStreamJanitorMu   sync.Mutex
 	activeStreamJanitorStop context.CancelFunc
+	newProjectIntroMu       sync.Mutex
+	newProjectIntroQueued   map[networkid.PortalKey]bool
 }
 
 const newProjectPrompt = "Send a project directory path to start Codex."
@@ -136,7 +138,7 @@ func (cl *Client) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*br
 			cl.Main.rememberThreadRoom(meta.ThreadID, cl, portal.PortalKey, meta.Cwd, nil)
 		}
 	}
-	name := "New Project"
+	name := provisionalProjectTitle()
 	var state map[string]any
 	missingThread := false
 	switch {
@@ -144,7 +146,7 @@ func (cl *Client) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*br
 		thread, err := cl.readThread(ctx, meta.ThreadID, false)
 		if err != nil {
 			if meta.Cwd != "" {
-				name = projectDisplayPath(meta.Cwd)
+				name = provisionalProjectRoomName(meta.Cwd)
 			}
 			if isThreadNotFoundError(err) {
 				missingThread = true
@@ -162,7 +164,7 @@ func (cl *Client) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*br
 			}
 		}
 	case meta.Cwd != "":
-		name = projectDisplayPath(meta.Cwd)
+		name = provisionalProjectRoomName(meta.Cwd)
 	}
 	if meta.ThreadID == "" && meta.Cwd == "" {
 		info := cl.newProjectChatInfo()
@@ -667,16 +669,117 @@ func (cl *Client) redactAndDeleteMessagesAfter(ctx context.Context, portal *brid
 }
 
 func (cl *Client) redactBridgeMessage(ctx context.Context, portal *bridgev2.Portal, eventID id.EventID) error {
+	return cl.redactBridgeMessageWithReason(ctx, portal, eventID, "Codex prompt edited")
+}
+
+func (cl *Client) redactBridgeMessageWithReason(ctx context.Context, portal *bridgev2.Portal, eventID id.EventID, reason string) error {
 	if cl == nil || cl.Main == nil || cl.Main.Bridge == nil || cl.Main.Bridge.Bot == nil || portal == nil || portal.MXID == "" || eventID == "" {
 		return nil
+	}
+	if reason == "" {
+		reason = "Codex bridge cleanup"
 	}
 	_, err := cl.Main.Bridge.Bot.SendMessage(ctx, portal.MXID, event.EventRedaction, &event.Content{
 		Parsed: &event.RedactionEventContent{
 			Redacts: eventID,
-			Reason:  "Codex prompt edited",
+			Reason:  reason,
 		},
 	}, nil)
 	return err
+}
+
+func (cl *Client) unbridgeProjectBackfill(ctx context.Context, rawPath string) (string, error) {
+	rawPath = firstTrimmedNonEmpty(rawPath)
+	if rawPath == "" {
+		return "Usage: `/unbridge PATH`", nil
+	}
+	if cl == nil || cl.Main == nil || cl.Main.Bridge == nil || cl.UserLogin == nil {
+		return "", fmt.Errorf("missing Codex bridge login")
+	}
+	cwd, err := cleanProjectDir(rawPath)
+	if err != nil {
+		return "That is not an available project directory.\n\n" + err.Error(), nil
+	}
+	portalKey := projectPortalKey(cwd, cl.UserLogin.ID)
+	portal, err := cl.Main.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	if err != nil {
+		return "", err
+	}
+	if portal == nil || portal.MXID == "" {
+		return "No bridged Codex room found for " + projectDisplayPath(cwd) + ".", nil
+	}
+	meta := portalMetadata(portal.Metadata)
+	keepThreadID := meta.ThreadID
+	if meta.Cwd == "" {
+		meta.Cwd = cwd
+	}
+	if meta.Kind == "" {
+		meta.Kind = portalKindProject
+	}
+	meta.BackfillDisabled = true
+	portal.Metadata = meta
+	if err := portal.Save(ctx); err != nil {
+		return "", err
+	}
+	if err := cl.Main.Bridge.DB.BackfillTask.Delete(ctx, portal.PortalKey); err != nil {
+		return "", err
+	}
+	removed, err := cl.redactAndDeleteOtherThreadMessages(ctx, portal, keepThreadID)
+	if err != nil {
+		return "", err
+	}
+	zerolog.Ctx(ctx).Info().
+		Stringer("portal_key", portal.PortalKey).
+		Str("cwd", cwd).
+		Str("kept_thread_id", keepThreadID).
+		Int("removed_messages", removed).
+		Msg("Unbridged Codex project history backfill")
+	return fmt.Sprintf("Stopped Codex history backfill for %s and removed %d backfilled messages.", projectDisplayPath(cwd), removed), nil
+}
+
+func (cl *Client) redactAndDeleteOtherThreadMessages(ctx context.Context, portal *bridgev2.Portal, keepThreadID string) (int, error) {
+	if cl == nil || cl.Main == nil || cl.Main.Bridge == nil || cl.Main.Bridge.DB == nil || portal == nil {
+		return 0, nil
+	}
+	count, err := cl.Main.Bridge.DB.Message.CountMessagesInPortal(ctx, portal.PortalKey)
+	if err != nil {
+		return 0, err
+	}
+	messages, err := cl.Main.Bridge.DB.Message.GetLastNInPortal(ctx, portal.PortalKey, count)
+	if err != nil {
+		return 0, err
+	}
+	seenMXID := map[id.EventID]bool{}
+	removed := 0
+	for _, msg := range messages {
+		if msg == nil || !isOtherThreadMessage(msg, keepThreadID) {
+			continue
+		}
+		if msg.MXID != "" && !strings.HasPrefix(string(msg.MXID), "~fake:") && !seenMXID[msg.MXID] {
+			seenMXID[msg.MXID] = true
+			if err := cl.redactBridgeMessageWithReason(ctx, portal, msg.MXID, "Codex history backfill removed"); err != nil {
+				return removed, err
+			}
+		}
+		if meta, _ := msg.Metadata.(*MessageMetadata); meta != nil && meta.TurnID != "" && cl.Main.Store != nil && cl.UserLogin != nil {
+			if err := cl.Main.Store.DeleteActiveStream(ctx, cl.UserLogin.ID, meta.TurnID); err != nil {
+				zerolog.Ctx(ctx).Warn().Err(err).Str("turn_id", meta.TurnID).Msg("Failed to delete Codex active stream record during unbridge")
+			}
+		}
+		if err := cl.Main.Bridge.DB.Message.Delete(ctx, msg.RowID); err != nil {
+			return removed, err
+		}
+		removed++
+	}
+	return removed, nil
+}
+
+func isOtherThreadMessage(msg *database.Message, keepThreadID string) bool {
+	meta, ok := messageMetadata(msg.Metadata)
+	if !ok || meta.ThreadID == "" {
+		return false
+	}
+	return keepThreadID == "" || meta.ThreadID != keepThreadID
 }
 
 func (cl *Client) freshPortal(ctx context.Context, portal *bridgev2.Portal) *bridgev2.Portal {
@@ -1084,14 +1187,14 @@ func (cl *Client) newProjectChat() *bridgev2.CreateChatResponse {
 
 func (cl *Client) newProjectChatForCWD(cwd string) *bridgev2.CreateChatResponse {
 	return &bridgev2.CreateChatResponse{
-		PortalKey:      newProjectPortalKey(cl.loginID()),
+		PortalKey:      projectPortalKey(cwd, cl.loginID()),
 		PortalInfo:     cl.projectStarterChatInfo(cwd),
 		DMRedirectedTo: codexUserID,
 	}
 }
 
 func (cl *Client) projectStarterChatInfo(cwd string) *bridgev2.ChatInfo {
-	info := codexChatInfo(projectDisplayPath(cwd), cl.codexMembers())
+	info := codexChatInfo(provisionalProjectRoomName(cwd), cl.codexMembers())
 	info.CanBackfill = false
 	info.ExtraUpdates = func(ctx context.Context, portal *bridgev2.Portal) bool {
 		oldThreadID := ""
@@ -1107,7 +1210,7 @@ func (cl *Client) projectStarterChatInfo(cwd string) *bridgev2.ChatInfo {
 
 func (cl *Client) newProjectChatInfo() *bridgev2.ChatInfo {
 	roomType := database.RoomTypeDM
-	name := "New Project"
+	name := provisionalProjectTitle()
 	topic := newProjectPrompt
 	return &bridgev2.ChatInfo{
 		Name:                       &name,
@@ -1132,6 +1235,7 @@ func (cl *Client) newProjectIntroUpdater() bridgev2.ExtraUpdater[*bridgev2.Porta
 		meta := portalMetadata(portal.Metadata)
 		meta.NewProjectIntroMessage = true
 		portal.Metadata = meta
+		cl.markNewProjectIntroQueued(portal.PortalKey)
 		go cl.queueNewProjectIntroMessage(context.WithoutCancel(ctx), portal.PortalKey)
 		return true
 	}
@@ -1142,13 +1246,70 @@ func (cl *Client) canQueueNewProjectIntro(portal *bridgev2.Portal) bool {
 		return false
 	}
 	meta := portalMetadata(portal.Metadata)
-	return !meta.NewProjectIntroMessage && meta.ThreadID == "" && meta.Cwd == ""
+	if meta.ThreadID != "" || meta.Cwd != "" {
+		return false
+	}
+	if cl.hasNewProjectIntroQueued(portal.PortalKey) {
+		return false
+	}
+	if !meta.NewProjectIntroMessage {
+		return true
+	}
+	return !cl.portalHasNewProjectIntroMessage(context.Background(), portal.PortalKey)
+}
+
+func (cl *Client) hasNewProjectIntroQueued(portalKey networkid.PortalKey) bool {
+	cl.newProjectIntroMu.Lock()
+	defer cl.newProjectIntroMu.Unlock()
+	return cl.newProjectIntroQueued[portalKey]
+}
+
+func (cl *Client) markNewProjectIntroQueued(portalKey networkid.PortalKey) {
+	cl.newProjectIntroMu.Lock()
+	defer cl.newProjectIntroMu.Unlock()
+	if cl.newProjectIntroQueued == nil {
+		cl.newProjectIntroQueued = make(map[networkid.PortalKey]bool)
+	}
+	cl.newProjectIntroQueued[portalKey] = true
+}
+
+func (cl *Client) portalHasNewProjectIntroMessage(ctx context.Context, portalKey networkid.PortalKey) bool {
+	if cl == nil || cl.UserLogin == nil || cl.UserLogin.Bridge == nil || portalKey.ID == "" {
+		return false
+	}
+	msgs, err := cl.UserLogin.Bridge.DB.Message.GetLastNInPortal(ctx, portalKey, 25)
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Stringer("portal_key", portalKey).Msg("Failed to check Codex new project intro message")
+		return true
+	}
+	msgID := networkid.MessageID("new-project-intro:" + string(portalKey.ID))
+	for _, msg := range msgs {
+		if msg.ID == msgID {
+			return true
+		}
+	}
+	return false
 }
 
 func (cl *Client) queueNewProjectIntroMessage(ctx context.Context, portalKey networkid.PortalKey) {
+	if cl == nil || cl.UserLogin == nil || cl.UserLogin.Bridge == nil {
+		return
+	}
+	portal, err := cl.UserLogin.Bridge.GetExistingPortalByKey(ctx, portalKey)
+	if err != nil || portal == nil || portal.MXID == "" || portal.Bridge == nil || portal.RoomCreated == nil {
+		if err != nil {
+			zerolog.Ctx(ctx).Warn().Err(err).Stringer("portal_key", portalKey).Msg("Failed to load Codex new project intro portal")
+		}
+		return
+	}
 	now := time.Now()
 	msgID := networkid.MessageID("new-project-intro:" + string(portalKey.ID))
 	run := commandNoticeRun(newProjectIntroText, string(msgID), string(portalKey.ID), "", now)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			zerolog.Ctx(ctx).Warn().Any("panic", recovered).Stringer("portal_key", portalKey).Msg("Skipped Codex new project intro for uninitialized portal")
+		}
+	}()
 	res := cl.UserLogin.QueueRemoteEvent(&simplevent.Message[aistream.Run]{
 		EventMeta: remoteEventMeta(bridgev2.RemoteEventMessage, portalKey, codexUserID, now),
 		ID:        msgID,
@@ -1196,7 +1357,7 @@ func (cl *Client) chatForProject(ctx context.Context, cwd, threadID string, stat
 	return &bridgev2.CreateChatResponse{
 		PortalKey:      key,
 		Portal:         portal,
-		PortalInfo:     portalInfo(projectDisplayPath(cwd), cl.codexMembers(), cwd, threadID, state),
+		PortalInfo:     portalInfo(codexThreadDisplayName(cwd, state), cl.codexMembers(), cwd, threadID, state),
 		DMRedirectedTo: codexUserID,
 	}
 }
@@ -1229,7 +1390,21 @@ func (cl *Client) latestThreadForDirectory(ctx context.Context, cwd string) (app
 }
 
 func isThreadForDirectory(thread appserver.Thread, cwd string) bool {
-	return projectCanonicalPath(thread.Cwd) == projectCanonicalPath(cwd) && !isDetachedThread(thread)
+	return sameProjectDirectory(thread.Cwd, cwd) && !isDetachedThread(thread)
+}
+
+func sameProjectDirectory(left, right string) bool {
+	left = firstTrimmedNonEmpty(left)
+	right = firstTrimmedNonEmpty(right)
+	if left == "" || right == "" {
+		return false
+	}
+	if projectCanonicalPath(left) == projectCanonicalPath(right) {
+		return true
+	}
+	leftInfo, leftErr := os.Stat(left)
+	rightInfo, rightErr := os.Stat(right)
+	return leftErr == nil && rightErr == nil && os.SameFile(leftInfo, rightInfo)
 }
 
 func (cl *Client) latestThreadStateForDirectory(ctx context.Context, cwd string) (appserver.Thread, string, map[string]any) {
@@ -1703,13 +1878,16 @@ func (cl *Client) syncSubagentPortal(ctx context.Context, portal *bridgev2.Porta
 	return portal
 }
 
-const codexBackfillVersion = 3
+const codexBackfillVersion = 6
 
 func (cl *Client) syncPortalBackfill(ctx context.Context, portal *bridgev2.Portal, oldThreadID string) {
 	if cl == nil || cl.Main == nil || cl.Main.Bridge == nil || cl.UserLogin == nil || portal == nil || portal.MXID == "" {
 		return
 	}
 	meta := portalMetadata(portal.Metadata)
+	if meta.BackfillDisabled {
+		return
+	}
 	if meta.ThreadID == "" && meta.Cwd == "" {
 		return
 	}
@@ -1906,6 +2084,9 @@ func (cl *Client) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 		return emptyFetchMessagesResponse(), nil
 	}
 	meta := portalMetadata(params.Portal.Metadata)
+	if meta.BackfillDisabled {
+		return emptyFetchMessagesResponse(), nil
+	}
 	meta = cl.hydratePortalThreadMetadata(ctx, params.Portal, meta)
 	if meta.Kind != portalKindSubagent && meta.Cwd != "" {
 		if !params.Forward {
@@ -1940,6 +2121,7 @@ func (cl *Client) backfillThreadPage(ctx context.Context, portal *bridgev2.Porta
 	if err != nil {
 		return nil, err
 	}
+	messages = dedupeBackfillMessages(messages)
 	resp.Messages = messages
 	return resp, nil
 }
@@ -1953,6 +2135,7 @@ func (cl *Client) backfillDirectoryPage(ctx context.Context, portal *bridgev2.Po
 	if err != nil {
 		return nil, err
 	}
+	messages = dedupeBackfillMessages(messages)
 	resp := &bridgev2.FetchMessagesResponse{
 		Messages: messages,
 		HasMore:  hasMore,
@@ -2028,6 +2211,9 @@ func (cl *Client) GetBackfillMaxBatchCount(ctx context.Context, portal *bridgev2
 		return 0
 	}
 	meta := portalMetadata(portal.Metadata)
+	if meta.BackfillDisabled {
+		return 0
+	}
 	if meta.ThreadID != "" || meta.Cwd != "" {
 		return -1
 	}
@@ -2407,7 +2593,19 @@ func codexRequestModel(model string) string {
 }
 
 func threadName(thread appserver.Thread) string {
-	return projectThreadRoomName(firstTrimmedNonEmpty(thread.Name, codexThreadTitle(thread.Raw), thread.Preview), thread.Cwd)
+	return projectThreadRoomName(firstTrimmedNonEmpty(thread.Name, codexThreadTitle(thread.Raw), provisionalProjectTitle()), thread.Cwd)
+}
+
+func provisionalProjectTitle() string {
+	return "New Codex Session"
+}
+
+func legacyProjectTitle() string {
+	return "New Project"
+}
+
+func provisionalProjectRoomName(cwd string) string {
+	return projectThreadRoomName(provisionalProjectTitle(), cwd)
 }
 
 func projectThreadRoomName(title, cwd string) string {
