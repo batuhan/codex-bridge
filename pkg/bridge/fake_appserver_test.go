@@ -14,6 +14,8 @@ import (
 const fakeAppServerEnv = "CODEX_BRIDGE_FAKE_APPSERVER"
 const fakeAppServerLogEnv = "CODEX_BRIDGE_FAKE_APPSERVER_LOG"
 const fakeAppServerDelayEnv = "CODEX_BRIDGE_FAKE_APPSERVER_DELAY_MS"
+const fakeAppServerNoActiveSteerEnv = "CODEX_BRIDGE_FAKE_APPSERVER_NO_ACTIVE_STEER"
+const fakeAppServerTurnStartIDEnv = "CODEX_BRIDGE_FAKE_APPSERVER_TURN_START_ID"
 
 func TestMain(m *testing.M) {
 	if os.Getenv(fakeAppServerEnv) == "1" {
@@ -91,13 +93,20 @@ func runFakeAppServer() {
 				}
 				resp.Result = thread
 			case "turn/start":
+				turnID := firstTrimmedNonEmpty(os.Getenv(fakeAppServerTurnStartIDEnv), "turn-1")
 				resp.Result = map[string]any{
 					"turn": map[string]any{
-						"id":     "turn-1",
+						"id":     turnID,
 						"status": "inProgress",
 					},
 				}
-			case "turn/steer", "turn/interrupt":
+			case "turn/steer":
+				if os.Getenv(fakeAppServerNoActiveSteerEnv) == "1" {
+					resp.Error = map[string]any{"code": -32004, "message": "no active turn to steer"}
+				} else {
+					resp.Result = map[string]any{}
+				}
+			case "turn/interrupt":
 				resp.Result = map[string]any{}
 			default:
 				resp.Result = map[string]any{}

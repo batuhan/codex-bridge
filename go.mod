@@ -3,7 +3,7 @@ module github.com/beeper/codex-bridge
 go 1.25.0
 
 require (
-	github.com/beeper/ai-bridge v0.0.0
+	github.com/beeper/ai-bridge v0.0.0-20260604134059-7c31f0e4f547
 	github.com/mattn/go-sqlite3 v1.14.44
 	github.com/rs/zerolog v1.35.1
 	go.mau.fi/util v0.9.9
@@ -50,8 +50,6 @@ require (
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	maunium.net/go/mauflag v1.0.0 // indirect
 )
-
-replace github.com/beeper/ai-bridge => /Users/batuhan/projects/ai-bridge
 
 replace maunium.net/go/mautrix => /Users/batuhan/Projects/mautrix/.upstream/go
 

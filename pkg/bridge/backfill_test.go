@@ -12,6 +12,7 @@ import (
 	"maunium.net/go/mautrix/bridgev2"
 	"maunium.net/go/mautrix/bridgev2/database"
 	"maunium.net/go/mautrix/bridgev2/networkid"
+	"maunium.net/go/mautrix/event"
 
 	agui "github.com/beeper/ai-bridge/pkg/ag-ui"
 	aistream "github.com/beeper/ai-bridge/pkg/ai-stream"
@@ -321,6 +322,74 @@ func TestBackfillAssistantMessageUploadsOversizedFinalParts(t *testing.T) {
 	}
 }
 
+func TestBackfillUserMessageUploadsOversizedBody(t *testing.T) {
+	intent := &recordingMediaIntent{}
+	client := &Client{
+		Main:      &Connector{Bridge: &bridgev2.Bridge{Bot: intent}},
+		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "codex"}},
+	}
+	thread := appserver.Thread{
+		ID:            "thread-1",
+		ModelProvider: "openai/gpt-5",
+		CreatedAt:     100,
+		Turns: []appserver.Turn{{
+			ID:        "turn-1",
+			StartedAt: 100,
+			Items: []appserver.TurnItem{{
+				ID:      "user-1",
+				Type:    "userMessage",
+				Content: []appserver.InputPart{{Type: "text", Text: strings.Repeat("x", backfillTextEventBudgetBytes+1)}},
+			}},
+		}},
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{ID: "portal", Receiver: "codex"},
+		MXID:      "!room:example.com",
+	}}
+	messages, err := client.projectBackfillMessages(context.Background(), portal, thread)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected one user backfill message, got %d", len(messages))
+	}
+	part := messages[0].ConvertedMessage.Parts[0]
+	if part.Content.MsgType != event.MsgFile || part.Content.URL != intent.url || part.Content.FileName == "" {
+		t.Fatalf("oversized user backfill should become a file attachment: %#v", part.Content)
+	}
+	if intent.roomID != portal.MXID || intent.mimeType != "text/plain" || len(intent.data) <= backfillTextEventBudgetBytes {
+		t.Fatalf("backfill upload used wrong media data: room=%q mime=%q bytes=%d", intent.roomID, intent.mimeType, len(intent.data))
+	}
+	if part.Content.Info == nil || part.Content.Info.Size != len(intent.data) {
+		t.Fatalf("backfill attachment missing file size: %#v", part.Content.Info)
+	}
+}
+
+func TestBackfillUserMessageTruncatesOversizedBodyWithoutUpload(t *testing.T) {
+	client := &Client{UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "codex"}}}
+	thread := appserver.Thread{
+		ID:        "thread-1",
+		CreatedAt: 100,
+		Turns: []appserver.Turn{{
+			ID:        "turn-1",
+			StartedAt: 100,
+			Items: []appserver.TurnItem{{
+				ID:      "user-1",
+				Type:    "userMessage",
+				Content: []appserver.InputPart{{Type: "text", Text: strings.Repeat("x", backfillTextEventBudgetBytes+1)}},
+			}},
+		}},
+	}
+	messages, err := client.projectBackfillMessages(context.Background(), nil, thread)
+	if err != nil {
+		t.Fatal(err)
+	}
+	part := messages[0].ConvertedMessage.Parts[0]
+	if part.Content.MsgType != event.MsgText || !strings.Contains(part.Content.Body, backfillOversizedUserMessageNotice) || len([]byte(part.Content.Body)) > backfillTextEventBudgetBytes {
+		t.Fatalf("oversized user backfill fallback should be truncated text: type=%s bytes=%d body=%q", part.Content.MsgType, len([]byte(part.Content.Body)), part.Content.Body)
+	}
+}
+
 func TestBackfillUserMessageUsesCodexClientID(t *testing.T) {
 	client := &Client{UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "codex"}}}
 	thread := appserver.Thread{
@@ -533,6 +602,64 @@ func TestDirectoryBackfillMessagesMergesSessionsOldestFirst(t *testing.T) {
 		if i > 0 && msg.StreamOrder <= messages[i-1].StreamOrder {
 			t.Fatalf("directory backfill stream order did not increase at %d: %d <= %d", i, msg.StreamOrder, messages[i-1].StreamOrder)
 		}
+	}
+}
+
+func TestBackfillThreadPageOnlyUploadsSelectedPage(t *testing.T) {
+	intent := &recordingMediaIntent{}
+	client := &Client{
+		Main:      &Connector{Bridge: &bridgev2.Bridge{Bot: intent}},
+		UserLogin: &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "codex"}},
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{
+		PortalKey: networkid.PortalKey{ID: "portal", Receiver: "codex"},
+		MXID:      "!room:example.com",
+	}}
+	threads := []appserver.Thread{
+		{
+			ID:            "thread-old",
+			Cwd:           "/tmp/project",
+			ModelProvider: "openai/gpt-5",
+			CreatedAt:     100,
+			Turns: []appserver.Turn{{
+				ID:        "turn-old",
+				StartedAt: 100,
+				Items: []appserver.TurnItem{{
+					ID:      "user-old",
+					Type:    "userMessage",
+					Content: []appserver.InputPart{{Type: "text", Text: strings.Repeat("x", backfillTextEventBudgetBytes+1)}},
+				}},
+			}},
+		},
+		{
+			ID:            "thread-new",
+			Cwd:           "/tmp/project",
+			ModelProvider: "openai/gpt-5",
+			CreatedAt:     200,
+			Turns: []appserver.Turn{{
+				ID:        "turn-new",
+				StartedAt: 200,
+				Items: []appserver.TurnItem{{
+					ID:      "user-new",
+					Type:    "userMessage",
+					Content: []appserver.InputPart{{Type: "text", Text: "new prompt"}},
+				}},
+			}},
+		},
+	}
+
+	resp, err := client.backfillThreadPage(context.Background(), portal, threads, bridgev2.FetchMessagesParams{Count: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ids := backfillMessageIDs(resp.Messages); strings.Join(ids, ",") != "codex:turn-new:user-new" {
+		t.Fatalf("unexpected selected page IDs: %v", ids)
+	}
+	if len(intent.data) != 0 {
+		t.Fatalf("older oversized backfill message should not be uploaded for newest page, uploaded %d bytes", len(intent.data))
+	}
+	if !resp.HasMore || resp.Cursor != "1" {
+		t.Fatalf("page should still advertise older history: %#v", resp)
 	}
 }
 
@@ -1467,7 +1594,7 @@ func TestBackfillCommandExecutionUsesRawAggregatedOutput(t *testing.T) {
 	}
 }
 
-func TestBackfillCommandExecutionSyncsTerminalMetadataAfterOutput(t *testing.T) {
+func TestBackfillCommandExecutionDoesNotEmitTerminalMetadataAsOutput(t *testing.T) {
 	run := aistream.NewRun("turn-1", "thread-1", "codex", "codex", "Codex", time.Unix(0, 0))
 	writer := aistream.NewWriter(run, func() time.Time { return time.Unix(0, 0) })
 	item := appserver.TurnItem{
@@ -1490,9 +1617,8 @@ func TestBackfillCommandExecutionSyncsTerminalMetadataAfterOutput(t *testing.T) 
 	if countToolResult(run.Events, "cmd-1", "ok") != 1 {
 		t.Fatalf("expected backfilled command output exactly once, got %#v", run.Events)
 	}
-	if !hasToolResultStateContaining(run.Events, "cmd-1", `"exitCode":0`, agui.ToolResultStateComplete) ||
-		!hasToolResultStateContaining(run.Events, "cmd-1", `"durationMs":12`, agui.ToolResultStateComplete) {
-		t.Fatalf("expected terminal command metadata to sync after output, got %#v", run.Events)
+	if got := countToolResults(run.Events, "cmd-1"); got != 1 {
+		t.Fatalf("expected terminal command metadata not to emit as output, got %d events=%#v", got, run.Events)
 	}
 	assertAGUISequenceValid(t, run)
 }

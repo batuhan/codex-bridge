@@ -1020,6 +1020,7 @@ func (c *Connector) lookupThreadRoom(ctx context.Context, threadID string) (thre
 
 func (c *Connector) hydrateThreadRooms(ctx context.Context) {
 	c.reconcilePortals(ctx, "")
+	c.ensureDefaultNewProjectRooms(ctx)
 }
 
 func (c *Connector) reconcileLoginPortals(ctx context.Context, loginID networkid.UserLoginID) {
@@ -1027,6 +1028,7 @@ func (c *Connector) reconcileLoginPortals(ctx context.Context, loginID networkid
 		return
 	}
 	c.reconcilePortals(ctx, loginID)
+	c.ensureDefaultNewProjectRoom(ctx, loginID)
 }
 
 func (c *Connector) reconcilePortals(ctx context.Context, receiver networkid.UserLoginID) {
@@ -1046,6 +1048,66 @@ func (c *Connector) reconcilePortals(ctx context.Context, receiver networkid.Use
 			c.rememberPortalThreadRoom(portal)
 		}
 	}
+}
+
+func (c *Connector) ensureDefaultNewProjectRooms(ctx context.Context) {
+	if c == nil || c.Bridge == nil {
+		return
+	}
+	for _, login := range c.Bridge.GetAllCachedUserLogins() {
+		if login != nil {
+			c.ensureDefaultNewProjectRoom(ctx, login.ID)
+		}
+	}
+}
+
+func (c *Connector) ensureDefaultNewProjectRoom(ctx context.Context, loginID networkid.UserLoginID) {
+	if c == nil || c.Bridge == nil || loginID == "" || c.hasMaterializedNewProjectRoom(ctx, loginID) {
+		return
+	}
+	login := c.Bridge.GetCachedUserLoginByID(loginID)
+	if login == nil {
+		return
+	}
+	cl, ok := login.Client.(*Client)
+	if !ok || cl == nil {
+		cl = newLoggedInClient(c, login)
+		login.Client = cl
+	}
+	portal, err := c.Bridge.GetPortalByKey(ctx, defaultNewProjectPortalKey(loginID))
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Str("login_id", string(loginID)).Msg("Failed to load default Codex starter portal")
+		return
+	}
+	if portal == nil {
+		return
+	}
+	info := cl.newProjectChatInfo()
+	applyStoredPortalInfo(info, portal)
+	if portal.MXID != "" {
+		updatePortalInfo(ctx, portal, login, info)
+		return
+	}
+	if err = portal.CreateMatrixRoom(ctx, login, info); err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Str("login_id", string(loginID)).Msg("Failed to materialize default Codex starter room")
+	}
+}
+
+func (c *Connector) hasMaterializedNewProjectRoom(ctx context.Context, loginID networkid.UserLoginID) bool {
+	if c == nil || c.Bridge == nil || loginID == "" {
+		return false
+	}
+	portals, err := c.Bridge.GetAllPortals(ctx)
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).Str("login_id", string(loginID)).Msg("Failed to list Codex portals before starter room materialization")
+		return true
+	}
+	for _, portal := range portals {
+		if portal != nil && portal.PortalKey.Receiver == loginID && portal.MXID != "" && strings.HasPrefix(string(portal.ID), newPortalIDPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Connector) reconcileStartupPortal(ctx context.Context, portal *bridgev2.Portal) *bridgev2.Portal {
@@ -1073,6 +1135,9 @@ func (c *Connector) reconcileStartupPortal(ctx context.Context, portal *bridgev2
 	}
 	if portal.MXID != "" {
 		updateStartupPortalInfo(ctx, portal, login, cl)
+	}
+	if strings.HasPrefix(string(portal.ID), newPortalIDPrefix) {
+		return portal
 	}
 	return c.hydratePortalThreadRoomState(ctx, portal, cl, login)
 }
@@ -1116,7 +1181,7 @@ func (c *Connector) syncContactGhostsForThreads(ctx context.Context, threads []a
 
 func contactGhostUpdates(threads []appserver.Thread) []contactGhostUpdate {
 	contacts := []contactGhostUpdate{
-		{codexUserID, codexUserInfo("Codex", false)},
+		{newProjectUserID, newProjectUserInfo()},
 	}
 	for _, thread := range sortedRecentDirectories(threads) {
 		contacts = append(contacts, contactGhostUpdate{projectUserID(thread.Cwd), projectThreadUserInfo(thread)})
@@ -1211,7 +1276,7 @@ func (c *Connector) clearMissingPortalThread(ctx context.Context, cl *Client, po
 	cwd := missingThreadCWD(portal, meta.Cwd)
 	cl.clearMissingThread(ctx, portal, meta)
 	state := missingThreadState(cwd, oldThreadID)
-	portal.UpdateInfo(ctx, portalInfo(directoryName(cwd), cl.codexMembers(), cwd, "", state), cl.UserLogin, nil, time.Now())
+	portal.UpdateInfo(ctx, portalInfo(projectDisplayPath(cwd), cl.codexMembers(), cwd, "", state), cl.UserLogin, nil, time.Now())
 	zerolog.Ctx(ctx).Warn().Str("thread_id", oldThreadID).Str("cwd", cwd).Msg("Cleared missing Codex thread during startup")
 }
 
@@ -1506,13 +1571,20 @@ func codexThreadChatInfo(cwd, threadID string, state map[string]any) *bridgev2.C
 }
 
 func codexThreadDisplayName(cwd string, state map[string]any) string {
-	if name := firstString(state, "name", "threadName", "preview"); name != "" {
-		return name
+	if name := codexThreadTitle(state); name != "" {
+		return projectThreadRoomName(name, cwd)
+	}
+	if name := firstString(state, "preview"); name != "" {
+		return projectThreadRoomName(name, cwd)
 	}
 	if cwd != "" {
-		return directoryName(cwd)
+		return projectDisplayPath(cwd)
 	}
 	return ""
+}
+
+func codexThreadTitle(state map[string]any) string {
+	return firstString(state, "name", "threadName", "title", "generatedTitle", "generatedName")
 }
 
 func codexThreadState(method, threadID, cwd string, params json.RawMessage) map[string]any {
@@ -1542,6 +1614,7 @@ func threadPayloadStateFields() []string {
 		"model", "modelName", "modelProvider", "serviceTier", "effort", "reasoningEffort",
 		"reasoning_mode", "reasoningMode", "summary", "createdAt", "updatedAt", "ephemeral",
 		"cliVersion", "source", "threadSource", "agentNickname", "agentRole", "gitInfo",
+		"threadName", "title", "generatedTitle", "generatedName",
 	}
 }
 
@@ -1637,7 +1710,7 @@ func normalizeThreadState(method string, state map[string]any) {
 	if state == nil {
 		return
 	}
-	setNonEmptyMapString(state, "name", firstString(state, "threadName"))
+	setNonEmptyMapString(state, "name", firstString(state, "threadName", "title", "generatedTitle", "generatedName"))
 	normalizeThreadStatusState(state)
 	normalizeThreadGoalState(method, state)
 	normalizeThreadTokenUsageState(state)
@@ -2191,6 +2264,37 @@ func directoryName(path string) string {
 	return base
 }
 
+func projectCanonicalPath(path string) string {
+	path = firstTrimmedNonEmpty(path)
+	if path == "" {
+		return ""
+	}
+	if realPath, err := filepath.EvalSymlinks(path); err == nil {
+		return realPath
+	}
+	return filepath.Clean(path)
+}
+
+func projectDisplayPath(path string) string {
+	path = firstTrimmedNonEmpty(path)
+	if path == "" {
+		return ""
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return path
+	}
+	home = filepath.Clean(home)
+	cleaned := filepath.Clean(path)
+	if cleaned == home {
+		return "~"
+	}
+	if rest, err := filepath.Rel(home, cleaned); err == nil && rest != "." && !strings.HasPrefix(rest, ".."+string(filepath.Separator)) && rest != ".." {
+		return "~/" + rest
+	}
+	return path
+}
+
 func sortedRecentDirectories(threads []appserver.Thread) []appserver.Thread {
 	latest := latestThreadsByDirectory(threads)
 	out := make([]appserver.Thread, 0, len(latest))
@@ -2207,8 +2311,10 @@ func latestThreadsByDirectory(threads []appserver.Thread) map[string]appserver.T
 		if !isRecentDirectoryThread(thread) {
 			continue
 		}
-		if current, ok := latest[thread.Cwd]; !ok || thread.UpdatedAt > current.UpdatedAt {
-			latest[thread.Cwd] = thread
+		key := projectCanonicalPath(thread.Cwd)
+		thread.Cwd = key
+		if current, ok := latest[key]; !ok || thread.UpdatedAt > current.UpdatedAt {
+			latest[key] = thread
 		}
 	}
 	return latest
@@ -2267,13 +2373,18 @@ func codexUserInfo(name string, isBot bool, identifiers ...string) *bridgev2.Use
 	return info
 }
 
+func newProjectUserInfo() *bridgev2.UserInfo {
+	return codexUserInfo("New Project", false, "new", "new project", "codex")
+}
+
 func projectThreadUserInfo(thread appserver.Thread) *bridgev2.UserInfo {
-	return codexUserInfo(thread.Cwd, false, thread.Cwd, thread.ID, thread.Name)
+	display := projectDisplayPath(thread.Cwd)
+	return codexUserInfo(display, false, thread.Cwd, display, thread.ID, thread.Name)
 }
 
 func portalInfo(name string, members *bridgev2.ChatMemberList, cwd, threadID string, state map[string]any) *bridgev2.ChatInfo {
 	info := codexChatInfo(name, members)
-	info.CanBackfill = threadID != ""
+	info.CanBackfill = threadID != "" || cwd != ""
 	info.ExtraUpdates = codexThreadMetadataUpdater(cwd, threadID, state)
 	return info
 }

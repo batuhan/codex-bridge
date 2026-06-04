@@ -490,11 +490,15 @@ func (cl *Client) handleBridgeCommand(ctx context.Context, msg *bridgev2.MatrixM
 	if msg == nil {
 		return nil, false, nil
 	}
+	isMatrixCommand := msg.Content != nil && msg.Content.MsgType == matrixCommandMsgType
 	command, ok := parseCodexCommand(msg.Content)
 	if !ok && msg.Event != nil {
 		command, ok = codexCommandFromRawContent(msg.Event.Content.Raw)
 	}
 	if !ok {
+		if isMatrixCommand {
+			return cl.commandNoticeHandled(msg, "", "unsupported_command", "That Codex command is not supported.")
+		}
 		return nil, false, nil
 	}
 	meta := portalMetadata(msg.Portal.Metadata)
@@ -647,14 +651,30 @@ func codexStructuredCommand(input *event.MSC4391BotCommandInput) (codexCommand, 
 
 func codexTextCommandBody(content *event.MessageEventContent) (string, bool) {
 	body := firstTrimmedNonEmpty(content.Body)
-	if command, ok := strings.CutPrefix(body, "/"); ok {
+	if content.MsgType == matrixCommandMsgType {
+		return codexCommandBody(body)
+	}
+	return codexSlashCommandBody(body)
+}
+
+func codexCommandBody(body string) (string, bool) {
+	body = firstTrimmedNonEmpty(body)
+	if command, ok := codexSlashCommandBody(body); ok {
 		return command, true
 	}
 	if command, ok := strings.CutPrefix(body, "!codex "); ok {
 		return firstTrimmedNonEmpty(command), true
 	}
-	if content.MsgType == matrixCommandMsgType {
+	name, _, _ := splitCommandArg(body)
+	if canonicalCodexCommandName(name) != "" {
 		return body, true
+	}
+	return "", false
+}
+
+func codexSlashCommandBody(body string) (string, bool) {
+	if command, ok := strings.CutPrefix(firstTrimmedNonEmpty(body), "/"); ok {
+		return command, true
 	}
 	return "", false
 }
@@ -678,7 +698,7 @@ func canonicalCodexCommandName(name string) string {
 		return "approvals"
 	case "answer":
 		return "answer"
-	case "stop":
+	case "abort", "cancel", "interrupt", "stop":
 		return "stop"
 	default:
 		return ""

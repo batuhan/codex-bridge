@@ -18,6 +18,7 @@ const (
 	projectIDPrefix        = "project:"
 	subagentPortalIDPrefix = "subagent:"
 	newPortalIDPrefix      = "new:"
+	defaultNewPortalID     = networkid.PortalID(newPortalIDPrefix + "starter")
 
 	codexApprovalPolicyOnRequest = "on-request"
 )
@@ -34,6 +35,10 @@ func projectPortalKey(cwd string, loginID networkid.UserLoginID) networkid.Porta
 
 func newProjectPortalKey(loginID networkid.UserLoginID) networkid.PortalKey {
 	return portalKey(newProjectPortalID(), loginID)
+}
+
+func defaultNewProjectPortalKey(loginID networkid.UserLoginID) networkid.PortalKey {
+	return portalKey(string(defaultNewPortalID), loginID)
 }
 
 func newProjectPortalID() string {

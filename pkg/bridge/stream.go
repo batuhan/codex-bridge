@@ -7,6 +7,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -77,6 +79,7 @@ type activeRun struct {
 	toolArgsText      map[string]string
 	toolEnded         map[string]bool
 	toolResult        map[string]bool
+	generatedImages   map[string]bool
 	subagents         map[string]bool
 	agentText         map[string]string
 	reasoning         map[string]string
@@ -95,24 +98,25 @@ func newActiveRun(cl *Client, portalKey networkid.PortalKey, threadID, turnID st
 	writer := aistream.NewWriter(run, time.Now)
 	writer.Start()
 	return &activeRun{
-		client:       cl,
-		portalKey:    portalKey,
-		threadID:     threadID,
-		turnID:       turnID,
-		messageID:    networkid.MessageID(run.MessageID),
-		run:          run,
-		writer:       writer,
-		pending:      map[string]*pendingServerRequest{},
-		processes:    map[string]string{},
-		toolAliases:  map[string]string{},
-		toolStarted:  map[string]bool{},
-		toolArgsText: map[string]string{},
-		toolEnded:    map[string]bool{},
-		toolResult:   map[string]bool{},
-		subagents:    map[string]bool{},
-		agentText:    map[string]string{},
-		reasoning:    map[string]string{},
-		nextSeq:      1,
+		client:          cl,
+		portalKey:       portalKey,
+		threadID:        threadID,
+		turnID:          turnID,
+		messageID:       networkid.MessageID(run.MessageID),
+		run:             run,
+		writer:          writer,
+		pending:         map[string]*pendingServerRequest{},
+		processes:       map[string]string{},
+		toolAliases:     map[string]string{},
+		toolStarted:     map[string]bool{},
+		toolArgsText:    map[string]string{},
+		toolEnded:       map[string]bool{},
+		toolResult:      map[string]bool{},
+		generatedImages: map[string]bool{},
+		subagents:       map[string]bool{},
+		agentText:       map[string]string{},
+		reasoning:       map[string]string{},
+		nextSeq:         1,
 	}
 }
 
@@ -599,11 +603,11 @@ func (r *activeRun) handle(method string, params json.RawMessage) {
 			if result := codexToolResultText(item.Raw, !r.toolResult[toolID]); result != "" {
 				r.writeToolResult(toolID, result, state)
 			}
+			if state == agui.ToolResultStateComplete {
+				r.queueGeneratedImageFromItem(context.Background(), item)
+			}
 			if state != agui.ToolResultStateStreaming {
 				status := codexItemStatusText(item.Raw, state)
-				if result := codexToolCompletionMetadataText(item.Raw, state, status, r.toolResult[toolID]); result != "" {
-					r.writeToolResult(toolID, result, state)
-				}
 				input, _ := codexItemToolInput(item.Raw)
 				r.endToolCall(toolID, item.Name(), input, toolEndResult(state, status))
 			}
@@ -2033,6 +2037,9 @@ func (r *activeRun) mapRawToolEnd(item map[string]any) {
 	if state == agui.ToolResultStateStreaming {
 		return
 	}
+	if state == agui.ToolResultStateComplete {
+		r.queueGeneratedImageFromItem(context.Background(), codexItem{ID: callID, Type: firstString(item, "type"), Raw: item})
+	}
 	r.endToolCall(callID, name, input, toolEndResult(state, status))
 }
 
@@ -2083,6 +2090,234 @@ func (r *activeRun) writeCustom(name string, value any) {
 		return
 	}
 	r.writer.Custom(name, value)
+}
+
+func (r *activeRun) queueGeneratedImageFromItem(ctx context.Context, item codexItem) {
+	if r == nil || r.client == nil || r.client.UserLogin == nil || item.ID == "" {
+		return
+	}
+	payload, ok, err := generatedImagePayloadFromItem(item, r.currentCWD())
+	if err != nil {
+		zerolog.Ctx(ctx).Warn().Err(err).
+			Str("thread_id", r.threadID).
+			Str("turn_id", r.turnID).
+			Str("item_id", item.ID).
+			Str("item_type", item.Type).
+			Msg("Failed to read generated Codex image")
+		return
+	}
+	if !ok || !r.claimGeneratedImage(item.ID) {
+		return
+	}
+	msg := r.generatedImageMessage(payload, time.Now())
+	res := r.client.UserLogin.QueueRemoteEvent(msg)
+	if !res.Success {
+		logCodexQueueFailure(ctx, res, "Failed to queue generated Codex image", map[string]any{
+			"thread_id": r.threadID,
+			"turn_id":   r.turnID,
+			"item_id":   item.ID,
+		})
+	}
+}
+
+func (r *activeRun) claimGeneratedImage(itemID string) bool {
+	if r.generatedImages == nil {
+		r.generatedImages = map[string]bool{}
+	}
+	if r.generatedImages[itemID] {
+		return false
+	}
+	r.generatedImages[itemID] = true
+	return true
+}
+
+func (r *activeRun) currentCWD() string {
+	if r == nil {
+		return ""
+	}
+	if r.client != nil && r.client.Main != nil {
+		if room, ok := r.client.Main.threadRoom(r.threadID); ok {
+			return room.cwd
+		}
+	}
+	if cwd, ok := parseProjectPortalID(r.portalKey.ID); ok {
+		return cwd
+	}
+	return ""
+}
+
+func (r *activeRun) generatedImageMessage(payload generatedImagePayload, ts time.Time) *simplevent.Message[generatedImagePayload] {
+	imageMessageID := networkid.MessageID("codex:" + sanitizeID(r.turnID) + ":image:" + sanitizeID(payload.ItemID))
+	replyPart := partID("text")
+	replyTo := &networkid.MessageOptionalPartID{MessageID: r.messageID, PartID: &replyPart}
+	return &simplevent.Message[generatedImagePayload]{
+		EventMeta: remoteEventMeta(bridgev2.RemoteEventMessage, r.portalKey, codexUserID, ts),
+		ID:        imageMessageID,
+		Data:      payload,
+		ConvertMessageFunc: func(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, data generatedImagePayload) (*bridgev2.ConvertedMessage, error) {
+			return generatedImageConvertedMessage(ctx, portal, intent, data, replyTo, &MessageMetadata{
+				Role:         "assistant",
+				ThreadID:     r.threadID,
+				TurnID:       r.turnID,
+				StreamStatus: "image",
+			})
+		},
+	}
+}
+
+type generatedImagePayload struct {
+	ItemID   string
+	Data     []byte
+	URL      id.ContentURIString
+	FileName string
+	MimeType string
+}
+
+func generatedImagePayloadFromItem(item codexItem, cwd string) (generatedImagePayload, bool, error) {
+	if item.Type != "imageGeneration" && item.Type != "image_generation_call" {
+		return generatedImagePayload{}, false, nil
+	}
+	if path := firstString(item.Raw, "savedPath", "path"); path != "" {
+		payload, err := generatedImagePayloadFromPath(item.ID, path, cwd)
+		return payload, err == nil, err
+	}
+	if result := firstString(item.Raw, "result", "output"); result != "" {
+		payload, ok, err := generatedImagePayloadFromResult(item.ID, result)
+		return payload, ok, err
+	}
+	return generatedImagePayload{}, false, nil
+}
+
+func generatedImagePayloadFromPath(itemID, path, cwd string) (generatedImagePayload, error) {
+	resolved := path
+	if !filepath.IsAbs(resolved) && cwd != "" {
+		resolved = filepath.Join(cwd, resolved)
+	}
+	data, err := os.ReadFile(resolved)
+	if err != nil {
+		return generatedImagePayload{}, err
+	}
+	mimeType := imageMimeType(data, "")
+	return generatedImagePayload{
+		ItemID:   itemID,
+		Data:     data,
+		FileName: generatedImageFileName(filepath.Base(path), mimeType),
+		MimeType: mimeType,
+	}, nil
+}
+
+func generatedImagePayloadFromResult(itemID, result string) (generatedImagePayload, bool, error) {
+	if strings.HasPrefix(strings.TrimSpace(result), "mxc://") {
+		return generatedImagePayload{
+			ItemID:   itemID,
+			URL:      id.ContentURIString(strings.TrimSpace(result)),
+			FileName: generatedImageFileName("", "image/png"),
+			MimeType: "image/png",
+		}, true, nil
+	}
+	data, mimeType, ok, err := decodeGeneratedImageResult(result)
+	if err != nil || !ok {
+		return generatedImagePayload{}, ok, err
+	}
+	mimeType = imageMimeType(data, mimeType)
+	if !strings.HasPrefix(mimeType, "image/") {
+		return generatedImagePayload{}, false, nil
+	}
+	return generatedImagePayload{
+		ItemID:   itemID,
+		Data:     data,
+		FileName: generatedImageFileName("", mimeType),
+		MimeType: mimeType,
+	}, true, nil
+}
+
+func decodeGeneratedImageResult(result string) ([]byte, string, bool, error) {
+	result = strings.TrimSpace(result)
+	if result == "" || strings.HasPrefix(result, "mxc://") || strings.HasPrefix(result, "http://") || strings.HasPrefix(result, "https://") {
+		return nil, "", false, nil
+	}
+	if prefix, value, ok := strings.Cut(result, ","); ok && strings.Contains(prefix, ";base64") {
+		mimeType := strings.TrimPrefix(strings.Split(prefix, ";")[0], "data:")
+		data, err := decodeBase64Image(value)
+		return data, mimeType, err == nil, err
+	}
+	data, err := decodeBase64Image(result)
+	if err != nil {
+		return nil, "", false, nil
+	}
+	return data, "", true, nil
+}
+
+func decodeBase64Image(value string) ([]byte, error) {
+	if data, err := base64.StdEncoding.DecodeString(value); err == nil {
+		return data, nil
+	}
+	return base64.RawStdEncoding.DecodeString(value)
+}
+
+func imageMimeType(data []byte, fallback string) string {
+	if fallback != "" {
+		return fallback
+	}
+	if len(data) == 0 {
+		return "application/octet-stream"
+	}
+	return http.DetectContentType(data)
+}
+
+func generatedImageFileName(name, mimeType string) string {
+	name = strings.TrimSpace(name)
+	if name != "" && name != "." && name != string(filepath.Separator) {
+		return name
+	}
+	switch mimeType {
+	case "image/jpeg":
+		return "image.jpg"
+	case "image/webp":
+		return "image.webp"
+	case "image/gif":
+		return "image.gif"
+	default:
+		return "image.png"
+	}
+}
+
+func generatedImageConvertedMessage(ctx context.Context, portal *bridgev2.Portal, intent bridgev2.MatrixAPI, payload generatedImagePayload, replyTo *networkid.MessageOptionalPartID, metadata *MessageMetadata) (*bridgev2.ConvertedMessage, error) {
+	if portal == nil || portal.Portal == nil {
+		return nil, fmt.Errorf("missing portal for generated image")
+	}
+	if len(payload.Data) == 0 && payload.URL == "" {
+		return nil, fmt.Errorf("generated image has no data")
+	}
+	mimeType := imageMimeType(payload.Data, payload.MimeType)
+	fileName := generatedImageFileName(payload.FileName, mimeType)
+	content := &event.MessageEventContent{
+		MsgType:  event.MsgImage,
+		Body:     fileName,
+		FileName: fileName,
+		Info:     &event.FileInfo{MimeType: mimeType, Size: len(payload.Data)},
+		Mentions: &event.Mentions{},
+	}
+	if payload.URL != "" {
+		content.URL = payload.URL
+	} else {
+		url, file, err := intent.UploadMedia(ctx, portal.MXID, payload.Data, fileName, mimeType)
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload generated image: %w", err)
+		}
+		if file != nil {
+			content.File = file
+		} else {
+			content.URL = url
+		}
+	}
+	applyCodexMessageProfile(content)
+	return &bridgev2.ConvertedMessage{ReplyTo: replyTo, Parts: []*bridgev2.ConvertedMessagePart{{
+		ID:         partID("image-" + payload.ItemID),
+		Type:       event.EventMessage,
+		Content:    content,
+		DBMetadata: metadata,
+	}}}, nil
 }
 
 func shouldBridgeCustomEvent(name string) bool {

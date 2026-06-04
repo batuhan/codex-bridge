@@ -229,12 +229,36 @@ func TestCodexThreadChatInfoName(t *testing.T) {
 	if info := codexThreadChatInfo("", "thread-1", state); info.Name == nil || *info.Name != "Build bridge" {
 		t.Fatalf("unexpected name %#v", info.Name)
 	}
+	if info := codexThreadChatInfo("/tmp/project", "thread-1", state); info.Name == nil || *info.Name != "Build bridge (/tmp/project)" {
+		t.Fatalf("unexpected titled project name %#v", info.Name)
+	}
+	state = codexThreadState("thread/name/updated", "thread-1", "/tmp/project", []byte(`{"threadId":"thread-1","generatedTitle":"Generated title","preview":"First user prompt"}`))
+	if state["name"] != "Generated title" {
+		t.Fatalf("generated title did not normalize to name: %#v", state)
+	}
+	if info := codexThreadChatInfo("/tmp/project", "thread-1", state); info.Name == nil || *info.Name != "Generated title (/tmp/project)" {
+		t.Fatalf("unexpected generated title name %#v", info.Name)
+	}
 	state = codexThreadState("thread/name/updated", "thread-1", "", []byte(`{"threadId":"thread-1","threadName":null}`))
 	if info := codexThreadChatInfo("", "thread-1", state); info.Name != nil {
 		t.Fatalf("unexpected null name %#v", info.Name)
 	}
-	if info := codexThreadChatInfo("/tmp/project", "thread-1", map[string]any{}); info.Name == nil || *info.Name != "project" {
+	if info := codexThreadChatInfo("/tmp/project", "thread-1", map[string]any{}); info.Name == nil || *info.Name != "/tmp/project" {
 		t.Fatalf("unexpected cwd fallback name %#v", info.Name)
+	}
+}
+
+func TestThreadNameUsesGeneratedTitleFromRawState(t *testing.T) {
+	got := threadName(appserver.Thread{
+		ID:      "thread-1",
+		Cwd:     "/tmp/project",
+		Preview: "First user prompt",
+		Raw: map[string]any{
+			"generatedTitle": "Generated title",
+		},
+	})
+	if got != "Generated title (/tmp/project)" {
+		t.Fatalf("unexpected thread name %q", got)
 	}
 }
 
@@ -247,7 +271,7 @@ func TestCodexThreadChatInfoSyncsMetadataNameAndBackfill(t *testing.T) {
 		}
 	}`))
 	info := codexThreadChatInfo("/old/project", "thread-1", state)
-	if info.Name == nil || *info.Name != "project" {
+	if info.Name == nil || *info.Name != "/new/project" {
 		t.Fatalf("expected room name from updated cwd, got %#v", info.Name)
 	}
 	if !info.ExcludeChangesFromTimeline || !info.CanBackfill {
@@ -270,7 +294,7 @@ func TestCodexThreadChatInfoSyncsMetadataNameAndBackfill(t *testing.T) {
 
 	state = codexThreadState("thread/name/updated", "thread-1", "/new/project", []byte(`{"threadId":"thread-1","threadName":"Build bridge"}`))
 	info = codexThreadChatInfo("/new/project", "thread-1", state)
-	if info.Name == nil || *info.Name != "Build bridge" {
+	if info.Name == nil || *info.Name != "Build bridge (/new/project)" {
 		t.Fatalf("expected explicit thread name, got %#v", info.Name)
 	}
 }

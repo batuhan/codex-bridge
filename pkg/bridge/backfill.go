@@ -23,6 +23,8 @@ import (
 const codexCompactionNotice = "Codex compacted the thread context."
 const codexEnteredReviewNotice = "Codex entered review mode."
 const codexExitedReviewNotice = "Codex exited review mode."
+const backfillTextEventBudgetBytes = 48 * 1024
+const backfillOversizedUserMessageNotice = "[backfilled user message truncated; full content was too large to inline]"
 
 func reviewModeNoticeText(itemType, review string) string {
 	text := codexEnteredReviewNotice
@@ -36,35 +38,104 @@ func reviewModeNoticeText(itemType, review string) string {
 }
 
 func (cl *Client) projectBackfillMessages(ctx context.Context, portal *bridgev2.Portal, thread appserver.Thread) ([]*bridgev2.BackfillMessage, error) {
+	return cl.backfillMessagesFromEntries(ctx, portal, projectBackfillEntries(thread))
+}
+
+func (cl *Client) backfillMessagesFromEntries(ctx context.Context, portal *bridgev2.Portal, entries []*backfillEntry) ([]*bridgev2.BackfillMessage, error) {
 	var messages []*bridgev2.BackfillMessage
-	var streamOrder int64
 	seenSubagents := map[string]bool{}
-	for _, turn := range sortedBackfillTurns(thread) {
-		ts := backfillTurnTime(thread, turn)
-		for _, item := range turn.Items {
-			cl.queueSubagentResyncs(ctx, thread.ID, thread.Cwd, subagentRefs(backfillItemData(item)), seenSubagents)
-			messages, ts, streamOrder = cl.appendBackfillUserMessage(messages, thread.ID, turn.ID, item, ts, streamOrder)
-		}
-		streamOrder = nextBackfillStreamOrder(streamOrder, ts)
-		msg, ok, err := cl.backfillAssistantMessage(ctx, portal, thread, turn, ts, streamOrder)
-		if err != nil {
-			return nil, err
-		}
-		if ok {
+	for _, entry := range entries {
+		switch entry.Kind {
+		case backfillEntryUser:
+			cl.queueSubagentResyncs(ctx, entry.Thread.ID, entry.Thread.Cwd, subagentRefs(backfillItemData(entry.Item)), seenSubagents)
+			msg, err := cl.backfillUserMessage(ctx, portal, entry.Thread.ID, entry.Turn.ID, entry.Item, entry.Body, entry.Timestamp, entry.StreamOrder)
+			if err != nil {
+				return nil, err
+			}
 			messages = append(messages, msg)
+		case backfillEntryAssistant:
+			cl.queueBackfillSubagentsForTurn(ctx, entry.Thread, entry.Turn, seenSubagents)
+			msg, ok, err := cl.backfillAssistantMessage(ctx, portal, entry.Thread, entry.Turn, entry.Timestamp, entry.StreamOrder)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				messages = append(messages, msg)
+			}
 		}
 	}
 	return messages, nil
 }
 
-func (cl *Client) appendBackfillUserMessage(messages []*bridgev2.BackfillMessage, threadID, turnID string, item appserver.TurnItem, ts time.Time, streamOrder int64) ([]*bridgev2.BackfillMessage, time.Time, int64) {
-	body := backfillUserMessageBody(item)
-	if body == "" {
-		return messages, ts, streamOrder
+func (cl *Client) queueBackfillSubagentsForTurn(ctx context.Context, thread appserver.Thread, turn appserver.Turn, seen map[string]bool) {
+	for _, item := range turn.Items {
+		cl.queueSubagentResyncs(ctx, thread.ID, thread.Cwd, subagentRefs(backfillItemData(item)), seen)
 	}
-	streamOrder = nextBackfillStreamOrder(streamOrder, ts)
-	messages = append(messages, cl.backfillUserMessage(threadID, turnID, item, body, ts, streamOrder))
-	return messages, ts.Add(time.Millisecond), streamOrder
+}
+
+type backfillEntryKind int
+
+const (
+	backfillEntryUser backfillEntryKind = iota + 1
+	backfillEntryAssistant
+)
+
+type backfillEntry struct {
+	Kind        backfillEntryKind
+	Thread      appserver.Thread
+	Turn        appserver.Turn
+	Item        appserver.TurnItem
+	Body        string
+	ID          networkid.MessageID
+	Timestamp   time.Time
+	StreamOrder int64
+}
+
+func projectBackfillEntries(thread appserver.Thread) []*backfillEntry {
+	var entries []*backfillEntry
+	var streamOrder int64
+	for _, turn := range sortedBackfillTurns(thread) {
+		ts := backfillTurnTime(thread, turn)
+		for _, item := range turn.Items {
+			body := backfillUserMessageBody(item)
+			if body == "" {
+				continue
+			}
+			streamOrder = nextBackfillStreamOrder(streamOrder, ts)
+			entries = append(entries, &backfillEntry{
+				Kind:        backfillEntryUser,
+				Thread:      thread,
+				Turn:        turn,
+				Item:        item,
+				Body:        body,
+				ID:          backfillUserMessageID(turn.ID, item),
+				Timestamp:   ts,
+				StreamOrder: streamOrder,
+			})
+			ts = ts.Add(time.Millisecond)
+		}
+		streamOrder = nextBackfillStreamOrder(streamOrder, ts)
+		if shouldBackfillAssistantEntry(thread, turn, ts) {
+			entries = append(entries, &backfillEntry{
+				Kind:        backfillEntryAssistant,
+				Thread:      thread,
+				Turn:        turn,
+				ID:          backfillAssistantMessageID(turn.ID),
+				Timestamp:   ts,
+				StreamOrder: streamOrder,
+			})
+		}
+	}
+	return entries
+}
+
+func shouldBackfillAssistantEntry(thread appserver.Thread, turn appserver.Turn, ts time.Time) bool {
+	run := newBackfillRun(thread, turn, ts)
+	writer := aistream.NewWriter(run, func() time.Time { return ts })
+	writer.Start()
+	var reasoningSections reasoningSectionState
+	hasContent := mapBackfillAssistantItems(writer, run.MessageID, turn.Items, &reasoningSections)
+	return !skipBackfillAssistantMessage(codexTurnStatusKind(turn.Status), hasContent, turn.Error != nil)
 }
 
 func sortedBackfillTurns(thread appserver.Thread) []appserver.Turn {
@@ -83,6 +154,18 @@ func paginateBackfillMessages(messages []*bridgev2.BackfillMessage, params bridg
 	}
 	start, end := backwardBackfillRange(messages, params, count)
 	return backwardBackfillResponse(messages[start:end], params, start, len(messages))
+}
+
+func paginateBackfillEntries(entries []*backfillEntry, params bridgev2.FetchMessagesParams) ([]*backfillEntry, *bridgev2.FetchMessagesResponse) {
+	count := backfillPageCount(params.Count, len(entries))
+	if params.Forward {
+		start, end := forwardBackfillEntryRange(entries, params, count)
+		resp := forwardBackfillResponse(nil)
+		return entries[start:end], resp
+	}
+	start, end := backwardBackfillEntryRange(entries, params, count)
+	resp := backwardBackfillResponse(nil, params, start, len(entries))
+	return entries[start:end], resp
 }
 
 func forwardBackfillResponse(messages []*bridgev2.BackfillMessage) *bridgev2.FetchMessagesResponse {
@@ -114,6 +197,16 @@ func backwardBackfillRange(messages []*bridgev2.BackfillMessage, params bridgev2
 	return max(0, end-count), end
 }
 
+func forwardBackfillEntryRange(entries []*backfillEntry, params bridgev2.FetchMessagesParams, count int) (int, int) {
+	start := forwardBackfillEntryStart(entries, params, count)
+	return start, min(len(entries), start+count)
+}
+
+func backwardBackfillEntryRange(entries []*backfillEntry, params bridgev2.FetchMessagesParams, count int) (int, int) {
+	end := backwardBackfillEntryEnd(entries, params, len(entries))
+	return max(0, end-count), end
+}
+
 func forwardBackfillStart(messages []*bridgev2.BackfillMessage, params bridgev2.FetchMessagesParams, count int) int {
 	if params.AnchorMessage == nil {
 		if len(messages) > count {
@@ -133,6 +226,25 @@ func forwardBackfillStart(messages []*bridgev2.BackfillMessage, params bridgev2.
 	return start
 }
 
+func forwardBackfillEntryStart(entries []*backfillEntry, params bridgev2.FetchMessagesParams, count int) int {
+	if params.AnchorMessage == nil {
+		if len(entries) > count {
+			return len(entries) - count
+		}
+		return 0
+	}
+	start := len(entries)
+	for i, entry := range entries {
+		if entry.ID == params.AnchorMessage.ID {
+			return i + 1
+		}
+		if start == len(entries) && entry.Timestamp.After(params.AnchorMessage.Timestamp) {
+			start = i
+		}
+	}
+	return start
+}
+
 func backwardBackfillEnd(messages []*bridgev2.BackfillMessage, params bridgev2.FetchMessagesParams, fallback int) int {
 	if params.Cursor != "" {
 		if cursorEnd, err := strconv.Atoi(string(params.Cursor)); err == nil {
@@ -146,6 +258,19 @@ func backwardBackfillEnd(messages []*bridgev2.BackfillMessage, params bridgev2.F
 	return backwardAnchorEnd(messages, params.AnchorMessage, fallback)
 }
 
+func backwardBackfillEntryEnd(entries []*backfillEntry, params bridgev2.FetchMessagesParams, fallback int) int {
+	if params.Cursor != "" {
+		if cursorEnd, err := strconv.Atoi(string(params.Cursor)); err == nil {
+			return max(0, min(cursorEnd, len(entries)))
+		}
+		return fallback
+	}
+	if params.AnchorMessage == nil {
+		return fallback
+	}
+	return backwardAnchorEntryEnd(entries, params.AnchorMessage, fallback)
+}
+
 func backwardAnchorEnd(messages []*bridgev2.BackfillMessage, anchor *database.Message, fallback int) int {
 	end := fallback
 	for i, msg := range messages {
@@ -153,6 +278,19 @@ func backwardAnchorEnd(messages []*bridgev2.BackfillMessage, anchor *database.Me
 			return i
 		}
 		if end == fallback && !msg.Timestamp.Before(anchor.Timestamp) {
+			end = i
+		}
+	}
+	return end
+}
+
+func backwardAnchorEntryEnd(entries []*backfillEntry, anchor *database.Message, fallback int) int {
+	end := fallback
+	for i, entry := range entries {
+		if entry.ID == anchor.ID {
+			return i
+		}
+		if end == fallback && !entry.Timestamp.Before(anchor.Timestamp) {
 			end = i
 		}
 	}
@@ -174,13 +312,17 @@ func backfillPaginationCursor(start int) networkid.PaginationCursor {
 	return networkid.PaginationCursor(strconv.Itoa(start))
 }
 
-func (cl *Client) backfillUserMessage(threadID, turnID string, item appserver.TurnItem, body string, ts time.Time, streamOrder int64) *bridgev2.BackfillMessage {
+func (cl *Client) backfillUserMessage(ctx context.Context, portal *bridgev2.Portal, threadID, turnID string, item appserver.TurnItem, body string, ts time.Time, streamOrder int64) (*bridgev2.BackfillMessage, error) {
 	msgID := backfillUserMessageID(turnID, item)
+	content, err := cl.backfillUserMessageContent(ctx, portal, msgID, body)
+	if err != nil {
+		return nil, err
+	}
 	return &bridgev2.BackfillMessage{
 		ConvertedMessage: &bridgev2.ConvertedMessage{Parts: []*bridgev2.ConvertedMessagePart{{
 			ID:         partID("text"),
 			Type:       event.EventMessage,
-			Content:    msgconv.TextContent(body),
+			Content:    content,
 			DBMetadata: backfillUserMetadata(threadID, turnID),
 		}}},
 		Sender:      cl.backfillUserSender(),
@@ -188,7 +330,35 @@ func (cl *Client) backfillUserMessage(threadID, turnID string, item appserver.Tu
 		TxnID:       backfillTransactionID(msgID),
 		Timestamp:   ts,
 		StreamOrder: streamOrder,
+	}, nil
+}
+
+func (cl *Client) backfillUserMessageContent(ctx context.Context, portal *bridgev2.Portal, msgID networkid.MessageID, body string) (*event.MessageEventContent, error) {
+	if len([]byte(body)) <= backfillTextEventBudgetBytes {
+		return msgconv.TextContent(body), nil
 	}
+	if portal != nil && portal.MXID != "" {
+		if intent := cl.backfillBotIntent(); intent != nil {
+			filename := string(msgID) + ".txt"
+			url, file, err := intent.UploadMedia(ctx, portal.MXID, []byte(body), filename, "text/plain")
+			if err != nil {
+				return nil, err
+			}
+			content := &event.MessageEventContent{
+				MsgType:  event.MsgFile,
+				Body:     filename,
+				FileName: filename,
+				Info:     &event.FileInfo{MimeType: "text/plain", Size: len([]byte(body))},
+			}
+			if file != nil {
+				content.File = file
+			} else {
+				content.URL = url
+			}
+			return content, nil
+		}
+	}
+	return msgconv.TextContent(utf8PrefixBytes(body, backfillTextEventBudgetBytes-len(backfillOversizedUserMessageNotice)-2) + "\n\n" + backfillOversizedUserMessageNotice), nil
 }
 
 func (cl *Client) backfillUserSender() bridgev2.EventSender {
@@ -512,7 +682,6 @@ func writeBackfillToolItem(writer *aistream.Writer, item appserver.TurnItem) {
 		return
 	}
 	status := codexItemStatusText(data, state)
-	hasResult = writeBackfillToolCompletionMetadata(writer, item.ID, data, state, status, hasResult)
 	if !hasInput {
 		input = nil
 	}
@@ -522,11 +691,6 @@ func writeBackfillToolItem(writer *aistream.Writer, item appserver.TurnItem) {
 func writeBackfillCodexToolResult(writer *aistream.Writer, itemID string, data map[string]any, state string) bool {
 	result := codexToolResultText(data, true)
 	return writeBackfillVisibleToolResult(writer, itemID, result, state)
-}
-
-func writeBackfillToolCompletionMetadata(writer *aistream.Writer, itemID string, data map[string]any, state, status string, hasResult bool) bool {
-	result := codexToolCompletionMetadataText(data, state, status, hasResult)
-	return writeBackfillVisibleToolResult(writer, itemID, result, state) || hasResult
 }
 
 func codexToolResultText(data map[string]any, includeStreamedFields bool) string {

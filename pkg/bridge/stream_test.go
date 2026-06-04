@@ -2,11 +2,14 @@ package bridge
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -290,6 +293,105 @@ func TestCodexFinalStreamEditUploadsOversizedPartsAndClearsStream(t *testing.T) 
 	meta, ok := existing.Metadata.(*MessageMetadata)
 	if !ok || meta.StreamStatus != "complete" || meta.ThreadID != run.ThreadID || meta.TurnID != run.RunID {
 		t.Fatalf("final edit did not update DB metadata: %#v", existing.Metadata)
+	}
+}
+
+func TestGeneratedImagePayloadFromSavedPath(t *testing.T) {
+	const oneByOnePNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+	root := t.TempDir()
+	path := filepath.Join(root, "out", "result.png")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	data, err := base64.StdEncoding.DecodeString(oneByOnePNG)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	payload, ok, err := generatedImagePayloadFromItem(codexItem{
+		ID:   "image-1",
+		Type: "imageGeneration",
+		Raw:  map[string]any{"savedPath": "out/result.png"},
+	}, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || payload.ItemID != "image-1" || payload.FileName != "result.png" || payload.MimeType != "image/png" || len(payload.Data) != len(data) {
+		t.Fatalf("unexpected generated image payload: ok=%v payload=%#v", ok, payload)
+	}
+}
+
+func TestGeneratedImagePayloadFromRawDataURL(t *testing.T) {
+	const oneByOnePNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+
+	payload, ok, err := generatedImagePayloadFromItem(codexItem{
+		ID:   "ig_1",
+		Type: "image_generation_call",
+		Raw:  map[string]any{"result": "data:image/png;base64," + oneByOnePNG},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || payload.ItemID != "ig_1" || payload.FileName != "image.png" || payload.MimeType != "image/png" || len(payload.Data) == 0 {
+		t.Fatalf("unexpected raw generated image payload: ok=%v payload=%#v", ok, payload)
+	}
+}
+
+func TestGeneratedImagePayloadFromRawMXCResult(t *testing.T) {
+	payload, ok, err := generatedImagePayloadFromItem(codexItem{
+		ID:   "ig_1",
+		Type: "image_generation_call",
+		Raw:  map[string]any{"result": "mxc://example.com/image"},
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || payload.URL != "mxc://example.com/image" || payload.FileName != "image.png" || payload.MimeType != "image/png" {
+		t.Fatalf("unexpected raw MXC generated image payload: ok=%v payload=%#v", ok, payload)
+	}
+}
+
+func TestGeneratedImageMessageUploadsMatrixImageReply(t *testing.T) {
+	const oneByOnePNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+	data, err := base64.StdEncoding.DecodeString(oneByOnePNG)
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
+	run.messageID = "anchor-message"
+	msg := run.generatedImageMessage(generatedImagePayload{
+		ItemID:   "image-1",
+		Data:     data,
+		FileName: "result.png",
+		MimeType: "image/png",
+	}, time.Unix(12, 0))
+	intent := &recordingMediaIntent{}
+	converted, err := msg.ConvertMessageFunc(
+		context.Background(),
+		&bridgev2.Portal{Portal: &database.Portal{MXID: "!room:example.com"}},
+		intent,
+		msg.Data,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if converted.ReplyTo == nil || converted.ReplyTo.MessageID != "anchor-message" || converted.ReplyTo.PartID == nil || *converted.ReplyTo.PartID != partID("text") {
+		t.Fatalf("generated image should reply to stream anchor: %#v", converted.ReplyTo)
+	}
+	part := converted.Parts[0]
+	if part.ID != partID("image-image-1") || part.Content.MsgType != event.MsgImage || part.Content.URL != intent.url || part.Content.Body != "result.png" {
+		t.Fatalf("unexpected image part: %#v", part)
+	}
+	if intent.roomID != "!room:example.com" || intent.fileName != "result.png" || intent.mimeType != "image/png" || len(intent.data) != len(data) {
+		t.Fatalf("unexpected upload: room=%q file=%q mime=%q bytes=%d", intent.roomID, intent.fileName, intent.mimeType, len(intent.data))
+	}
+	assertCodexProfile(t, part.Content)
+	meta, ok := part.DBMetadata.(*MessageMetadata)
+	if !ok || meta.Role != "assistant" || meta.ThreadID != "thread-1" || meta.TurnID != "turn-1" || meta.StreamStatus != "image" {
+		t.Fatalf("unexpected generated image metadata: %#v", part.DBMetadata)
 	}
 }
 
@@ -2554,7 +2656,7 @@ func TestCompletedCommandDoesNotReplayStreamedAggregateOutput(t *testing.T) {
 	}
 }
 
-func TestCompletedCommandWithStreamedOutputSyncsTerminalMetadata(t *testing.T) {
+func TestCompletedCommandWithStreamedOutputDoesNotEmitTerminalMetadataAsOutput(t *testing.T) {
 	run := newActiveRun(nil, projectPortalKey("/tmp/project", "codex"), "thread-1", "turn-1")
 	run.handle("item/started", []byte(`{"threadId":"thread-1","turnId":"turn-1","item":{"type":"commandExecution","id":"cmd-1","command":"go test ./...","status":"inProgress"}}`))
 	run.handle("item/commandExecution/outputDelta", []byte(`{"threadId":"thread-1","turnId":"turn-1","itemId":"cmd-1","delta":"ok\n"}`))
@@ -2563,9 +2665,8 @@ func TestCompletedCommandWithStreamedOutputSyncsTerminalMetadata(t *testing.T) {
 	if countToolResult(run.run.Events, "cmd-1", "ok\n") != 1 {
 		t.Fatalf("expected streamed command output exactly once, got %#v", run.run.Events)
 	}
-	if !hasToolResultStateContaining(run.run.Events, "cmd-1", `"exitCode":0`, agui.ToolResultStateComplete) ||
-		!hasToolResultStateContaining(run.run.Events, "cmd-1", `"durationMs":12`, agui.ToolResultStateComplete) {
-		t.Fatalf("expected terminal command metadata to sync after streamed output, got %#v", run.run.Events)
+	if got := countToolResults(run.run.Events, "cmd-1"); got != 1 {
+		t.Fatalf("expected terminal command metadata not to emit as output, got %d events=%#v", got, run.run.Events)
 	}
 	assertAGUISequenceValid(t, run.run)
 }

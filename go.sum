@@ -6,6 +6,8 @@ github.com/DATA-DOG/go-sqlmock v1.5.2 h1:OcvFkGmslmlZibjAjaHm3L//6LiuBgolP7Oputl
 github.com/DATA-DOG/go-sqlmock v1.5.2/go.mod h1:88MAG/4G7SMwSE3CeA0ZKzrT5CiOU3OJ+JlNzwDqpNU=
 github.com/Netflix/go-expect v0.0.0-20220104043353-73e0943537d2 h1:+vx7roKuyA63nhn5WAunQHLTznkw5W8b1Xc0dNjp83s=
 github.com/Netflix/go-expect v0.0.0-20220104043353-73e0943537d2/go.mod h1:HBCaDeC1lPdgDeDbhX8XFpy1jqjK0IBG8W5K+xYqA0w=
+github.com/beeper/ai-bridge v0.0.0-20260604134059-7c31f0e4f547 h1:abQsbwnX6ic1kdQkfKL+i+clMft9Xx8gy29bpJhuTjc=
+github.com/beeper/ai-bridge v0.0.0-20260604134059-7c31f0e4f547/go.mod h1:+icZV4D9wnp0NTP8bsfS/WXrf/8plzmnp/3bhQEnL3E=
 github.com/beeper/bridge-manager v0.14.0 h1:7XeZfHeDiOuwLUe6UiX/HCywthw1s0Q7xhrmDzzW9FA=
 github.com/beeper/bridge-manager v0.14.0/go.mod h1:pherlTADz3wkojdc2AvAsR3mS1yG5jF9/OaxkHqPy4Y=
 github.com/chengxilo/virtualterm v1.0.4 h1:Z6IpERbRVlfB8WkOmtbHiDbBANU7cimRIof7mk9/PwM=

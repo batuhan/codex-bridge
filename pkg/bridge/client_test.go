@@ -157,7 +157,11 @@ func TestCleanProjectDirExpandsHome(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != dir {
+	if want, err := filepath.EvalSymlinks(dir); err == nil {
+		if got != want {
+			t.Fatalf("unexpected path: got %q want %q", got, want)
+		}
+	} else if got != dir {
 		t.Fatalf("unexpected path: got %q want %q", got, dir)
 	}
 }
@@ -168,8 +172,19 @@ func TestCreateChatWithGhostMapsProjectGhosts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.PortalKey != projectPortalKey("/tmp/project", defaultLoginID) {
+	if !strings.HasPrefix(string(resp.PortalKey.ID), "new:") || resp.PortalKey.Receiver != defaultLoginID {
 		t.Fatalf("unexpected portal key: %#v", resp.PortalKey)
+	}
+	if resp.PortalInfo == nil || resp.PortalInfo.CanBackfill {
+		t.Fatalf("project starter chat should not run synchronous room-create backfill: %#v", resp.PortalInfo)
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: resp.PortalKey}}
+	if !resp.PortalInfo.ExtraUpdates(context.Background(), portal) {
+		t.Fatal("expected project starter metadata updater to report a change")
+	}
+	meta := portalMetadata(portal.Metadata)
+	if meta.Cwd != "/tmp/project" || meta.ThreadID != "" {
+		t.Fatalf("project starter should persist cwd without binding an existing thread: %#v", meta)
 	}
 }
 
@@ -194,6 +209,56 @@ func TestCreateChatWithGhostMapsCodexGhostToNewProjectChat(t *testing.T) {
 	}
 	if second.PortalKey == resp.PortalKey {
 		t.Fatalf("new project chats should use unique starter keys: %#v", resp.PortalKey)
+	}
+}
+
+func TestCreateChatWithGhostMapsNewProjectGhostToNewProjectChat(t *testing.T) {
+	client := &Client{UserLogin: testUserLogin("login-1")}
+	resp, err := client.CreateChatWithGhost(context.Background(), testGhost(newProjectUserID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(resp.PortalKey.ID), "new:") || resp.PortalKey.Receiver != "login-1" {
+		t.Fatalf("unexpected portal key: %#v", resp.PortalKey)
+	}
+	if resp.PortalInfo == nil || resp.PortalInfo.Name == nil || *resp.PortalInfo.Name != "New Project" {
+		t.Fatalf("new project ghost should create a New Project room: %#v", resp.PortalInfo)
+	}
+}
+
+func TestProjectStarterChatQueuesBackgroundBackfill(t *testing.T) {
+	ctx := context.Background()
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
+	login := &bridgev2.UserLogin{UserLogin: &database.UserLogin{ID: "sh-codex"}, Bridge: br}
+	client := &Client{Main: connector, UserLogin: login}
+	login.Client = client
+
+	resp := client.newProjectChatForCWD("/tmp/project")
+	if err := br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: resp.PortalKey,
+		MXID:      "!project:example.com",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	portal, err := br.GetExistingPortalByKey(ctx, resp.PortalKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.PortalInfo.ExtraUpdates(ctx, portal) {
+		t.Fatal("expected project starter metadata updater to report a change")
+	}
+	meta := portalMetadata(portal.Metadata)
+	if meta.Cwd != "/tmp/project" || meta.ThreadID != "" || meta.BackfillVersion != codexBackfillVersion {
+		t.Fatalf("project starter should persist cwd and backfill version: %#v", meta)
+	}
+	task, err := br.DB.BackfillTask.GetNextForPortal(ctx, resp.PortalKey, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if task == nil || task.UserLoginID != login.ID || task.BatchCount != -1 {
+		t.Fatalf("project starter should queue background backfill task: %#v", task)
 	}
 }
 
@@ -704,6 +769,8 @@ func TestNewProjectChatInfoQueuesIntroOnRoomCreate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	requireEventually(t, time.Second, func() bool { return len(matrix.intent().messages) == 1 })
+	matrix.intent().messages = nil
 	client := &Client{Main: connector, UserLogin: login, loggedIn: true}
 	login.Client = client
 	key := newProjectPortalKey(login.ID)
@@ -1047,14 +1114,14 @@ func TestValidatedRoomTurnSettingsUsesProviderQualifiedRoomModel(t *testing.T) {
 	}
 }
 
-func TestContactsIncludeOneCodexGhost(t *testing.T) {
+func TestContactsIncludeOneNewProjectGhost(t *testing.T) {
 	client := &Client{UserLogin: testUserLogin("sh-codex")}
 	contacts := client.contactsForThreads(context.Background(), nil)
 	got := make([]networkid.UserID, 0, len(contacts))
 	for _, contact := range contacts {
 		got = append(got, contact.UserID)
 	}
-	want := []networkid.UserID{codexUserID}
+	want := []networkid.UserID{newProjectUserID}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("unexpected contacts:\n got: %#v\nwant: %#v", got, want)
 	}
@@ -1064,7 +1131,7 @@ func TestContactsIncludeOneCodexGhost(t *testing.T) {
 		}
 	}
 	if contacts[0].UserInfo == nil || contacts[0].UserInfo.IsBot == nil || *contacts[0].UserInfo.IsBot {
-		t.Fatalf("Codex contact should not be marked as a network bot: %#v", contacts[0].UserInfo)
+		t.Fatalf("New Project contact should not be marked as a network bot: %#v", contacts[0].UserInfo)
 	}
 }
 
@@ -1091,7 +1158,7 @@ func TestContactsUseConcreteGhostsWhenBridgeIsAvailable(t *testing.T) {
 			t.Fatalf("contact list should not eagerly sync ghost profile info: %#v", contact.Ghost.Ghost)
 		}
 	}
-	if contacts[0].Ghost.ID != codexUserID {
+	if contacts[0].Ghost.ID != newProjectUserID {
 		t.Fatalf("unexpected base contact ghost: %#v", contacts[0].Ghost.ID)
 	}
 	if contacts[1].Ghost.ID != projectUserID("/tmp/project") {
@@ -1109,15 +1176,19 @@ func TestContactsUseConcreteGhostsWhenBridgeIsAvailable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(searched.Results) != 1 || searched.Results[0].ID != codexUserID || searched.Results[0].MXID == "" {
-		t.Fatalf("provisioned search should find Codex ghost: %#v", searched.Results)
+	if len(searched.Results) != 1 || searched.Results[0].ID != newProjectUserID || searched.Results[0].MXID == "" {
+		t.Fatalf("provisioned search should find New Project ghost: %#v", searched.Results)
 	}
 	projectDir := t.TempDir()
 	resolved, err := provisionutil.ResolveIdentifier(context.Background(), login, projectDir, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resolved.ID != projectUserID(projectDir) || resolved.MXID == "" || resolved.AvatarURL == "" {
+	cleanProjectDir, err := cleanProjectDir(projectDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.ID != projectUserID(cleanProjectDir) || resolved.MXID == "" || resolved.AvatarURL == "" {
 		t.Fatalf("provisioned resolve should expose project ghost: %#v", resolved)
 	}
 }
@@ -1188,19 +1259,30 @@ func TestResolveIdentifierDecodesProjectIDs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.UserID != projectUserID(dir) || resp.Chat == nil || resp.Chat.PortalKey != projectPortalKey(dir, "sh-codex") {
+	cwd, err := cleanProjectDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.UserID != projectUserID(cwd) || resp.Chat == nil || !strings.HasPrefix(string(resp.Chat.PortalKey.ID), "new:") {
 		t.Fatalf("unexpected project identifier response: %#v", resp)
+	}
+	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: resp.Chat.PortalKey}}
+	if !resp.Chat.PortalInfo.ExtraUpdates(context.Background(), portal) {
+		t.Fatal("expected project identifier chat metadata updater to report a change")
+	}
+	if meta := portalMetadata(portal.Metadata); meta.Cwd != cwd || meta.ThreadID != "" {
+		t.Fatalf("project identifier chat should persist cwd without binding an existing thread: %#v", meta)
 	}
 }
 
-func TestResolveIdentifierCodexUsesAssistantGhostProfile(t *testing.T) {
+func TestResolveIdentifierCodexUsesNewProjectGhostProfile(t *testing.T) {
 	client := &Client{UserLogin: testUserLogin("sh-codex")}
 	resp, err := client.ResolveIdentifier(context.Background(), "codex", false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.UserID != codexUserID || resp.UserInfo == nil || resp.UserInfo.IsBot == nil || *resp.UserInfo.IsBot {
-		t.Fatalf("Codex identifier should resolve to assistant ghost profile: %#v", resp)
+	if resp.UserID != newProjectUserID || resp.UserInfo == nil || resp.UserInfo.Name == nil || *resp.UserInfo.Name != "New Project" || resp.UserInfo.IsBot == nil || *resp.UserInfo.IsBot {
+		t.Fatalf("Codex identifier should resolve to New Project ghost profile: %#v", resp)
 	}
 }
 
@@ -1216,6 +1298,8 @@ func TestProvisioningCreateDMCreatesCodexRooms(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	requireEventually(t, time.Second, func() bool { return len(matrix.intent().messages) == 1 })
+	matrix.intent().messages = nil
 	client := &Client{Main: connector, UserLogin: login, loggedIn: true}
 	login.Client = client
 
@@ -1258,6 +1342,8 @@ func TestNewProjectRoomQueuesIntroMessage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	requireEventually(t, time.Second, func() bool { return len(matrix.intent().messages) == 1 })
+	matrix.intent().messages = nil
 	client := &Client{Main: connector, UserLogin: login, loggedIn: true}
 	login.Client = client
 
@@ -1341,11 +1427,15 @@ func TestProvisioningCreateDMMaterializesProjectRoom(t *testing.T) {
 	if resp == nil || resp.DMRoomID == "" || !resp.JustCreated || resp.Portal == nil {
 		t.Fatalf("project create DM did not materialize a room: %#v", resp)
 	}
-	if resp.ID != projectUserID(cwd) || resp.Portal.PortalKey != projectPortalKey(cwd, login.ID) {
+	cleanCWD, err := cleanProjectDir(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.ID != projectUserID(cleanCWD) || !strings.HasPrefix(string(resp.Portal.PortalKey.ID), "new:") || resp.Portal.PortalKey.Receiver != login.ID {
 		t.Fatalf("project create DM used wrong identity: %#v portal=%#v", resp, resp.Portal.Portal)
 	}
 	meta := portalMetadata(resp.Portal.Metadata)
-	if meta.Cwd != cwd {
+	if meta.Cwd != cleanCWD || meta.ThreadID != "" {
 		t.Fatalf("project create DM should persist cwd metadata, got %#v", meta)
 	}
 }
@@ -1371,6 +1461,9 @@ func TestThreadTurnsListUnavailableOnlyMatchesProtocolFallbacks(t *testing.T) {
 	}
 	if !isThreadTurnsListUnavailable(&appserver.RPCError{Method: "thread/turns/list", Msg: "experimental API disabled"}) {
 		t.Fatal("experimental API unavailability should use thread/read fallback")
+	}
+	if !isThreadTurnsListUnavailable(&appserver.RPCError{Method: "thread/turns/list", Msg: "thread is not materialized yet; thread/turns/list is unavailable before first user message"}) {
+		t.Fatal("unmaterialized new threads should use thread/read fallback")
 	}
 	if isThreadTurnsListUnavailable(&appserver.RPCError{Method: "thread/turns/list", Code: -32001, Msg: "Server overloaded; retry later."}) {
 		t.Fatal("retryable server errors must not be hidden by fallback")
@@ -1467,6 +1560,27 @@ func TestSortedRecentDirectoriesKeepsNewestAttachedThreadPerDirectory(t *testing
 	}
 }
 
+func TestSortedRecentDirectoriesCanonicalizesEquivalentPaths(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "project")
+	if err := os.Mkdir(target, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "project-link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	threads := sortedRecentDirectories([]appserver.Thread{
+		{ID: "target-project", Cwd: target, UpdatedAt: 10},
+		{ID: "link-project", Cwd: link, UpdatedAt: 20},
+	})
+	canonical := projectCanonicalPath(target)
+	if len(threads) != 1 || threads[0].ID != "link-project" || threads[0].Cwd != canonical {
+		t.Fatalf("equivalent paths should collapse to the newest canonical project: %#v want cwd %q", threads, canonical)
+	}
+}
+
 func TestSearchUsersReturnsExistingDirectoryPathAsProjectGhost(t *testing.T) {
 	cwd := t.TempDir()
 	client := &Client{UserLogin: testUserLogin("sh-codex")}
@@ -1475,11 +1589,15 @@ func TestSearchUsersReturnsExistingDirectoryPathAsProjectGhost(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) == 0 || results[0].UserID != projectUserID(cwd) {
+	cleanCWD, err := cleanProjectDir(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 || results[0].UserID != projectUserID(cleanCWD) {
 		t.Fatalf("directory search did not return direct project ghost: %#v", results)
 	}
-	if results[0].UserInfo == nil || results[0].UserInfo.Name == nil || *results[0].UserInfo.Name != cwd {
-		t.Fatalf("direct project ghost should use full path display name: %#v", results[0].UserInfo)
+	if results[0].UserInfo == nil || results[0].UserInfo.Name == nil || *results[0].UserInfo.Name != projectDisplayPath(cleanCWD) {
+		t.Fatalf("direct project ghost should use compact path display name: %#v", results[0].UserInfo)
 	}
 }
 
@@ -1491,7 +1609,11 @@ func TestSearchUsersReturnsDirectoryPathWhenContactListFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(results) != 1 || results[0].UserID != projectUserID(cwd) {
+	cleanCWD, err := cleanProjectDir(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 || results[0].UserID != projectUserID(cleanCWD) {
 		t.Fatalf("directory search should survive contact list failure: %#v", results)
 	}
 }
@@ -1504,7 +1626,7 @@ func TestSyncContactGhostsCreatesBaseAndRecentDirectoryGhosts(t *testing.T) {
 		{ID: "new-thread", Cwd: "/tmp/project", Name: "Build bridge", Preview: strings.Repeat("preview ", 100), UpdatedAt: 20},
 	})
 
-	for _, userID := range []networkid.UserID{codexUserID, projectUserID("/tmp/project")} {
+	for _, userID := range []networkid.UserID{newProjectUserID, projectUserID("/tmp/project")} {
 		ghost, err := br.GetExistingGhostByID(ctx, userID)
 		if err != nil {
 			t.Fatal(err)
@@ -1513,7 +1635,7 @@ func TestSyncContactGhostsCreatesBaseAndRecentDirectoryGhosts(t *testing.T) {
 			t.Fatalf("contact ghost %s was not synced: %#v", userID, ghost)
 		}
 		if ghost.IsBot {
-			t.Fatalf("Codex contact ghost %s should not be marked as a network bot", userID)
+			t.Fatalf("contact ghost %s should not be marked as a network bot", userID)
 		}
 	}
 	project, err := br.GetExistingGhostByID(ctx, projectUserID("/tmp/project"))
@@ -1597,7 +1719,7 @@ func TestCodexMembersUseGlobalGhost(t *testing.T) {
 	}
 }
 
-func TestRecentDirectoryContactUsesCanonicalProjectRoom(t *testing.T) {
+func TestRecentDirectoryContactDoesNotRewriteCachedProjectRoom(t *testing.T) {
 	connector := &Connector{threadRooms: map[string]threadRoom{}}
 	client := &Client{Main: connector, UserLogin: testUserLogin("sh-codex")}
 	newProjectKey := projectPortalKey("", "sh-codex")
@@ -1615,10 +1737,10 @@ func TestRecentDirectoryContactUsesCanonicalProjectRoom(t *testing.T) {
 	}
 	room, ok := connector.threadRoom("thread-1")
 	if !ok {
-		t.Fatal("expected project contact to cache thread room")
+		t.Fatal("expected existing thread room cache to remain available")
 	}
-	if room.portalKey != projectPortalKey("/tmp/project", "sh-codex") {
-		t.Fatalf("project contact cached non-canonical room: %#v", room)
+	if room.portalKey != newProjectKey {
+		t.Fatalf("project contact listing should not rewrite cached room portals: %#v", room)
 	}
 	chat := client.chatForProject(context.Background(), "/tmp/project", "thread-1", nil)
 	portal := &bridgev2.Portal{Portal: &database.Portal{PortalKey: chat.PortalKey}}
@@ -1631,7 +1753,7 @@ func TestRecentDirectoryContactUsesCanonicalProjectRoom(t *testing.T) {
 	}
 }
 
-func TestRecentDirectoryContactCachesThreadModel(t *testing.T) {
+func TestRecentDirectoryContactDoesNotCacheThreadModel(t *testing.T) {
 	connector := &Connector{threadRooms: map[string]threadRoom{}}
 	client := &Client{Main: connector, UserLogin: testUserLogin("sh-codex")}
 	contacts := client.contactsForThreads(context.Background(), []appserver.Thread{{
@@ -1644,12 +1766,8 @@ func TestRecentDirectoryContactCachesThreadModel(t *testing.T) {
 	if len(contacts) != 2 || contacts[1].Chat != nil {
 		t.Fatalf("unexpected contacts: %#v", contacts)
 	}
-	room, ok := connector.threadRoom("thread-1")
-	if !ok {
-		t.Fatal("expected project contact to cache thread room")
-	}
-	if room.modelProvider != "openai" || room.model != "openai/gpt-5" {
-		t.Fatalf("project contact cached wrong model: %#v", room)
+	if room, ok := connector.threadRoom("thread-1"); ok {
+		t.Fatalf("contact listing should not cache thread room model state: %#v", room)
 	}
 }
 
@@ -2530,14 +2648,18 @@ func TestDirectorySelectionPostSaveStartsThreadAndCanonicalizesMessage(t *testin
 	}
 	resp.PostSave(ctx, resp.DB)
 
-	projectKey := projectPortalKey(cwd, login.ID)
+	cleanCWD, err := cleanProjectDir(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectKey := projectPortalKey(cleanCWD, login.ID)
 	requireEventually(t, time.Second, func() bool {
 		projectPortal, err := br.GetExistingPortalByKey(ctx, projectKey)
 		if err != nil || projectPortal == nil || projectPortal.MXID != "!starter:example.com" {
 			return false
 		}
 		meta := portalMetadata(projectPortal.Metadata)
-		return meta.ThreadID != "" && meta.Cwd == cwd
+		return meta.ThreadID != "" && meta.Cwd == cleanCWD
 	})
 	requireEventually(t, time.Second, func() bool {
 		dbMsg, err := br.DB.Message.GetPartByID(ctx, login.ID, resp.DB.ID, resp.DB.PartID)
@@ -2664,7 +2786,11 @@ func TestHandleMatrixMessageStartsTurnThroughAppServerTransport(t *testing.T) {
 	if !ok {
 		t.Fatalf("thread/resume request missing: %#v", requests)
 	}
-	if resume.Params["threadId"] != "thread-1" || resume.Params["cwd"] != cwd || resume.Params["approvalPolicy"] != "on-request" {
+	cleanCWD, err := cleanProjectDir(cwd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resume.Params["threadId"] != "thread-1" || resume.Params["cwd"] != cleanCWD || resume.Params["approvalPolicy"] != "on-request" {
 		t.Fatalf("bad thread/resume params: %#v", resume.Params)
 	}
 	start, ok := findFakeAppServerRequest(requests, "turn/start")
@@ -2934,6 +3060,74 @@ func TestHandleMatrixMessageSteersActiveTurnWithTurnMetadata(t *testing.T) {
 	})
 }
 
+func TestHandleMatrixMessageStartsNewTurnAfterStaleSteer(t *testing.T) {
+	ctx := context.Background()
+	connector, br := testBridgeWithDB(t, &fakeMatrixConnector{})
+	logPath := filepath.Join(t.TempDir(), "fake-appserver.jsonl")
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	app, err := appserver.Start(ctx, exe, map[string]string{
+		fakeAppServerEnv:              "1",
+		fakeAppServerLogEnv:           logPath,
+		fakeAppServerNoActiveSteerEnv: "1",
+		fakeAppServerTurnStartIDEnv:   "turn-2",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer app.Close()
+	connector.appMu.Lock()
+	connector.app = app
+	connector.appMu.Unlock()
+
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := &Client{Main: connector, UserLogin: login, loggedIn: true}
+	login.Client = client
+	msg := testMatrixMessage("thread-1", "recover this")
+	msg.Portal.PortalKey = projectPortalKey("/tmp/project", login.ID)
+	if err = br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: msg.Portal.PortalKey,
+		MXID:      "!room:example.com",
+		Name:      "project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{ThreadID: "thread-1", Cwd: "/tmp/project"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	staleRun := newActiveRun(client, msg.Portal.PortalKey, "thread-1", "turn-1")
+	connector.setActive("thread-1", staleRun)
+
+	resp, err := client.HandleMatrixMessage(ctx, msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp == nil || resp.DB == nil {
+		t.Fatalf("missing Matrix response: %#v", resp)
+	}
+	if err = br.DB.Message.Insert(ctx, resp.DB); err != nil {
+		t.Fatal(err)
+	}
+	resp.PostSave(ctx, resp.DB)
+
+	requireEventually(t, time.Second, func() bool {
+		requests := readFakeAppServerRequestsIfExists(t, logPath)
+		return countFakeAppServerRequests(requests, "turn/steer") == 1 &&
+			countFakeAppServerRequests(requests, "turn/start") == 1
+	})
+	if active := connector.activeRun("thread-1"); active != nil && active.turnID == "turn-1" {
+		t.Fatalf("stale active run was not cleared: %#v", active)
+	}
+}
+
 func TestInterruptTurnSyncsClientRequestState(t *testing.T) {
 	ctx := context.Background()
 	connector, _ := testBridgeWithDB(t, &fakeMatrixConnector{})
@@ -3177,6 +3371,81 @@ func TestClientConnectReconcilesOnlyItsLoginPortals(t *testing.T) {
 	}
 	if task == nil || task.BatchCount != -1 || task.IsDone || task.QueueDone {
 		t.Fatalf("login reconnect should reset backfill for reconciled portal: %#v", task)
+	}
+}
+
+func TestClientConnectMaterializesDefaultNewProjectRoom(t *testing.T) {
+	ctx := context.Background()
+	oldPortalEventBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	t.Cleanup(func() { bridgev2.PortalEventBuffer = oldPortalEventBuffer })
+
+	matrix := &fakeMatrixConnector{}
+	connector, br := testBridgeWithDB(t, matrix)
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(login.Client.Disconnect)
+
+	key := defaultNewProjectPortalKey(login.ID)
+	portal, err := br.GetExistingPortalByKey(ctx, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if portal == nil || portal.MXID == "" || portal.RoomType != database.RoomTypeDM {
+		t.Fatalf("login connect did not materialize the default New Project room: %#v", portal)
+	}
+	if portal.Name != "New Project" || portal.Topic != newProjectPrompt {
+		t.Fatalf("default New Project room has wrong info: %#v", portal.Portal)
+	}
+	requireEventually(t, time.Second, func() bool { return len(matrix.intent().messages) == 1 })
+	msg := matrix.intent().messages[0]
+	content, ok := msg.Content.Parsed.(*event.MessageEventContent)
+	if msg.RoomID != portal.MXID || !ok || !strings.Contains(content.Body, "Send a project directory path") || !strings.Contains(content.Body, "/approvals") {
+		t.Fatalf("default New Project room intro was not queued: %#v", msg)
+	}
+}
+
+func TestClientConnectDoesNotCreateDefaultNewProjectRoomWhenStarterExists(t *testing.T) {
+	ctx := context.Background()
+	oldPortalEventBuffer := bridgev2.PortalEventBuffer
+	bridgev2.PortalEventBuffer = 0
+	t.Cleanup(func() { bridgev2.PortalEventBuffer = oldPortalEventBuffer })
+
+	matrix := &fakeMatrixConnector{}
+	connector, br := testBridgeWithDB(t, matrix)
+	existingKey := newProjectPortalKey("sh-codex")
+	if err := br.DB.Portal.Insert(ctx, &database.Portal{
+		PortalKey: existingKey,
+		MXID:      "!existing-starter:example.com",
+		Name:      "New Project",
+		RoomType:  database.RoomTypeDM,
+		Metadata:  &PortalMetadata{NewProjectIntroMessage: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	user, err := br.GetUserByMXID(ctx, "@alice:example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	login, err := connector.ensureLoginID(ctx, user, "sh-codex", "alice@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(login.Client.Disconnect)
+
+	if portal, err := br.GetExistingPortalByKey(ctx, defaultNewProjectPortalKey(login.ID)); err != nil {
+		t.Fatal(err)
+	} else if portal != nil && portal.MXID != "" {
+		t.Fatalf("connect should not create a second default starter room when one exists: %#v", portal.Portal)
+	}
+	if len(matrix.intent().messages) != 0 {
+		t.Fatalf("existing starter with intro metadata should not queue another intro: %#v", matrix.intent().messages)
 	}
 }
 
@@ -3480,6 +3749,8 @@ func TestHydrateThreadRoomsQueuesExistingNewProjectIntro(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	requireEventually(t, time.Second, func() bool { return len(matrix.intent().messages) == 1 })
+	matrix.intent().messages = nil
 	login.Client = &Client{Main: connector, UserLogin: login, loggedIn: true}
 	key := newProjectPortalKey(login.ID)
 	if err = br.DB.Portal.Insert(ctx, &database.Portal{
@@ -3537,7 +3808,7 @@ func TestHydrateThreadRoomsDeletesUnmaterializedProjectPortals(t *testing.T) {
 	}
 	staleKey := projectPortalKey("/tmp/stale", login.ID)
 	realKey := projectPortalKey("/tmp/real", login.ID)
-	otherKey := networkid.PortalKey{ID: "new:starter", Receiver: login.ID}
+	otherKey := networkid.PortalKey{ID: "new:other", Receiver: login.ID}
 	for _, portal := range []*database.Portal{
 		{PortalKey: staleKey, Metadata: &PortalMetadata{ThreadID: "thread-stale", Cwd: "/tmp/stale"}},
 		{PortalKey: realKey, MXID: "!real:example.com", Metadata: &PortalMetadata{ThreadID: "thread-real", Cwd: "/tmp/real"}},
@@ -4091,6 +4362,10 @@ func (f *fakeMatrixAPI) CreateRoom(ctx context.Context, req *mautrix.ReqCreateRo
 		return req.BeeperLocalRoomID, nil
 	}
 	return id.RoomID("!created" + sanitizeID(string(rune('0'+f.roomCount))) + ":example.com"), nil
+}
+
+func (f *fakeMatrixAPI) DeleteRoom(ctx context.Context, roomID id.RoomID, puppetsOnly bool) error {
+	return nil
 }
 
 func (f *fakeMatrixAPI) SendMessage(ctx context.Context, roomID id.RoomID, eventType event.Type, content *event.Content, extra *bridgev2.MatrixSendExtra) (*mautrix.RespSendEvent, error) {

@@ -135,14 +135,16 @@ func (cl *Client) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*br
 	}
 	name := "New Project"
 	var state map[string]any
+	missingThread := false
 	switch {
 	case meta.ThreadID != "":
 		thread, err := cl.readThread(ctx, meta.ThreadID, false)
 		if err != nil {
 			if meta.Cwd != "" {
-				name = directoryName(meta.Cwd)
+				name = projectDisplayPath(meta.Cwd)
 			}
 			if isThreadNotFoundError(err) {
+				missingThread = true
 				cl.clearMissingThread(ctx, portal, meta)
 				if portal != nil {
 					meta = portalMetadata(portal.Metadata)
@@ -157,7 +159,7 @@ func (cl *Client) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*br
 			}
 		}
 	case meta.Cwd != "":
-		name = directoryName(meta.Cwd)
+		name = projectDisplayPath(meta.Cwd)
 	}
 	if meta.ThreadID == "" && meta.Cwd == "" {
 		info := cl.newProjectChatInfo()
@@ -165,6 +167,9 @@ func (cl *Client) GetChatInfo(ctx context.Context, portal *bridgev2.Portal) (*br
 		return info, nil
 	}
 	info := portalInfo(name, cl.codexMembers(), meta.Cwd, meta.ThreadID, state)
+	if missingThread {
+		info.CanBackfill = false
+	}
 	applyStoredPortalInfo(info, portal)
 	return info, nil
 }
@@ -174,11 +179,13 @@ func (cl *Client) GetUserInfo(ctx context.Context, ghost *bridgev2.Ghost) (*brid
 		return nil, fmt.Errorf("missing ghost")
 	}
 	switch ghost.ID {
+	case newProjectUserID:
+		return newProjectUserInfo(), nil
 	case codexUserID:
 		return codexUserInfo("Codex", false), nil
 	default:
 		if cwd, ok := parseProjectUserID(ghost.ID); ok {
-			return codexUserInfo(cwd, false, cwd), nil
+			return codexUserInfo(projectDisplayPath(cwd), false, cwd), nil
 		}
 		if strings.HasPrefix(string(ghost.ID), "login:") {
 			return loginUserInfo(), nil
@@ -318,7 +325,13 @@ func (cl *Client) handleMatrixMessage(ctx context.Context, msg *bridgev2.MatrixM
 			threadID := meta.ThreadID
 			turnID := active.turnID
 			resp.PostSave = func(ctx context.Context, saved *database.Message) {
-				go cl.steerMatrixTurn(startKey, msg.Portal, threadID, turnID, clientUserMessageID, prompt)
+				messageID := userDB.ID
+				part := userDB.PartID
+				if saved != nil {
+					messageID = saved.ID
+					part = saved.PartID
+				}
+				go cl.steerMatrixTurn(startKey, msg.Portal, threadID, turnID, clientUserMessageID, prompt, messageID, part)
 			}
 		}
 	} else {
@@ -454,10 +467,28 @@ func matrixPromptContentError(content *event.MessageEventContent) error {
 	}
 }
 
-func (cl *Client) steerMatrixTurn(startKey string, portal *bridgev2.Portal, threadID, turnID, clientUserMessageID, prompt string) {
+func (cl *Client) steerMatrixTurn(startKey string, portal *bridgev2.Portal, threadID, turnID, clientUserMessageID, prompt string, messageID networkid.MessageID, part networkid.PartID) {
 	defer cl.Main.finishMatrixStart(startKey)
 	ctx := context.Background()
 	if err := cl.steerTurn(ctx, threadID, turnID, clientUserMessageID, prompt); err != nil {
+		if isNoActiveTurnError(err) {
+			if active := cl.Main.activeRun(threadID); active != nil && active.turnID == turnID {
+				cl.Main.setActive(threadID, nil)
+			}
+			if portal = cl.freshPortal(ctx, portal); portal == nil {
+				zerolog.Ctx(ctx).Err(errors.New("missing Codex portal")).Str("thread_id", threadID).Str("turn_id", turnID).Msg("Failed to recover stale Codex turn from Matrix message")
+				return
+			}
+			run, startErr := cl.startTurn(ctx, portal.PortalKey, threadID, clientUserMessageID, prompt)
+			if startErr == nil {
+				if run != nil {
+					cl.updateStoredUserMessageMetadata(ctx, portal.PortalKey.Receiver, messageID, part, threadID, run.turnID)
+				}
+				zerolog.Ctx(ctx).Warn().Str("thread_id", threadID).Str("stale_turn_id", turnID).Msg("Started new Codex turn after stale steer state")
+				return
+			}
+			err = startErr
+		}
 		zerolog.Ctx(ctx).Err(err).Str("thread_id", threadID).Str("turn_id", turnID).Msg("Failed to steer Codex turn from Matrix message")
 		cl.queueAsyncTurnFailure(ctx, portal, threadID, "Failed to send that message to Codex:\n\n"+err.Error())
 	}
@@ -824,7 +855,7 @@ func (cl *Client) ResolveIdentifier(ctx context.Context, identifier string, crea
 	}
 	log.Debug().Msg("Resolving Codex identifier")
 	if isStarterIdentifier(identifier) {
-		resp := cl.resolveUser(ctx, codexUserID, codexUserInfo("Codex", false))
+		resp := cl.resolveUser(ctx, newProjectUserID, newProjectUserInfo())
 		if createChat {
 			resp.Chat = cl.newProjectChat()
 		}
@@ -864,14 +895,13 @@ func (cl *Client) resolveProject(ctx context.Context, cwd string, createChat boo
 	if err != nil {
 		return nil, err
 	}
-	thread, threadID, state := cl.latestThreadStateForDirectory(ctx, cwd)
 	resp := &bridgev2.ResolveIdentifierResponse{
 		UserID:   projectUserID(cwd),
-		UserInfo: codexUserInfo(cwd, false, cwd, thread.ID, thread.Name),
+		UserInfo: projectThreadUserInfo(appserver.Thread{Cwd: cwd}),
 	}
 	resp = cl.resolveUser(ctx, resp.UserID, resp.UserInfo)
 	if createChat {
-		resp.Chat = cl.chatForProject(ctx, cwd, threadID, state)
+		resp.Chat = cl.newProjectChatForCWD(cwd)
 	}
 	return resp, nil
 }
@@ -886,7 +916,7 @@ func (cl *Client) CreateChatWithGhost(ctx context.Context, ghost *bridgev2.Ghost
 	}
 	log.Debug().Msg("Creating Codex chat with ghost")
 	switch ghost.ID {
-	case codexUserID:
+	case newProjectUserID, codexUserID:
 		resp := cl.newProjectChat()
 		log.Debug().Stringer("portal_key", resp.PortalKey).Msg("Created Codex starter chat with ghost")
 		return resp, nil
@@ -896,9 +926,8 @@ func (cl *Client) CreateChatWithGhost(ctx context.Context, ghost *bridgev2.Ghost
 			log.Debug().Msg("Rejected unknown Codex ghost")
 			return nil, fmt.Errorf("unknown Codex ghost %s", ghost.ID)
 		}
-		_, threadID, state := cl.latestThreadStateForDirectory(ctx, cwd)
-		resp := cl.chatForProject(ctx, cwd, threadID, state)
-		log.Debug().Str("cwd", cwd).Str("thread_id", threadID).Stringer("portal_key", resp.PortalKey).Msg("Created Codex project chat with ghost")
+		resp := cl.newProjectChatForCWD(cwd)
+		log.Debug().Str("cwd", cwd).Stringer("portal_key", resp.PortalKey).Msg("Created Codex project starter chat with ghost")
 		return resp, nil
 	}
 }
@@ -914,7 +943,7 @@ func (cl *Client) GetContactList(ctx context.Context) ([]*bridgev2.ResolveIdenti
 		log.Debug().Int("contacts", len(contacts)).Msg("Listed Codex contacts without app-server")
 		return contacts, nil
 	}
-	threads, err := cl.listThreads(ctx, "", defaultThreadListLimit)
+	threads, err := cl.listRecentContactThreads(ctx)
 	if err != nil {
 		zerolog.Ctx(ctx).Warn().Err(err).Msg("Failed to list Codex threads for contacts")
 		contacts := cl.contactsForThreads(ctx, cl.Main.cachedThreadsForLogin(cl.UserLogin))
@@ -928,7 +957,7 @@ func (cl *Client) GetContactList(ctx context.Context) ([]*bridgev2.ResolveIdenti
 
 func (cl *Client) contactsForThreads(ctx context.Context, threads []appserver.Thread) []*bridgev2.ResolveIdentifierResponse {
 	contacts := []*bridgev2.ResolveIdentifierResponse{
-		cl.resolveUser(ctx, codexUserID, codexUserInfo("Codex", false)),
+		cl.resolveUser(ctx, newProjectUserID, newProjectUserInfo()),
 	}
 	for _, thread := range sortedRecentDirectories(threads) {
 		contacts = append(contacts, cl.contactForThread(ctx, thread))
@@ -937,12 +966,7 @@ func (cl *Client) contactsForThreads(ctx context.Context, threads []appserver.Th
 }
 
 func (cl *Client) contactForThread(ctx context.Context, thread appserver.Thread) *bridgev2.ResolveIdentifierResponse {
-	contact := cl.resolveUser(ctx, projectUserID(thread.Cwd), projectThreadUserInfo(thread))
-	chat := cl.chatForProject(ctx, thread.Cwd, thread.ID, codexThreadInitialState(thread))
-	if chat != nil && chat.Portal != nil && chat.Portal.MXID != "" {
-		contact.Chat = chat
-	}
-	return contact
+	return cl.resolveUser(ctx, projectUserID(thread.Cwd), projectThreadUserInfo(thread))
 }
 
 func (cl *Client) resolveUser(ctx context.Context, userID networkid.UserID, info *bridgev2.UserInfo) *bridgev2.ResolveIdentifierResponse {
@@ -964,7 +988,7 @@ func (cl *Client) resolveUser(ctx context.Context, userID networkid.UserID, info
 
 func isResolvableGhostUserID(userID networkid.UserID) bool {
 	_, ok := parseProjectUserID(userID)
-	return userID == codexUserID || ok
+	return userID == codexUserID || userID == newProjectUserID || ok
 }
 
 func (cl *Client) SearchUsers(ctx context.Context, query string) ([]*bridgev2.ResolveIdentifierResponse, error) {
@@ -975,12 +999,12 @@ func (cl *Client) SearchUsers(ctx context.Context, query string) ([]*bridgev2.Re
 		log = log.With().Str("login_id", string(cl.UserLogin.ID)).Logger()
 	}
 	log.Debug().Msg("Searching Codex contacts")
+	if direct, ok := cl.directPathSearchResult(ctx, rawQuery); ok {
+		log.Debug().Msg("Search query is a direct Codex project path")
+		return []*bridgev2.ResolveIdentifierResponse{direct}, nil
+	}
 	contacts, err := cl.GetContactList(ctx)
 	if err != nil {
-		if direct, ok := cl.directPathSearchResult(ctx, rawQuery); ok {
-			log.Debug().Err(err).Msg("Contact listing failed, returning direct Codex project path")
-			return []*bridgev2.ResolveIdentifierResponse{direct}, nil
-		}
 		log.Debug().Err(err).Msg("Failed to search Codex contacts")
 		return contacts, err
 	}
@@ -996,9 +1020,6 @@ func (cl *Client) SearchUsers(ctx context.Context, query string) ([]*bridgev2.Re
 func (cl *Client) matchingSearchContacts(ctx context.Context, rawQuery, query string, contacts []*bridgev2.ResolveIdentifierResponse) []*bridgev2.ResolveIdentifierResponse {
 	filtered := contacts[:0]
 	seenUserIDs := map[networkid.UserID]struct{}{}
-	if direct, ok := cl.directPathSearchResult(ctx, rawQuery); ok {
-		filtered = appendUniqueSearchResult(filtered, seenUserIDs, direct)
-	}
 	for _, contact := range contacts {
 		if contactMatchesQuery(contact, query) {
 			filtered = appendUniqueSearchResult(filtered, seenUserIDs, contact)
@@ -1056,6 +1077,29 @@ func (cl *Client) newProjectChat() *bridgev2.CreateChatResponse {
 		PortalInfo:     cl.newProjectChatInfo(),
 		DMRedirectedTo: codexUserID,
 	}
+}
+
+func (cl *Client) newProjectChatForCWD(cwd string) *bridgev2.CreateChatResponse {
+	return &bridgev2.CreateChatResponse{
+		PortalKey:      newProjectPortalKey(cl.loginID()),
+		PortalInfo:     cl.projectStarterChatInfo(cwd),
+		DMRedirectedTo: codexUserID,
+	}
+}
+
+func (cl *Client) projectStarterChatInfo(cwd string) *bridgev2.ChatInfo {
+	info := codexChatInfo(projectDisplayPath(cwd), cl.codexMembers())
+	info.CanBackfill = false
+	info.ExtraUpdates = func(ctx context.Context, portal *bridgev2.Portal) bool {
+		oldThreadID := ""
+		if portal != nil {
+			oldThreadID = portalMetadata(portal.Metadata).ThreadID
+		}
+		changed := codexThreadMetadataUpdater(cwd, "", nil)(ctx, portal)
+		cl.syncPortalBackfill(ctx, portal, oldThreadID)
+		return changed
+	}
+	return info
 }
 
 func (cl *Client) newProjectChatInfo() *bridgev2.ChatInfo {
@@ -1149,7 +1193,7 @@ func (cl *Client) chatForProject(ctx context.Context, cwd, threadID string, stat
 	return &bridgev2.CreateChatResponse{
 		PortalKey:      key,
 		Portal:         portal,
-		PortalInfo:     portalInfo(cwd, cl.codexMembers(), cwd, threadID, state),
+		PortalInfo:     portalInfo(projectDisplayPath(cwd), cl.codexMembers(), cwd, threadID, state),
 		DMRedirectedTo: codexUserID,
 	}
 }
@@ -1182,7 +1226,7 @@ func (cl *Client) latestThreadForDirectory(ctx context.Context, cwd string) (app
 }
 
 func isThreadForDirectory(thread appserver.Thread, cwd string) bool {
-	return thread.Cwd == cwd && !isDetachedThread(thread)
+	return projectCanonicalPath(thread.Cwd) == projectCanonicalPath(cwd) && !isDetachedThread(thread)
 }
 
 func (cl *Client) latestThreadStateForDirectory(ctx context.Context, cwd string) (appserver.Thread, string, map[string]any) {
@@ -1260,6 +1304,14 @@ func (cl *Client) listThreads(ctx context.Context, cursor string, limit int) ([]
 			return out, nil
 		}
 	}
+}
+
+func (cl *Client) listRecentContactThreads(ctx context.Context) ([]appserver.Thread, error) {
+	var resp appserver.ThreadListResponse
+	if err := cl.Main.request(ctx, "thread/list", threadListParams("", defaultThreadListLimit), &resp); err != nil {
+		return nil, err
+	}
+	return resp.Data, nil
 }
 
 func threadListParams(cursor string, limit int) map[string]any {
@@ -1526,7 +1578,7 @@ func isThreadNotFoundError(err error) bool {
 
 func isThreadTurnsListUnavailable(err error) bool {
 	rpcErr, msg, ok := lowerRPCErrorMessage(err)
-	return ok && (rpcErr.Code == -32601 || containsAny(msg, "method not found", "unknown method", "experimental"))
+	return ok && (rpcErr.Code == -32601 || containsAny(msg, "method not found", "unknown method", "experimental", "not materialized yet"))
 }
 
 func lowerRPCErrorMessage(err error) (*appserver.RPCError, string, bool) {
@@ -1556,6 +1608,9 @@ func cleanProjectDir(path string) (string, error) {
 	}
 	if !stat.IsDir() {
 		return "", fmt.Errorf("%s is not a directory", abs)
+	}
+	if realPath, err := filepath.EvalSymlinks(abs); err == nil {
+		return realPath, nil
 	}
 	return abs, nil
 }
@@ -1767,6 +1822,13 @@ func (cl *Client) steerTurn(ctx context.Context, threadID, turnID, clientUserMes
 
 func (cl *Client) interruptTurn(ctx context.Context, portal *bridgev2.Portal, threadID, turnID string) {
 	if err := cl.Main.request(ctx, "turn/interrupt", turnInterruptParams(threadID, turnID), nil); err != nil {
+		if isNoActiveTurnError(err) {
+			if active := cl.Main.activeRun(threadID); active != nil && active.turnID == turnID {
+				cl.Main.setActive(threadID, nil)
+			}
+			cl.queueCommandNotice(portal, threadID, "No active Codex turn is running.")
+			return
+		}
 		cl.queueCommandNotice(portal, threadID, "Failed to stop Codex turn:\n\n"+err.Error())
 		return
 	}
@@ -1774,6 +1836,14 @@ func (cl *Client) interruptTurn(ctx context.Context, portal *bridgev2.Portal, th
 		run.writeCodexClientRequestState("turn/interrupt", codexClientTurnRequestState(threadID, turnID, "", ""))
 	}
 	cl.queueCommandNotice(portal, threadID, "Requested Codex to stop the active turn.")
+}
+
+func isNoActiveTurnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := lowerTrimmed(err.Error())
+	return strings.Contains(message, "no active turn")
 }
 
 func turnInterruptParams(threadID, turnID string) map[string]any {
@@ -1830,11 +1900,7 @@ func (cl *Client) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 			return nil, err
 		}
 		if len(threads) > 0 {
-			messages, err := cl.directoryBackfillMessages(ctx, params.Portal, threads)
-			if err != nil {
-				return nil, err
-			}
-			return paginateBackfillMessages(messages, params), nil
+			return cl.backfillThreadPage(ctx, params.Portal, threads, params)
 		}
 	}
 	if meta.ThreadID == "" {
@@ -1848,11 +1914,18 @@ func (cl *Client) FetchMessages(ctx context.Context, params bridgev2.FetchMessag
 		}
 		return nil, err
 	}
-	messages, err := cl.projectBackfillMessages(ctx, params.Portal, thread)
+	return cl.backfillThreadPage(ctx, params.Portal, []appserver.Thread{thread}, params)
+}
+
+func (cl *Client) backfillThreadPage(ctx context.Context, portal *bridgev2.Portal, threads []appserver.Thread, params bridgev2.FetchMessagesParams) (*bridgev2.FetchMessagesResponse, error) {
+	entries := directoryBackfillEntries(threads)
+	page, resp := paginateBackfillEntries(entries, params)
+	messages, err := cl.backfillMessagesFromEntries(ctx, portal, page)
 	if err != nil {
 		return nil, err
 	}
-	return paginateBackfillMessages(messages, params), nil
+	resp.Messages = messages
+	return resp, nil
 }
 
 func emptyFetchMessagesResponse() *bridgev2.FetchMessagesResponse {
@@ -1929,19 +2002,19 @@ func threadBackfillBefore(left, right appserver.Thread) bool {
 }
 
 func (cl *Client) directoryBackfillMessages(ctx context.Context, portal *bridgev2.Portal, threads []appserver.Thread) ([]*bridgev2.BackfillMessage, error) {
-	var messages []*bridgev2.BackfillMessage
+	return cl.backfillMessagesFromEntries(ctx, portal, directoryBackfillEntries(threads))
+}
+
+func directoryBackfillEntries(threads []appserver.Thread) []*backfillEntry {
+	var entries []*backfillEntry
 	for _, thread := range threads {
-		threadMessages, err := cl.projectBackfillMessages(ctx, portal, thread)
-		if err != nil {
-			return nil, err
-		}
-		messages = append(messages, threadMessages...)
+		entries = append(entries, projectBackfillEntries(thread)...)
 	}
-	sort.SliceStable(messages, func(i, j int) bool {
-		return backfillMessageBefore(messages[i], messages[j])
+	sort.SliceStable(entries, func(i, j int) bool {
+		return backfillEntryBefore(entries[i], entries[j])
 	})
-	assignBackfillStreamOrder(messages)
-	return messages, nil
+	assignBackfillEntryStreamOrder(entries)
+	return entries
 }
 
 func assignBackfillStreamOrder(messages []*bridgev2.BackfillMessage) {
@@ -1952,7 +2025,22 @@ func assignBackfillStreamOrder(messages []*bridgev2.BackfillMessage) {
 	}
 }
 
+func assignBackfillEntryStreamOrder(entries []*backfillEntry) {
+	var streamOrder int64
+	for _, entry := range entries {
+		streamOrder = nextBackfillStreamOrder(streamOrder, entry.Timestamp)
+		entry.StreamOrder = streamOrder
+	}
+}
+
 func backfillMessageBefore(left, right *bridgev2.BackfillMessage) bool {
+	if left.Timestamp.Equal(right.Timestamp) {
+		return left.ID < right.ID
+	}
+	return left.Timestamp.Before(right.Timestamp)
+}
+
+func backfillEntryBefore(left, right *backfillEntry) bool {
 	if left.Timestamp.Equal(right.Timestamp) {
 		return left.ID < right.ID
 	}
@@ -2154,5 +2242,17 @@ func codexRequestModel(model string) string {
 }
 
 func threadName(thread appserver.Thread) string {
-	return firstNonEmptyString(firstTrimmedNonEmpty(thread.Name, thread.Preview), directoryName(thread.Cwd))
+	return projectThreadRoomName(firstTrimmedNonEmpty(thread.Name, codexThreadTitle(thread.Raw), thread.Preview), thread.Cwd)
+}
+
+func projectThreadRoomName(title, cwd string) string {
+	title = firstTrimmedNonEmpty(title)
+	display := projectDisplayPath(cwd)
+	if title == "" {
+		return display
+	}
+	if display == "" {
+		return title
+	}
+	return title + " (" + display + ")"
 }

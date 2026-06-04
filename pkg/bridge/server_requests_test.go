@@ -219,14 +219,34 @@ func TestParseCodexCommand(t *testing.T) {
 			ok:      true,
 		},
 		{
-			name:    "abort is not a command",
+			name:    "slash abort aliases stop",
 			content: &event.MessageEventContent{Body: "/abort"},
-			ok:      false,
+			want:    codexCommand{name: "stop"},
+			ok:      true,
 		},
 		{
-			name:    "interrupt is not a command",
+			name:    "slash interrupt aliases stop",
 			content: &event.MessageEventContent{Body: "/interrupt"},
-			ok:      false,
+			want:    codexCommand{name: "stop"},
+			ok:      true,
+		},
+		{
+			name:    "matrix command slash abort aliases stop",
+			content: &event.MessageEventContent{MsgType: matrixCommandMsgType, Body: "/abort"},
+			want:    codexCommand{name: "stop"},
+			ok:      true,
+		},
+		{
+			name:    "matrix command bot prefix stop",
+			content: &event.MessageEventContent{MsgType: matrixCommandMsgType, Body: "!codex stop"},
+			want:    codexCommand{name: "stop"},
+			ok:      true,
+		},
+		{
+			name:    "matrix command plain stop",
+			content: &event.MessageEventContent{MsgType: matrixCommandMsgType, Body: "stop"},
+			want:    codexCommand{name: "stop"},
+			ok:      true,
 		},
 		{
 			name:    "normal message",
@@ -1279,13 +1299,8 @@ func TestMCPFormAnswerUsesSchemaFields(t *testing.T) {
 func TestMCPFormCodexInputResponseWrapsContent(t *testing.T) {
 	pending := &pendingServerRequest{Method: "mcpServer/elicitation/request"}
 	content := map[string]string{"repo": "codex-bridge"}
-	direct := mcpElicitationResponse(mcpElicitationActionAccept, content)
-	if direct["action"] != "accept" || !reflect.DeepEqual(direct["content"], content) || direct["_meta"] != nil {
-		t.Fatalf("unexpected direct MCP elicitation response: %#v", direct)
-	}
-
 	got := codexInputResponse(pending, content).(map[string]any)
-	if got["action"] != "accept" || !reflect.DeepEqual(got["content"], content) {
+	if got["action"] != "accept" || !reflect.DeepEqual(got["content"], content) || got["_meta"] != nil {
 		t.Fatalf("unexpected MCP elicitation response: %#v", got)
 	}
 	got = codexInputResponse(pending, aistream.ToolApprovalResponse{Approved: true}).(map[string]any)
